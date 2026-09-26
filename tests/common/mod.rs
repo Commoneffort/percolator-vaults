@@ -464,8 +464,8 @@ impl World {
         let target = self.env.current_slot() + slots;
         self.env.warp_to_slot(target);
         self.env.push_auth_mark(0, target, price).expect("push mark");
-        let _ = self.env.crank(0, target, vec![]);
-        let _ = self.env.crank(0, target, vec![]);
+        let hint = percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 };
+        self.env.crank(0, target, vec![hint]).expect("crank asset 0");
     }
 
     /// A harness actor trades against the vault through Percolator's TradeCpi.

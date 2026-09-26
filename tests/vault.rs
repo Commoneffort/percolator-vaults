@@ -5,6 +5,8 @@ use common::*;
 use percolator_prog::ix::Instruction as ProgIx;
 use percolator_vault::{percolator as perc, state};
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
+#[allow(unused_imports)]
+use solana_sdk::signature::Keypair;
 
 // ---------------------------------------------------------------- layout
 
@@ -243,4 +245,145 @@ fn market_offsets_match_engine() {
         perc::market_account_len_for_slots(4),
         percolator_prog::state::market_account_len_for_capacity(4).unwrap()
     );
+}
+
+fn settle_ix(w: &World) -> solana_sdk::instruction::Instruction {
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+    Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new(w.env.market, false),
+            AccountMeta::new(w.portfolio, false),
+            AccountMeta::new(w.buffer, false),
+            AccountMeta::new(w.env.vault, false),
+            AccountMeta::new_readonly(w.env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
+        ],
+        data: vec![percolator_vault::processor::TAG_SETTLE_RESOLVED],
+    }
+}
+
+fn redeem_ix(w: &World, u: &User, shares: u64) -> solana_sdk::instruction::Instruction {
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+    let mut data = vec![percolator_vault::processor::TAG_REDEEM_TERMINAL];
+    data.extend_from_slice(&shares.to_le_bytes());
+    Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new_readonly(u.kp.pubkey(), true),
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new(u.shares, false),
+            AccountMeta::new(w.share_mint, false),
+            AccountMeta::new(u.collateral, false),
+            AccountMeta::new(w.buffer, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    }
+}
+
+#[test]
+fn market_resolution_winds_the_vault_down_and_everyone_exits() {
+    let mut w = World::new();
+    w.env.warp_to_slot(5);
+    w.create_vault(default_params(1)).unwrap();
+    let alice = w.new_user(100_000_000);
+    let bob = w.new_user(100_000_000);
+    w.deposit(&alice, 30_000_000).unwrap();
+    w.deposit(&bob, 20_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.roll().unwrap();
+    w.claim(&alice, 0).unwrap();
+    // Bob leaves his shares unclaimed in escrow; Carol queues a deposit that never settles.
+    let carol = w.new_user(5_000_000);
+    w.deposit(&carol, 5_000_000).unwrap();
+    // The vault holds a position when the market is resolved.
+    w.taker_trade(0, TEN_M).unwrap();
+    w.advance(3, INITIAL_PRICE);
+    w.env.resolve_market().unwrap();
+
+    // Settlement is permissionless and may take several calls.
+    let mut calls = 0;
+    while { w.vault_state().status } != state::STATUS_TERMINAL {
+        calls += 1;
+        assert!(calls < 10, "vault never became terminal");
+        let ix = settle_ix(&w);
+        match w.send(vec![ix], &[]) {
+            Ok(_) => {}
+            Err(e) => panic!("settle failed on call {calls}:\n{e}"),
+        }
+        w.env.warp_to_slot(w.env.current_slot() + 1);
+    }
+    println!("terminal after {calls} settle call(s); buffer {}", w.tokens(w.buffer));
+
+    // Carol gets her unsettled deposit back; Bob claims his shares; everyone redeems pro rata.
+    w.claim(&carol, 1).unwrap();
+    assert_eq!(w.tokens(carol.collateral), 5_000_000);
+    w.claim(&bob, 0).unwrap();
+    let a = w.tokens(alice.shares);
+    let b = w.tokens(bob.shares);
+    let ix = redeem_ix(&w, &alice, a);
+    w.send(vec![ix], &[&alice.kp]).unwrap();
+    let ix = redeem_ix(&w, &bob, b);
+    w.send(vec![ix], &[&bob.kp]).unwrap();
+    let alice_out = w.tokens(alice.collateral) - 70_000_000;
+    let bob_out = w.tokens(bob.collateral) - 80_000_000;
+    println!("alice {alice_out} of 30M, bob {bob_out} of 20M, buffer left {}", w.tokens(w.buffer));
+    assert!(alice_out >= 29_990_000 && bob_out >= 19_990_000);
+    assert!(w.tokens(w.buffer) < 10, "nothing stranded beyond rounding dust");
+}
+
+fn convert_ix(w: &World) -> solana_sdk::instruction::Instruction {
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+    Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new_readonly(w.vault, false),
+            AccountMeta::new(w.env.market, false),
+            AccountMeta::new(w.portfolio, false),
+            AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
+        ],
+        data: vec![percolator_vault::processor::TAG_CONVERT_PNL],
+    }
+}
+
+/// The vault takes the other side of a taker; the price moves; the vault's profit or loss
+/// reaches depositors through the next roll.
+fn price_move_round_trip(move_bps: i64) -> (u64, perc::PortfolioView) {
+    let mut w = World::new();
+    w.env.warp_to_slot(5);
+    w.create_vault(default_params(1)).unwrap();
+    let alice = w.new_user(100_000_000);
+    w.deposit(&alice, 50_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.roll().unwrap();
+    w.claim(&alice, 0).unwrap();
+
+    w.taker_trade(0, TEN_M).unwrap(); // taker long 10 units, vault short
+    let target = (INITIAL_PRICE as i64 * (10_000 + move_bps) / 10_000) as u64;
+    for _ in 0..5 {
+        w.advance(1, target); // price walks to target under the per-slot cap
+    }
+    w.taker_trade(0, -TEN_M).unwrap(); // taker closes; vault flat again
+    w.advance(20, target); // let any profit lock mature
+    let _ = w.send(vec![convert_ix(&w)], &[]); // no-op (and harmless) when nothing is released
+    let pv = w.portfolio_view();
+    w.withdraw(&alice, w.tokens(alice.shares)).unwrap();
+    w.advance(EPOCH_LEN, target);
+    w.roll().unwrap();
+    w.claim(&alice, 1).unwrap();
+    (w.tokens(alice.collateral), pv)
+}
+
+#[test]
+fn vault_profit_and_loss_reach_depositors() {
+    let (down, pv_down) = price_move_round_trip(-1_000); // price -10%: short vault wins 1M
+    let (up, pv_up) = price_move_round_trip(1_000); // price +10%: short vault loses 1M
+    println!("price down: alice {down} (portfolio {pv_down:?})");
+    println!("price up:   alice {up} (portfolio {pv_up:?})");
+    assert!(down > 100_000_000, "vault gains reach depositors");
+    assert!(up < 100_000_000, "vault losses reach depositors");
+    assert!(up >= 100_000_000 - 1_000_001, "loss is exactly the move, not more");
 }
