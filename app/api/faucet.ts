@@ -8,7 +8,7 @@ const TEST_USDC_MINT = "FT7B8rR8NN1ciyGPmTDT8AxUUWtF1PGc4NCmuisYVPkh";
 const USDC = 1_000_000;
 const DRIP_USDC = 1_000;
 const MAX_HELD_USDC = 5_000;
-const DRIP_SOL = 0.1;
+const DRIP_SOL = 0.3; // enough to launch a market (~0.12) or open a trading account (~0.07)
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
@@ -33,7 +33,7 @@ export default async function handler(req: any, res: any) {
     createAssociatedTokenAccountIdempotentInstruction(faucet.publicKey, ata, to, mint),
     createMintToInstruction(mint, ata, faucet.publicKey, BigInt(DRIP_USDC * USDC)),
   );
-  const sendSol = sol < DRIP_SOL;
+  const sendSol = sol < 0.2;
   if (sendSol) tx.add(SystemProgram.transfer({ fromPubkey: faucet.publicKey, toPubkey: to, lamports: DRIP_SOL * LAMPORTS_PER_SOL }));
   try {
     const sig = await conn.sendTransaction(tx, [faucet]);

@@ -479,8 +479,8 @@ fn export_layout_for_frontend() {
     }
     let layout = serde_json::json!({
         "vault": f!(V, o, magic, status, share_decimals, market, creator, seed, collateral_mint, share_mint, buffer, share_escrow,
-            lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_fill_abs, max_inventory_abs,
-            epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, asset_market_id, inventory, epoch, epoch_start_slot,
+            lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_inventory_abs,
+            epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, asset_market_id, inventory, epoch, epoch_start_slot,
             pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested),
         "vault_len": state::VAULT_ACCOUNT_LEN,
         "ticket": f!(Ticket, 0, vault, owner, epoch, deposit_assets, withdraw_shares),
@@ -500,6 +500,11 @@ fn export_layout_for_frontend() {
             "side": offset_of!(percolator::PortfolioLegV16Account, side),
             "active": offset_of!(percolator::PortfolioLegV16Account, active)
         },
+        "market_header": {
+            "next_market_id": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, next_market_id),
+            "max_market_slots": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, config) + offset_of!(percolator::V16ConfigAccount, max_market_slots),
+            "mode": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, mode)
+        },
         "market": { "slots": perc::MARKET_SLOTS_OFF, "slot_len": perc::MARKET_ASSET_SLOT_LEN, "engine": 512,
             "market_id": 0,
             "effective_price": offset_of!(percolator::AssetStateV16Account, effective_price),
@@ -510,4 +515,14 @@ fn export_layout_for_frontend() {
     });
     std::fs::create_dir_all("app/src").unwrap();
     std::fs::write("app/src/layout.json", serde_json::to_string_pretty(&layout).unwrap()).unwrap();
+}
+
+#[test]
+fn pyth_push_feed_address_derivation() {
+    let push = solana_sdk::pubkey!("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
+    let mut feed = [0u8; 32];
+    let hex = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+    for i in 0..32 { feed[i] = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap(); }
+    let (k, _) = Pubkey::find_program_address(&[&0u16.to_le_bytes(), &feed], &push);
+    assert_eq!(k.to_string(), "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE");
 }

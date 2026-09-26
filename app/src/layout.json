@@ -31,6 +31,11 @@
     "slot_len": 1813,
     "slots": 1190
   },
+  "market_header": {
+    "max_market_slots": 498,
+    "mode": 1058,
+    "next_market_id": 1013
+  },
   "portfolio": {
     "active_bitmap": 348,
     "capital": 148,
@@ -73,6 +78,7 @@
     "max_fill_abs": 368,
     "max_inventory_abs": 384,
     "mode": 416,
+    "oracle_feeds": 464,
     "pending_deposit_assets": 616,
     "pending_withdraw_shares": 624,
     "portfolio_id": 344,

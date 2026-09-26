@@ -308,26 +308,33 @@ fn vault_state(rpc: &RpcClient, vault: &Pubkey) -> VaultState {
 
 /// Cranks the vault's asset until its accrual clock is current (each crank moves at most
 /// `max_accrual_dt_slots`), reading the Pyth account, with the LP portfolio as the target.
-fn crank(rpc: &RpcClient, payer: &Keypair, m: &Value, v: &VaultState) -> Result<(), String> {
-    let market = key(m, "market");
-    let oracle = Pubkey::from_str(SOL_USD_ACCOUNT).unwrap();
+const PYTH_PUSH_ORACLE: Pubkey = solana_sdk::pubkey!("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
+
+/// The Pyth sponsored (shard 0) price account for a feed id.
+fn push_feed_account(feed: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[&0u16.to_le_bytes(), feed], &PYTH_PUSH_ORACLE).0
+}
+
+/// Cranks a vault's asset until its accrual clock is current (each crank moves at most
+/// `max_accrual_dt_slots`), reading its Pyth account, with the LP portfolio as the target.
+fn crank_vault(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState) -> Result<(), String> {
+    let oracle = push_feed_account(&v.oracle_feeds[0]);
     for _ in 0..3 {
         let now = rpc.get_slot().map_err(|e| e.to_string())?;
-        let (_, g, _) = market_state(rpc, &market);
+        let (_, g, _) = market_state(rpc, market);
         if g.assets[v.asset_index as usize].slot_last + 2 >= now {
             return Ok(());
         }
         let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 1 };
         let ix = prog(ProgIx::PermissionlessCrank { now_slot: now, observations: vec![hint] }, vec![
             AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(market, false),
+            AccountMeta::new(*market, false),
             AccountMeta::new(v.lp_portfolio, false),
             AccountMeta::new_readonly(oracle, false),
         ]);
         if let Err(e) = send(rpc, payer, vec![ix], &[]) {
-            // 0x16 = NonProgress: nothing left to do this slot.
             if e.contains("0x16") {
-                return Ok(());
+                return Ok(()); // NonProgress: nothing to do this slot
             }
             return Err(e);
         }
@@ -335,47 +342,74 @@ fn crank(rpc: &RpcClient, payer: &Keypair, m: &Value, v: &VaultState) -> Result<
     Ok(())
 }
 
+fn crank(rpc: &RpcClient, payer: &Keypair, m: &Value, v: &VaultState) -> Result<(), String> {
+    crank_vault(rpc, payer, &key(m, "market"), v)
+}
+
+/// Every active vault of the program, with its keys.
+fn all_vaults(rpc: &RpcClient) -> Vec<(VaultKeys, VaultState)> {
+    use solana_client::{rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig}, rpc_filter::RpcFilterType};
+    let cfg = RpcProgramAccountsConfig {
+        filters: Some(vec![RpcFilterType::DataSize(state::VAULT_ACCOUNT_LEN as u64)]),
+        account_config: RpcAccountInfoConfig { encoding: Some(solana_account_decoder::UiAccountEncoding::Base64), ..Default::default() },
+        ..Default::default()
+    };
+    let accs = rpc.get_program_accounts_with_config(&percolator_vault::id(), cfg).unwrap_or_default();
+    accs.into_iter()
+        .filter_map(|(k, a)| {
+            let v: VaultState = bytemuck::pod_read_unaligned(&a.data[state::VAULT_STATE_OFF..]);
+            if v.magic != state::VAULT_MAGIC || v.status != state::STATUS_ACTIVE {
+                return None;
+            }
+            let keys = VaultKeys::derive(percolator_vault::id(), v.market, v.creator, v.seed, &v.collateral_mint);
+            (keys.vault == k).then_some((keys, v))
+        })
+        .collect()
+}
+
 fn keeper(rpc: &RpcClient, payer: &Keypair) {
-    let m = load();
-    let creator = key(&m, "vault_creator");
-    let k = keys(&m, &creator);
     let mut tick: u64 = 0;
+    let mut vaults = all_vaults(rpc);
     loop {
         tick += 1;
-        let v = vault_state(rpc, &k.vault);
-        let now = rpc.get_slot().unwrap_or(0);
-        // Keep the vault's asset within Percolator's accrual window so takers can add risk.
-        if let Err(e) = crank(rpc, payer, &m, &v) {
-            eprintln!("crank: {}", e.lines().next().unwrap_or(""));
+        if tick % 30 == 1 {
+            vaults = all_vaults(rpc);
+            println!("servicing {} vault(s)", vaults.len());
         }
-        let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots;
-        if tick % 15 != 0 && !epoch_over {
-            sleep(Duration::from_secs(2));
-            continue;
-        }
-        let (_, g, data) = market_state(rpc, &k.market);
-        // Harvest fees above the floor.
-        let (_, remaining) = {
+        for (k, _) in vaults.clone() {
+            let d = match rpc.get_account_data(&k.vault) { Ok(d) => d, Err(_) => continue };
+            let v: VaultState = bytemuck::pod_read_unaligned(&d[state::VAULT_STATE_OFF..]);
+            if v.status != state::STATUS_ACTIVE {
+                continue;
+            }
+            let now = rpc.get_slot().unwrap_or(0);
+            if let Err(e) = crank_vault(rpc, payer, &k.market, &v) {
+                eprintln!("{} crank: {}", k.vault, e.lines().next().unwrap_or(""));
+            }
+            let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots;
+            if tick % 15 != 0 && !epoch_over {
+                continue;
+            }
+            let (_, g, data) = market_state(rpc, &k.market);
             let base = perc::MARKET_SLOTS_OFF + v.asset_index as usize * perc::MARKET_ASSET_SLOT_LEN + 512;
             let rd = |o: usize| u128::from_le_bytes(data[base + o..base + o + 16].try_into().unwrap());
-            (0, (rd(515) + rd(531)).saturating_sub(rd(547) + rd(563)))
-        };
-        if remaining > v.insurance_floor as u128 + USDC as u128 {
-            let seq = pstate::read_asset_control_sequences(&data, v.asset_index as usize).unwrap();
-            match send(rpc, payer, vec![client::harvest_fees(&k, seq.authority_epoch, u64::MAX)], &[]) {
-                Ok(s) => println!("harvested fees ({s})"),
-                Err(e) => eprintln!("harvest: {}", e.lines().next().unwrap_or("")),
+            let remaining = (rd(515) + rd(531)).saturating_sub(rd(547) + rd(563));
+            if remaining > v.insurance_floor as u128 + USDC as u128 {
+                let seq = pstate::read_asset_control_sequences(&data, v.asset_index as usize).unwrap();
+                match send(rpc, payer, vec![client::harvest_fees(&k, seq.authority_epoch, u64::MAX)], &[]) {
+                    Ok(s) => println!("{} harvested fees ({s})", k.vault),
+                    Err(e) => eprintln!("{} harvest: {}", k.vault, e.lines().next().unwrap_or("")),
+                }
             }
-        }
-        // Roll when the epoch is over (fails harmlessly until the vault is flat).
-        if now >= v.epoch_start_slot + v.epoch_len_slots {
-            let _ = send(rpc, payer, vec![client::convert_pnl(&k)], &[]);
-            match send(rpc, payer, vec![client::roll_epoch(&k, &payer.pubkey(), v.epoch, g.next_market_id)], &[]) {
-                Ok(s) => println!("rolled epoch {} ({s})", { v.epoch }),
-                Err(e) => {
-                    eprintln!("roll: {}", e.lines().next().unwrap_or(""));
-                    if now >= v.epoch_start_slot + 2 * v.epoch_len_slots {
-                        let _ = send(rpc, payer, vec![client::unwind(&k)], &[]);
+            if epoch_over {
+                let _ = send(rpc, payer, vec![client::convert_pnl(&k)], &[]);
+                match send(rpc, payer, vec![client::roll_epoch(&k, &payer.pubkey(), v.epoch, g.next_market_id)], &[]) {
+                    Ok(s) => println!("{} rolled epoch {} ({s})", k.vault, { v.epoch }),
+                    Err(e) => {
+                        eprintln!("{} roll: {}", k.vault, e.lines().next().unwrap_or(""));
+                        if now >= v.epoch_start_slot + 2 * v.epoch_len_slots {
+                            let _ = send(rpc, payer, vec![client::unwind(&k)], &[]);
+                        }
                     }
                 }
             }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { ComputeBudgetProgram, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
@@ -6,42 +6,123 @@ import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-t
 import * as C from "./chain";
 
 const SLOT_SECONDS = 0.4;
-
-const fmtUsd = (atoms: bigint, dp = 2) => (Number(atoms) / C.USDC).toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
-const fmtPrice = (e6: bigint) => (Number(e6) / 1e6).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const fmtSol = (q: bigint) => (Number(q) / Number(C.UNIT)).toLocaleString(undefined, { maximumFractionDigits: 4 });
-const fmtShares = (s: bigint) => (Number(s) / 10 ** C.SHARE_DECIMALS).toLocaleString(undefined, { maximumFractionDigits: 4 });
+const num = (x: bigint, scale: number) => Number(x) / scale;
+const fmt = (x: number, dp = 2) => x.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+const usd = (atoms: bigint, dp = 2) => `$${fmt(num(atoms, C.USDC), dp)}`;
+const priceDp = (p: number) => (p >= 1000 ? 2 : p >= 1 ? 3 : 5);
+const px = (e6: bigint) => { const p = num(e6, 1e6); return `$${fmt(p, priceDp(p))}`; };
+const units = (q: bigint) => fmt(num(q, Number(C.UNIT)), 4).replace(/\.?0+$/, "") || "0";
+const shares = (s: bigint) => fmt(num(s, 10 ** C.SHARE_DECIMALS), 2);
 const short = (k: PublicKey | string) => { const s = k.toString(); return `${s.slice(0, 4)}…${s.slice(-4)}`; };
 const explorer = (what: "address" | "tx", id: string) => `https://explorer.solana.com/${what}/${id}?cluster=devnet`;
+const ago = (sec: number) => (sec < 60 ? `${Math.max(1, Math.round(sec))}s ago` : sec < 3600 ? `${Math.round(sec / 60)}m ago` : `${Math.round(sec / 3600)}h ago`);
 
-function useChain() {
+// ---------------------------------------------------------------- routing
+
+function useRoute(): [string[], (to: string) => void] {
+  const parse = () => window.location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+  const [route, setRoute] = useState(parse);
+  useEffect(() => {
+    const on = () => setRoute(parse());
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  return [route, (to: string) => { window.location.hash = to; window.scrollTo(0, 0); }];
+}
+
+// ---------------------------------------------------------------- transactions
+
+type Toast = { ok: boolean; text: string; sig?: string };
+type Send = (label: string, ixs: TransactionInstruction[]) => Promise<string | undefined>;
+
+const ERRORS: Record<string, string> = {
+  "0x1": "not enough test USDC: use Get test USDC", "0x5608": "vault not active", "0x560a": "claim your previous request first",
+  "0x560b": "nothing to claim", "0x560c": "epoch not over", "0x560d": "epoch not settled yet", "0x560e": "vault not flat yet",
+  "0x5610": "amount is zero", "0x5611": "unknown asset", "0x15": "market busy: try again in a few seconds",
+  "0x13": "market state stale: try again", "0xe": "not enough margin", "0x12": "asset generation changed: retry",
+};
+
+function useSend(onDone: () => void): [Send, string | undefined, Toast | undefined, () => void] {
   const { connection } = useConnection();
-  const { publicKey } = useWallet();
-  const [state, setState] = useState<C.State>();
-  const [portfolioKey, setPortfolioKey] = useState<PublicKey>();
-  const [error, setError] = useState<string>();
+  const wallet = useWallet();
+  const [busy, setBusy] = useState<string>();
+  const [toast, setToast] = useState<Toast>();
+  const send = useCallback<Send>(
+    async (label, ixs) => {
+      if (!wallet.publicKey) return;
+      setBusy(label);
+      try {
+        // Percolator instructions can use several hundred thousand compute units.
+        const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }), ...ixs);
+        const sig = await wallet.sendTransaction(tx, connection);
+        await connection.confirmTransaction(sig, "confirmed");
+        setToast({ ok: true, text: `${label}: confirmed`, sig });
+        onDone();
+        return sig;
+      } catch (e: any) {
+        const logs: string[] = e?.logs ?? [];
+        const code = logs.map(l => l.match(/custom program error: (0x[0-9a-f]+)/)?.[1]).find(Boolean) ?? String(e?.message ?? "").match(/custom program error: (0x[0-9a-f]+)/)?.[1];
+        setToast({ ok: false, text: `${label} failed${code ? `: ${ERRORS[code] ?? code}` : `: ${e?.message ?? e}`}` });
+      } finally {
+        setBusy(undefined);
+      }
+    },
+    [wallet, connection, onDone],
+  );
+  return [send, busy, toast, () => setToast(undefined)];
+}
 
-  useEffect(() => {
-    if (!publicKey) return setPortfolioKey(undefined);
-    C.portfolioAddress(publicKey).then(setPortfolioKey);
-  }, [publicKey]);
+// ---------------------------------------------------------------- app shell
 
-  const refresh = useCallback(async () => {
-    try {
-      setState(await C.fetchState(connection, publicKey ?? undefined, portfolioKey));
-      setError(undefined);
-    } catch (e: any) {
-      setError(e.message ?? String(e));
-    }
-  }, [connection, publicKey, portfolioKey]);
+export default function App() {
+  const [route, go] = useRoute();
+  const [tick, setTick] = useState(0);
+  const refresh = useCallback(() => setTick(t => t + 1), []);
+  const [send, busy, toast, clearToast] = useSend(refresh);
+  const page = route[0] ?? "";
 
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 4000);
-    return () => clearInterval(id);
-  }, [refresh]);
+  return (
+    <div className="page">
+      <header className="top">
+        <a className="brand" href="#/">
+          <span className="logo" aria-hidden>◈</span>
+          <div>
+            <div className="brand-name">Percolator Vaults</div>
+            <div className="brand-sub">Keyless perp markets with liquidity built in · devnet</div>
+          </div>
+        </a>
+        <nav className="tabs">
+          <a className={page === "" || page === "m" ? "tab active" : "tab"} href="#/">Markets</a>
+          <a className={page === "launch" ? "tab active" : "tab"} href="#/launch">Launch a market</a>
+          <a className={page === "how" ? "tab active" : "tab"} href="#/how">How it works</a>
+        </nav>
+        <WalletMultiButton />
+      </header>
 
-  return { state, refresh, error, portfolioKey };
+      {page === "m" && route[1] ? (
+        <MarketPage vaultKey={route[1]} send={send} busy={busy} tick={tick} />
+      ) : page === "launch" ? (
+        <LaunchPage send={send} busy={busy} go={go} />
+      ) : page === "how" ? (
+        <HowPage />
+      ) : (
+        <MarketsPage go={go} tick={tick} />
+      )}
+
+      {toast && (
+        <div className={toast.ok ? "toast ok" : "toast err"} onClick={clearToast}>
+          {toast.text}
+          {toast.sig && <a href={explorer("tx", toast.sig)} target="_blank" rel="noreferrer"> · view</a>}
+        </div>
+      )}
+      <footer className="foot">
+        Unaudited experimental software on Solana devnet · vault program{" "}
+        <a href={explorer("address", C.VAULT_PROGRAM.toString())} target="_blank" rel="noreferrer">{short(C.VAULT_PROGRAM)}</a> · Percolator{" "}
+        <a href={explorer("address", C.PERCOLATOR.toString())} target="_blank" rel="noreferrer">{short(C.PERCOLATOR)}</a> ·{" "}
+        <a href="https://github.com/Commoneffort/percolator-vaults" target="_blank" rel="noreferrer">source</a>
+      </footer>
+    </div>
+  );
 }
 
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
@@ -54,209 +135,390 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
   );
 }
 
-export default function App() {
-  const { state, refresh, error, portfolioKey } = useChain();
-  const [tab, setTab] = useState<"vault" | "trade" | "how">("vault");
-  const { connection } = useConnection();
-  const wallet = useWallet();
-  const [busy, setBusy] = useState<string>();
-  const [toast, setToast] = useState<{ ok: boolean; text: string; sig?: string }>();
-
-  const send = useCallback(
-    async (label: string, ixs: TransactionInstruction[]) => {
-      if (!wallet.publicKey) return;
-      setBusy(label);
-      try {
-        // Percolator trades can use several hundred thousand compute units.
-        const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }), ...ixs);
-        const sig = await wallet.sendTransaction(tx, connection, { skipPreflight: false });
-        await connection.confirmTransaction(sig, "confirmed");
-        setToast({ ok: true, text: `${label}: confirmed`, sig });
-        await refresh();
-      } catch (e: any) {
-        const logs: string[] = e?.logs ?? [];
-        const code = logs.map(l => l.match(/custom program error: (0x[0-9a-f]+)/)?.[1]).find(Boolean);
-        setToast({ ok: false, text: `${label} failed${code ? ` (${explainError(code)})` : ""}: ${e.message ?? e}` });
-      } finally {
-        setBusy(undefined);
-      }
-    },
-    [wallet, connection, refresh],
-  );
-
-  return (
-    <div className="page">
-      <header className="top">
-        <div className="brand">
-          <span className="logo" aria-hidden>◈</span>
-          <div>
-            <div className="brand-name">Percolator Vaults</div>
-            <div className="brand-sub">Permissionless liquidity for Percolator perps · devnet</div>
-          </div>
-        </div>
-        <nav className="tabs">
-          {(["vault", "trade", "how"] as const).map(t => (
-            <button key={t} className={tab === t ? "tab active" : "tab"} onClick={() => setTab(t)}>
-              {t === "vault" ? "Provide liquidity" : t === "trade" ? "Trade SOL-PERP" : "How it works"}
-            </button>
-          ))}
-        </nav>
-        <WalletMultiButton />
-      </header>
-
-      {error && <div className="banner warn">RPC error: {error}</div>}
-      {!state ? (
-        <div className="loading">Loading vault…</div>
-      ) : tab === "vault" ? (
-        <VaultTab state={state} send={send} busy={busy} />
-      ) : tab === "trade" ? (
-        <TradeTab state={state} send={send} busy={busy} portfolioKey={portfolioKey} />
-      ) : (
-        <HowTab />
-      )}
-
-      {toast && (
-        <div className={toast.ok ? "toast ok" : "toast err"} onClick={() => setToast(undefined)}>
-          {toast.text}
-          {toast.sig && (
-            <a href={explorer("tx", toast.sig)} target="_blank" rel="noreferrer"> · view</a>
-          )}
-        </div>
-      )}
-      <footer className="foot">
-        Unaudited experimental software on devnet. Vault <a href={explorer("address", C.VAULT.toString())} target="_blank" rel="noreferrer">{short(C.VAULT)}</a> · program{" "}
-        <a href={explorer("address", C.VAULT_PROGRAM.toString())} target="_blank" rel="noreferrer">{short(C.VAULT_PROGRAM)}</a> · Percolator{" "}
-        <a href={explorer("address", C.PERCOLATOR.toString())} target="_blank" rel="noreferrer">{short(C.PERCOLATOR)}</a>
-      </footer>
-    </div>
-  );
+function Icon({ symbol }: { symbol: string }) {
+  const hue = [...symbol].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+  return <span className="coin" style={{ background: `hsl(${hue} 55% 42%)` }}>{symbol.slice(0, 1)}</span>;
 }
 
-const ERRORS: Record<string, string> = {
-  "0x5608": "vault not active", "0x560a": "claim your previous request first", "0x560b": "nothing to claim",
-  "0x560c": "epoch not over", "0x560d": "epoch not settled yet", "0x560e": "vault not flat yet", "0x5610": "amount is zero",
-  "0x1": "not enough test USDC: use Get test USDC", "0x15": "market busy: try again in a few seconds", "0x13": "market state stale: try again", "0xe": "not enough margin",
-};
-const explainError = (code: string) => ERRORS[code] ?? code;
+// ---------------------------------------------------------------- markets directory
 
-type TabProps = { state: C.State; send: (label: string, ixs: TransactionInstruction[]) => Promise<void>; busy?: string };
+type Card = { v: C.Vault; asset: C.Asset; nav: bigint };
 
-function VaultTab({ state, send, busy }: TabProps) {
-  const { publicKey } = useWallet();
-  const [amount, setAmount] = useState("100");
-  const [shares, setShares] = useState("");
-  const v = state.vault;
-  const nav = state.lp.capital + (state.lp.pnl > 0n ? state.lp.pnl : 0n) + state.buffer - v.reserved - v.pendingDeposit;
-  const sharePrice = state.shareSupply > 0n ? Number(nav) / C.USDC / (Number(state.shareSupply) / 10 ** C.SHARE_DECIMALS) : 1;
-  const epochEnd = v.epochStart + v.epochLen;
-  const slotsLeft = epochEnd > state.slot ? epochEnd - state.slot : 0n;
-  const reduceOnly = slotsLeft === 0n && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
-  const t = state.ticket;
-  const claimable = t && (t.deposit > 0n || t.withdraw > 0n) && t.epoch < v.epoch;
-  const pendingMine = t && (t.deposit > 0n || t.withdraw > 0n) && t.epoch === v.epoch;
-  const myValue = Number(state.userShares) / 10 ** C.SHARE_DECIMALS * sharePrice;
+function MarketsPage({ go, tick }: { go: (to: string) => void; tick: number }) {
+  const { connection } = useConnection();
+  const [cards, setCards] = useState<Card[]>();
+  const [err, setErr] = useState<string>();
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const [vaults, m] = await Promise.all([C.listVaults(connection), C.fetchMarket(connection)]);
+        const lps = await connection.getMultipleAccountsInfo(vaults.flatMap(v => [v.lpPortfolio, v.buffer]), "confirmed");
+        const out = vaults.map((v, i) => {
+          const lp = lps[2 * i] ? C.decodePortfolio(new Uint8Array(lps[2 * i]!.data), v.assetIndex) : undefined;
+          const b = lps[2 * i + 1];
+          const buf = b ? new DataView(b.data.buffer, b.data.byteOffset).getBigUint64(64, true) : 0n;
+          const nav = (lp ? lp.capital + (lp.pnl > 0n ? lp.pnl : 0n) : 0n) + buf - v.reserved - v.pendingDeposit;
+          return { v, asset: C.decodeAsset(m.data, v.assetIndex), nav };
+        });
+        out.sort((a, b) => (b.nav > a.nav ? 1 : b.nav < a.nav ? -1 : 0));
+        if (live) { setCards(out); setErr(undefined); }
+      } catch (e: any) { if (live) setErr(e.message); }
+    };
+    load();
+    const id = setInterval(load, 8000);
+    return () => { live = false; clearInterval(id); };
+  }, [connection, tick]);
 
-  const notEnough = BigInt(Math.floor(Number(amount || 0) * C.USDC)) > state.userCollateral;
-  const deposit = () => {
-    if (!publicKey) return;
-    const atoms = BigInt(Math.floor(Number(amount) * C.USDC));
-    if (atoms <= 0n) return;
-    const ixs: TransactionInstruction[] = [
-      createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
-    ];
-    if (claimable) ixs.push(...claimIxs(publicKey, t!.epoch));
-    ixs.push(C.requestDeposit(publicKey, atoms));
-    send("Deposit request", ixs);
-  };
-  const withdraw = () => {
-    if (!publicKey) return;
-    const s = shares ? BigInt(Math.floor(Number(shares) * 10 ** C.SHARE_DECIMALS)) : state.userShares;
-    const ixs: TransactionInstruction[] = [];
-    if (claimable) ixs.push(...claimIxs(publicKey, t!.epoch));
-    ixs.push(C.requestWithdraw(publicKey, s));
-    send("Withdraw request", ixs);
-  };
+  const tvl = cards?.reduce((a, c) => a + c.nav, 0n) ?? 0n;
+  const fills = cards?.reduce((a, c) => a + c.v.totalFills, 0n) ?? 0n;
+  const fees = cards?.reduce((a, c) => a + c.v.feesHarvested + c.asset.insurance, 0n) ?? 0n;
 
   return (
-    <main className="grid">
-      <section className="card span2">
-        <div className="card-head">
-          <h2>SOL-PERP liquidity vault</h2>
-          <span className={v.status === 1 ? "pill good" : "pill"}>{v.status === 1 ? "Active" : v.status === 2 ? "Wound down" : "Pending listing"}</span>
-        </div>
+    <main>
+      <section className="hero">
+        <h1>Launch a perpetual market on any Pyth price.<br /><span className="grad">Liquidity included. No keys.</span></h1>
         <p className="muted">
-          This vault listed its own SOL/USD perpetual on Percolator, priced by Pyth. It is the counterparty to traders and
-          collects the market's trading fees. No one holds an admin key: every parameter was fixed at creation, and every
-          maintenance step can be run by anyone.
+          Each market here was created by a vault on Anatoly Yakovenko's Percolator engine. The vault listed the market, owns every
+          key to it, and is the counterparty to every trade. Depositors earn the market's fees. No person can pause, change or drain it.
         </p>
-        <div className="stats">
-          <Stat label="Net asset value" value={`$${fmtUsd(nav)}`} sub={`${fmtShares(state.shareSupply)} shares`} />
-          <Stat label="Share price" value={`$${sharePrice.toFixed(4)}`} sub="per share" />
-          <Stat label="Fees harvested" value={`$${fmtUsd(v.feesHarvested)}`} sub={`insurance $${fmtUsd(state.asset.insurance)}`} />
-          <Stat label="Vault position" value={`${fmtSol(v.inventory)} SOL`} sub={`limit ±${fmtSol(v.maxInventory)} SOL`} />
-          <Stat label="SOL price" value={`$${fmtPrice(state.asset.price)}`} sub="Percolator mark (Pyth)" />
-          <Stat label={`Epoch ${v.epoch}`} value={slotsLeft > 0n ? `${Math.ceil(Number(slotsLeft) * SLOT_SECONDS / 60)} min left` : reduceOnly ? "Settling" : "Open"} sub={`${fmtUsd(v.pendingDeposit)} USDC in · ${fmtShares(v.pendingWithdraw)} shares out`} />
+        <div className="hero-cta">
+          <button className="btn primary" onClick={() => go("/launch")}>Launch a market</button>
+          <button className="btn ghost" onClick={() => go("/how")}>How it works</button>
+        </div>
+        <div className="stats four">
+          <Stat label="Markets" value={cards ? String(cards.length) : "…"} />
+          <Stat label="Liquidity" value={usd(tvl, 0)} sub="in all vaults" />
+          <Stat label="Fills" value={String(fills)} sub="trades matched by vaults" />
+          <Stat label="Fees earned" value={usd(fees)} sub="harvested + pending" />
         </div>
       </section>
-
-      <section className="card span2">
-        <h3>Your position</h3>
-        {!publicKey ? (
-          <p className="muted">Connect a wallet to deposit.</p>
-        ) : (
-          <>
-            <div className="row"><span>Shares</span><b>{fmtShares(state.userShares)}</b></div>
-            <div className="row"><span>Value</span><b>${myValue.toFixed(2)}</b></div>
-            <div className="row"><span>Wallet USDC (test)</span><b>{fmtUsd(state.userCollateral)}</b></div>
-            {pendingMine && (
-              <div className="note">
-                Queued for epoch {String(t!.epoch)}: {t!.deposit > 0n && `${fmtUsd(t!.deposit)} USDC deposit`} {t!.withdraw > 0n && `${fmtShares(t!.withdraw)} shares withdrawal`}. It settles at one price when the epoch rolls.
+      {err && <div className="banner warn">RPC error: {err}</div>}
+      <div className="market-grid">
+        {!cards ? <div className="loading">Loading markets…</div> : cards.map(c => (
+          <button key={c.v.key.toString()} className="market-card" onClick={() => go(`/m/${c.v.key.toString()}`)}>
+            <div className="mc-head">
+              <Icon symbol={c.v.feed!.symbol} />
+              <div>
+                <div className="mc-sym">{c.v.feed!.symbol}-PERP</div>
+                <div className="muted small">{c.v.feed!.name} · vault {short(c.v.key)}</div>
               </div>
-            )}
-            {claimable && (
-              <button className="btn primary wide" disabled={!!busy} onClick={() => send("Claim", claimIxs(publicKey, t!.epoch))}>
-                Claim epoch {String(t!.epoch)} result
-              </button>
-            )}
-            <Faucet />
-          </>
-        )}
-      </section>
-
-      <section className="card">
-        <h3>Deposit</h3>
-        <label className="field">
-          <span>USDC</span>
-          <input value={amount} onChange={e => setAmount(e.target.value)} inputMode="decimal" />
-        </label>
-        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1 || notEnough} onClick={deposit}>
-          {busy === "Deposit request" ? "Sending…" : "Request deposit"}
+              <div className="mc-price">{px(c.asset.price)}</div>
+            </div>
+            <div className="mc-row"><span>Liquidity</span><b>{usd(c.nav, 0)}</b></div>
+            <div className="mc-row"><span>Open interest</span><b>{units(c.asset.oiLong)} {c.v.feed!.symbol}</b></div>
+            <div className="mc-row"><span>Fees</span><b>{usd(c.v.feesHarvested + c.asset.insurance)}</b></div>
+            <div className="mc-row"><span>Epoch</span><b>{String(c.v.epoch)} · {Math.round(Number(c.v.epochLen) * SLOT_SECONDS / 60)} min</b></div>
+          </button>
+        ))}
+        <button className="market-card launch-card" onClick={() => go("/launch")}>
+          <div className="plus">+</div>
+          <div>Launch a new market</div>
+          <div className="muted small">Pick a Pyth feed, set limits, go live in two transactions.</div>
         </button>
-        {publicKey && notEnough && <p className="small down">You have {fmtUsd(state.userCollateral)} test USDC. Use "Get test USDC" first.</p>}
-        <p className="muted small">Priced at the next epoch roll, together with every other request, so nobody can trade against a stale share price.</p>
-      </section>
-
-      <section className="card">
-        <h3>Withdraw</h3>
-        <label className="field">
-          <span>Shares</span>
-          <input value={shares} placeholder={fmtShares(state.userShares)} onChange={e => setShares(e.target.value)} inputMode="decimal" />
-        </label>
-        <button className="btn wide" disabled={!publicKey || !!busy || state.userShares === 0n || v.status !== 1} onClick={withdraw}>
-          {busy === "Withdraw request" ? "Sending…" : "Request withdrawal"}
-        </button>
-        <p className="muted small">After the epoch ends the vault only takes trades that shrink its position. If a trader holds a position to block exits, anyone can make the vault close it one epoch later.</p>
-      </section>
+      </div>
     </main>
   );
 }
 
-function claimIxs(user: PublicKey, epoch: bigint) {
-  return [
-    createAssociatedTokenAccountIdempotentInstruction(user, C.ata(user, C.SHARE_MINT), user, C.SHARE_MINT),
-    createAssociatedTokenAccountIdempotentInstruction(user, C.ata(user, C.MINT), user, C.MINT),
-    C.claim(user, epoch),
+// ---------------------------------------------------------------- market page
+
+function useVault(vaultKey: PublicKey, tick: number) {
+  const { connection } = useConnection();
+  const { publicKey } = useWallet();
+  const [state, setState] = useState<C.State>();
+  const [err, setErr] = useState<string>();
+  const [history, setHistory] = useState<{ t: number; p: number }[]>([]);
+  const load = useCallback(async () => {
+    try {
+      const s = await C.fetchVault(connection, vaultKey, publicKey ?? undefined);
+      setState(s);
+      setErr(undefined);
+      const p = num(s.asset.price, 1e6);
+      setHistory(h => (h.length && h[h.length - 1].p === p && Date.now() - h[h.length - 1].t < 30_000 ? h : [...h.slice(-240), { t: Date.now(), p }]));
+    } catch (e: any) { setErr(e.message); }
+  }, [connection, vaultKey.toString(), publicKey?.toString()]);
+  useEffect(() => { setHistory([]); }, [vaultKey.toString()]);
+  useEffect(() => { load(); const id = setInterval(load, 4000); return () => clearInterval(id); }, [load, tick]);
+  return { state, err, history, reload: load };
+}
+
+function MarketPage({ vaultKey, send, busy, tick }: { vaultKey: string; send: Send; busy?: string; tick: number }) {
+  const key = useMemo(() => { try { return new PublicKey(vaultKey); } catch { return undefined; } }, [vaultKey]);
+  if (!key) return <div className="banner warn">Invalid market address.</div>;
+  return <MarketInner vaultKey={key} send={send} busy={busy} tick={tick} />;
+}
+
+function MarketInner({ vaultKey, send, busy, tick }: { vaultKey: PublicKey; send: Send; busy?: string; tick: number }) {
+  const { state, err, history, reload } = useVault(vaultKey, tick);
+  const [tab, setTab] = useState<"trade" | "lp">("trade");
+  const wrapped: Send = async (l, ixs) => { const r = await send(l, ixs); reload(); return r; };
+  if (err && !state) return <div className="banner warn">{err}</div>;
+  if (!state) return <div className="loading">Loading market…</div>;
+  const v = state.vault;
+  const sym = v.feed?.symbol ?? "?";
+  const nav = C.navOf(state);
+  const age = state.pyth ? Date.now() / 1000 - state.pyth.publish : undefined;
+  return (
+    <main className="grid">
+      <section className="card span2">
+        <div className="card-head">
+          <div className="mc-head">
+            <Icon symbol={sym} />
+            <div>
+              <h2>{sym}-PERP</h2>
+              <div className="muted small">
+                Pyth {v.feed?.name} feed{age !== undefined && ` · updated ${ago(age)}`} · vault{" "}
+                <a href={explorer("address", v.key.toString())} target="_blank" rel="noreferrer">{short(v.key)}</a>
+              </div>
+            </div>
+          </div>
+          <div className="price">{px(state.asset.price)}</div>
+        </div>
+        <Sparkline points={history} />
+        <div className="stats">
+          <Stat label="Vault liquidity" value={usd(nav)} sub={`${shares(state.shareSupply)} shares`} />
+          <Stat label="Vault position" value={`${units(v.inventory)} ${sym}`} sub={`limit ±${units(v.maxInventory)}, ≤${units(v.maxFill)} per fill`} />
+          <Stat label="Open interest" value={`${units(state.asset.oiLong)} ${sym}`} sub="long = short" />
+          <Stat label="Fees" value={usd(v.feesHarvested + state.asset.insurance)} sub={`${usd(v.feesHarvested)} harvested · floor ${usd(v.insuranceFloor, 0)}`} />
+          <Stat label="Leverage" value="10×" sub="0.05% fee per trade" />
+          <EpochStat state={state} />
+        </div>
+      </section>
+      <div className="span2 subtabs">
+        <button className={tab === "trade" ? "tab active" : "tab"} onClick={() => setTab("trade")}>Trade</button>
+        <button className={tab === "lp" ? "tab active" : "tab"} onClick={() => setTab("lp")}>Provide liquidity</button>
+      </div>
+      {tab === "trade" ? <TradePanel state={state} send={wrapped} busy={busy} /> : <LiquidityPanel state={state} send={wrapped} busy={busy} />}
+      <Activity vault={v} tick={tick} />
+    </main>
+  );
+}
+
+function EpochStat({ state }: { state: C.State }) {
+  const v = state.vault;
+  const end = v.epochStart + v.epochLen;
+  const left = end > state.slot ? end - state.slot : 0n;
+  const settling = left === 0n && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
+  return (
+    <Stat
+      label={`Epoch ${v.epoch}`}
+      value={left > 0n ? `${Math.max(1, Math.ceil(Number(left) * SLOT_SECONDS / 60))} min left` : settling ? "Settling" : "Rolling"}
+      sub={`${usd(v.pendingDeposit)} in · ${shares(v.pendingWithdraw)} shares out`}
+    />
+  );
+}
+
+function Sparkline({ points }: { points: { t: number; p: number }[] }) {
+  if (points.length < 2) return <div className="spark empty muted small">Price chart builds live while this page is open.</div>;
+  const w = 1000, h = 120;
+  const ps = points.map(x => x.p);
+  const lo = Math.min(...ps), hi = Math.max(...ps);
+  const span = hi - lo || hi * 0.001 || 1;
+  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  const xy = points.map(pt => [((pt.t - t0) / (t1 - t0 || 1)) * w, h - 8 - ((pt.p - lo) / span) * (h - 16)]);
+  const d = xy.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const up = ps[ps.length - 1] >= ps[0];
+  return (
+    <svg className="spark" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" role="img" aria-label="price chart">
+      <path d={`${d} L${w},${h} L0,${h} Z`} className={up ? "area up" : "area down"} />
+      <path d={d} className={up ? "line up" : "line down"} vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function Activity({ vault, tick }: { vault: C.Vault; tick: number }) {
+  const { connection } = useConnection();
+  const [rows, setRows] = useState<{ sig: string; when: number; what: string }[]>();
+  const seen = useRef(new Map<string, string>());
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const sigs = (await connection.getSignaturesForAddress(vault.key, { limit: 12 }, "confirmed")).filter(s => !s.err);
+        const fresh = sigs.filter(s => !seen.current.has(s.signature));
+        if (fresh.length) {
+          const txs = await connection.getTransactions(fresh.map(s => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+          txs.forEach((tx, i) => seen.current.set(fresh[i].signature, describe(tx, vault)));
+        }
+        if (live) setRows(sigs.map(s => ({ sig: s.signature, when: s.blockTime ?? 0, what: seen.current.get(s.signature) ?? "Transaction" })));
+      } catch { /* public RPC may rate-limit history; keep the last list */ }
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => { live = false; clearInterval(id); };
+  }, [connection, vault.key.toString(), tick]);
+  return (
+    <section className="card span2">
+      <h3>Activity</h3>
+      {!rows ? <div className="muted small">Loading…</div> : rows.length === 0 ? <div className="muted small">No activity yet.</div> : (
+        <div className="activity">
+          {rows.map(r => (
+            <a key={r.sig} className="act-row" href={explorer("tx", r.sig)} target="_blank" rel="noreferrer">
+              <span>{r.what}</span>
+              <span className="muted small">{r.when ? ago(Date.now() / 1000 - r.when) : ""}</span>
+            </a>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+const VAULT_TAGS: Record<number, string> = {
+  16: "Vault created", 17: "Deposit requested", 18: "Withdrawal requested", 19: "Epoch settled", 20: "Claimed",
+  21: "Matcher renewed", 22: "Profit converted", 23: "Market settled", 24: "Redeemed", 25: "Swept", 26: "Market listed", 27: "Fees harvested", 28: "Position unwound",
+};
+
+function describe(tx: any, v: C.Vault): string {
+  if (!tx) return "Transaction";
+  const msg = tx.transaction.message;
+  const keys: PublicKey[] = (msg.staticAccountKeys ?? msg.accountKeys) as PublicKey[];
+  const ixs: any[] = msg.compiledInstructions ?? msg.instructions;
+  for (const ix of ixs) {
+    const program = keys[ix.programIdIndex];
+    const data: Uint8Array = ix.data instanceof Uint8Array ? ix.data : new Uint8Array(ix.data);
+    if (program.equals(C.VAULT_PROGRAM) && VAULT_TAGS[data[0]]) {
+      if (data[0] === 17) return `Deposit requested · ${usd(new DataView(data.buffer, data.byteOffset).getBigUint64(1, true))}`;
+      return VAULT_TAGS[data[0]];
+    }
+    if (program.equals(C.PERCOLATOR) && data[0] === 10) {
+      const dv = new DataView(data.buffer, data.byteOffset);
+      const lo = dv.getBigUint64(51, true), hi = dv.getBigInt64(59, true); // size_q follows ids, epochs, sequence, asset and market id
+      const size = (hi << 64n) + lo;
+      return `${size > 0n ? "Long" : "Short"} ${units(size < 0n ? -size : size)} ${v.feed?.symbol ?? ""} vs vault`;
+    }
+    if (program.equals(C.PERCOLATOR) && data[0] === 5) return "Keeper crank";
+  }
+  return "Transaction";
+}
+
+// ---------------------------------------------------------------- trade
+
+function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
+  const { publicKey } = useWallet();
+  const { connection } = useConnection();
+  const [size, setSize] = useState("1");
+  const [margin, setMargin] = useState("100");
+  const v = state.vault, p = state.portfolio, pf = state.portfolioKey, sym = v.feed?.symbol ?? "";
+  const notional = Number(size || 0) * num(state.asset.price, 1e6);
+  const usdcAtoms = BigInt(Math.floor(Number(margin || 0) * C.USDC));
+
+  const create = async () => {
+    if (!publicKey || !pf) return;
+    await send("Create trading account", [
+      SystemProgram.createAccountWithSeed({
+        fromPubkey: publicKey, basePubkey: publicKey, seed: C.portfolioSeed(v.assetIndex), newAccountPubkey: pf,
+        lamports: await connection.getMinimumBalanceForRentExemption(C.PORTFOLIO_LEN), space: C.PORTFOLIO_LEN, programId: C.PERCOLATOR,
+      }),
+      C.initPortfolio(publicKey, pf),
+    ]);
+  };
+  const trade = (sign: 1n | -1n) => {
+    if (!publicKey || !pf || !p) return;
+    const q = BigInt(Math.round(Number(size) * 1e6)) * sign;
+    send(`${sign > 0n ? "Long" : "Short"} ${size} ${sym}`, [C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, q)]);
+  };
+  const close = () => {
+    if (!publicKey || !pf || !p || p.position === 0n) return;
+    send("Close position", [C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, -p.position)]);
+  };
+
+  return (
+    <>
+      <section className="card">
+        <h3>Your {sym} account</h3>
+        {!publicKey ? <p className="muted">Connect a wallet to trade.</p> : !p ? (
+          <>
+            <p className="muted small">Trading needs a Percolator account for this market (about 0.067 devnet SOL of rent, yours to reclaim).</p>
+            <button className="btn primary wide" disabled={!!busy} onClick={create}>Create trading account</button>
+            <Faucet />
+          </>
+        ) : (
+          <>
+            <div className="row"><span>Margin</span><b>{usd(p.capital)}</b></div>
+            <div className="row"><span>Position</span><b className={p.position > 0n ? "up" : p.position < 0n ? "down" : ""}>{units(p.position)} {sym}</b></div>
+            <div className="row"><span>Position value</span><b>${fmt(Math.abs(num(p.position, 1e6)) * num(state.asset.price, 1e6))}</b></div>
+            <div className="row"><span>Wallet test USDC</span><b>{usd(state.userCollateral)}</b></div>
+            <label className="field"><span>USDC</span><input value={margin} onChange={e => setMargin(e.target.value)} inputMode="decimal" /></label>
+            <div className="btns">
+              <button className="btn" disabled={!!busy || usdcAtoms <= 0n || usdcAtoms > state.userCollateral}
+                onClick={() => send("Add margin", [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.percDeposit(publicKey, pf!, p, usdcAtoms)])}>Add margin</button>
+              <button className="btn" disabled={!!busy || p.position !== 0n || usdcAtoms <= 0n || usdcAtoms > p.capital} onClick={() => send("Withdraw margin", [C.percWithdraw(publicKey, pf!, p, usdcAtoms)])}>Withdraw</button>
+            </div>
+            <Faucet />
+          </>
+        )}
+      </section>
+      <section className="card">
+        <h3>Trade {sym}-PERP</h3>
+        <label className="field"><span>Size ({sym})</span><input value={size} onChange={e => setSize(e.target.value)} inputMode="decimal" /></label>
+        <div className="muted small">Notional ≈ ${fmt(notional)} · margin ≈ ${fmt(notional / 10)} · fee ≈ ${fmt(notional * 0.0005)}</div>
+        <div className="btns">
+          <button className="btn long" disabled={!p || !!busy} onClick={() => trade(1n)}>Long</button>
+          <button className="btn short" disabled={!p || !!busy} onClick={() => trade(-1n)}>Short</button>
+        </div>
+        <button className="btn ghost wide" disabled={!p || p.position === 0n || !!busy} onClick={close}>Close position</button>
+        <p className="muted small">Trades settle at Percolator's mark price. The vault may fill less than you ask when it nears its position limit or is settling an epoch.</p>
+      </section>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------- liquidity
+
+function LiquidityPanel({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
+  const { publicKey } = useWallet();
+  const [amount, setAmount] = useState("100");
+  const [out, setOut] = useState("");
+  const v = state.vault, t = state.ticket;
+  const nav = C.navOf(state);
+  const price = state.shareSupply > 0n ? num(nav, C.USDC) / num(state.shareSupply, 10 ** C.SHARE_DECIMALS) : 1;
+  const claimable = !!t && (t.deposit > 0n || t.withdraw > 0n) && t.epoch < v.epoch;
+  const pending = !!t && (t.deposit > 0n || t.withdraw > 0n) && t.epoch === v.epoch;
+  const atoms = BigInt(Math.floor(Number(amount || 0) * C.USDC));
+  const tooMuch = atoms > state.userCollateral;
+  const claimIxs = (u: PublicKey) => [
+    createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, v.shareMint), u, v.shareMint),
+    createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, C.MINT), u, C.MINT),
+    C.claim(v, u, t!.epoch),
   ];
+  return (
+    <>
+      <section className="card">
+        <h3>Your liquidity</h3>
+        {!publicKey ? <p className="muted">Connect a wallet to provide liquidity.</p> : (
+          <>
+            <div className="row"><span>Shares</span><b>{shares(state.userShares)}</b></div>
+            <div className="row"><span>Value</span><b>${fmt(num(state.userShares, 10 ** C.SHARE_DECIMALS) * price)}</b></div>
+            <div className="row"><span>Share price</span><b>${fmt(price, 4)}</b></div>
+            <div className="row"><span>Wallet test USDC</span><b>{usd(state.userCollateral)}</b></div>
+            {pending && <div className="note">Queued for epoch {String(t!.epoch)}: {t!.deposit > 0n && `${usd(t!.deposit)} deposit`} {t!.withdraw > 0n && `${shares(t!.withdraw)} shares out`}. It settles at one price when the epoch ends.</div>}
+            {claimable && <button className="btn primary wide" disabled={!!busy} onClick={() => send("Claim", claimIxs(publicKey))}>Claim epoch {String(t!.epoch)} result</button>}
+            <Faucet />
+          </>
+        )}
+      </section>
+      <section className="card">
+        <h3>Deposit or withdraw</h3>
+        <label className="field"><span>Deposit USDC</span><input value={amount} onChange={e => setAmount(e.target.value)} inputMode="decimal" /></label>
+        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1 || atoms <= 0n || tooMuch}
+          onClick={() => publicKey && send("Deposit request", [
+            ...(claimable ? claimIxs(publicKey) : []),
+            createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
+            C.requestDeposit(v, publicKey, atoms),
+          ])}>Request deposit</button>
+        {publicKey && tooMuch && <p className="small down">You have {usd(state.userCollateral)} test USDC. Use "Get test USDC" first.</p>}
+        <label className="field"><span>Withdraw shares</span><input value={out} placeholder={shares(state.userShares)} onChange={e => setOut(e.target.value)} inputMode="decimal" /></label>
+        <button className="btn wide" disabled={!publicKey || !!busy || state.userShares === 0n || v.status !== 1}
+          onClick={() => publicKey && send("Withdraw request", [
+            ...(claimable ? claimIxs(publicKey) : []),
+            C.requestWithdraw(v, publicKey, out ? BigInt(Math.floor(Number(out) * 10 ** C.SHARE_DECIMALS)) : state.userShares),
+          ])}>Request withdrawal</button>
+        <p className="muted small">Requests settle together at one price when the epoch ends, so nobody trades against a stale share price. Withdrawals can't be blocked: if a trader holds a position to stop the vault going flat, anyone can make the vault close it one epoch later.</p>
+      </section>
+    </>
+  );
 }
 
 function Faucet() {
@@ -269,9 +531,7 @@ function Faucet() {
       const r = await fetch("/api/faucet", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ address: publicKey.toString() }) });
       const j = await r.json();
       setMsg(r.ok ? `Sent ${j.usdc} test USDC${j.sol ? ` and ${j.sol} SOL` : ""}` : j.error);
-    } catch (e: any) {
-      setMsg(e.message);
-    }
+    } catch (e: any) { setMsg(e.message); }
   };
   return (
     <div className="faucet">
@@ -281,117 +541,159 @@ function Faucet() {
   );
 }
 
-function TradeTab({ state, send, busy, portfolioKey }: TabProps & { portfolioKey?: PublicKey }) {
-  const { publicKey } = useWallet();
-  const [size, setSize] = useState("1");
-  const [margin, setMargin] = useState("100");
-  const p = state.portfolio;
-  const a = state.asset;
-  const notional = Number(size || 0) * Number(a.price) / 1e6;
+// ---------------------------------------------------------------- launch
 
-  const createPortfolio = async () => {
-    if (!publicKey || !portfolioKey) return;
-    send("Create trading account", [
-      SystemProgram.createAccountWithSeed({
-        fromPubkey: publicKey,
-        basePubkey: publicKey,
-        seed: C.PORTFOLIO_SEED,
-        newAccountPubkey: portfolioKey,
-        lamports: await rentFor(C.PORTFOLIO_LEN),
-        space: C.PORTFOLIO_LEN,
-        programId: C.PERCOLATOR,
-      }),
-      C.initPortfolio(publicKey, portfolioKey),
-    ]);
-  };
+const EPOCHS = [
+  { label: "10 minutes", slots: 1_500n },
+  { label: "1 hour", slots: 9_000n },
+  { label: "1 day", slots: 216_000n },
+];
+
+function LaunchPage({ send, busy, go }: { send: Send; busy?: string; go: (to: string) => void }) {
   const { connection } = useConnection();
-  const rentFor = (len: number) => connection.getMinimumBalanceForRentExemption(len);
+  const { publicKey } = useWallet();
+  const [prices, setPrices] = useState<Record<string, { e6: bigint; publish: number }>>({});
+  const [feed, setFeed] = useState(C.FEEDS[0]);
+  const [maxPos, setMaxPos] = useState("50000");
+  const [maxFill, setMaxFill] = useState("10000");
+  const [epoch, setEpoch] = useState(0);
+  const [floor, setFloor] = useState("100");
+  const [seedDeposit, setSeedDeposit] = useState("500");
+  const [step, setStep] = useState(0);
+  const [created, setCreated] = useState<PublicKey>();
+  const [taken, setTaken] = useState<Record<string, number>>({});
 
-  const trade = (sign: 1n | -1n) => {
-    if (!publicKey || !portfolioKey || !p) return;
-    const q = BigInt(Math.round(Number(size) * 1e6)) * sign;
-    send(sign > 0n ? "Long" : "Short", [C.tradeAgainstVault(publicKey, portfolioKey, p, state.lp, a, q)]);
+  useEffect(() => {
+    const load = async () => {
+      const accs = await connection.getMultipleAccountsInfo(C.FEEDS.map(f => C.feedAccount(f.id)));
+      const out: Record<string, { e6: bigint; publish: number }> = {};
+      accs.forEach((a, i) => { if (a) out[C.FEEDS[i].symbol] = C.decodePyth(new Uint8Array(a.data)); });
+      setPrices(out);
+      const vs = await C.listVaults(connection).catch(() => [] as C.Vault[]);
+      const counts: Record<string, number> = {};
+      vs.forEach(v => { if (v.feed) counts[v.feed.symbol] = (counts[v.feed.symbol] ?? 0) + 1; });
+      setTaken(counts);
+    };
+    load();
+    const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, [connection]);
+
+  const price = prices[feed.symbol] ? num(prices[feed.symbol].e6, 1e6) : 0;
+  // Limits are whole tokens; a fractional result rounds down, but never below one token.
+  const toUnits = (usdStr: string) => (price > 0 ? BigInt(Math.max(1, Math.floor(Number(usdStr || 0) / price))) : 0n);
+  const invUnits = toUnits(maxPos), fillUnits = toUnits(maxFill);
+  const valid = price > 0 && invUnits > 0n && fillUnits > 0n && fillUnits <= invUnits;
+
+  const list = async (vault: PublicKey) => {
+    if (!publicKey) return false;
+    // Listing appends a new asset slot, so read the market right before it.
+    const m = await C.fetchMarket(connection);
+    const pyth = C.decodePyth(new Uint8Array((await connection.getAccountInfo(C.feedAccount(feed.id)))!.data));
+    return !!(await send(`List ${feed.symbol}-PERP`, [
+      createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
+      C.listAsset(publicKey, vault, feed.id, m.slots, m.nextMarketId, pyth.e6),
+    ]));
   };
-  const close = () => {
-    if (!publicKey || !portfolioKey || !p || p.position === 0n) return;
-    send("Close", [C.tradeAgainstVault(publicKey, portfolioKey, p, state.lp, a, -p.position)]);
+
+  const launch = async () => {
+    if (!publicKey || !valid) return;
+    let vault = created;
+    if (!vault) {
+      setStep(1);
+      const m = await C.fetchMarket(connection);
+      const seed = BigInt(Date.now()) * 1000n + BigInt(Math.floor(Math.random() * 1000));
+      const r = C.initVault(publicKey, {
+        seed, feedHex: feed.id, maxFillUnits: fillUnits, maxInventoryUnits: invUnits,
+        epochLenSlots: EPOCHS[epoch].slots, insuranceFloor: BigInt(Math.floor(Number(floor || 0) * C.USDC)), frontier: m.nextMarketId,
+      });
+      if (!(await send("Create vault", [r.ix]))) return setStep(0);
+      vault = r.vault;
+      setCreated(vault);
+    }
+    setStep(2);
+    if (!(await list(vault))) return;
+    setStep(3);
+    const dep = BigInt(Math.floor(Number(seedDeposit || 0) * C.USDC));
+    if (dep > 0n) {
+      const s = await C.fetchVault(connection, vault, publicKey);
+      if (s.userCollateral >= dep) await send("Seed deposit", [C.requestDeposit(s.vault, publicKey, dep)]);
+    }
+    setCreated(undefined);
+    setStep(0);
+    go(`/m/${vault.toString()}`);
   };
 
   return (
     <main className="grid">
       <section className="card span2">
-        <div className="card-head">
-          <h2>SOL-PERP</h2>
-          <span className="price">${fmtPrice(a.price)}</span>
-        </div>
-        <div className="stats">
-          <Stat label="Open interest" value={`${fmtSol(a.oiLong)} SOL`} sub="long = short" />
-          <Stat label="Counterparty" value="Vault" sub={`takes up to ${fmtSol(state.vault.maxInventory)} SOL net`} />
-          <Stat label="Max leverage" value="10×" sub="10% initial margin" />
-          <Stat label="Trading fee" value="0.05%" sub="funds the vault's insurance" />
+        <h2>Launch a perpetual market</h2>
+        <p className="muted">
+          Two transactions create a vault and let it list a new {feed.symbol}-PERP market on Percolator. The vault becomes the
+          market's only admin and oracle authority, so nobody, including you, can change or drain it afterwards. You pay about 0.12
+          devnet SOL of rent and a 1 USDC listing fee. Then anyone can trade it and anyone can deposit into its vault.
+        </p>
+        <div className="feed-grid">
+          {C.FEEDS.map(f => (
+            <button key={f.symbol} disabled={!!created} className={f.symbol === feed.symbol ? "feed active" : "feed"} onClick={() => setFeed(f)}>
+              <Icon symbol={f.symbol} />
+              <div className="feed-sym">{f.symbol}</div>
+              <div className="muted small">{prices[f.symbol] ? px(prices[f.symbol].e6) : "…"}</div>
+              {taken[f.symbol] ? <div className="tag">{taken[f.symbol]} live</div> : null}
+            </button>
+          ))}
         </div>
       </section>
       <section className="card">
-        <h3>Your account</h3>
-        {!publicKey ? (
-          <p className="muted">Connect a wallet to trade.</p>
-        ) : !p ? (
-          <>
-            <p className="muted">Trading needs a Percolator portfolio account (about 0.067 devnet SOL of rent, yours to reclaim).</p>
-            <button className="btn primary wide" disabled={!!busy} onClick={createPortfolio}>Create trading account</button>
-          </>
-        ) : (
-          <>
-            <div className="row"><span>Margin</span><b>${fmtUsd(p.capital)}</b></div>
-            <div className="row"><span>Position</span><b className={p.position > 0n ? "up" : p.position < 0n ? "down" : ""}>{fmtSol(p.position)} SOL</b></div>
-            <div className="row"><span>Realized PnL</span><b>${fmtUsd(p.pnl)}</b></div>
-            <label className="field"><span>USDC</span><input value={margin} onChange={e => setMargin(e.target.value)} /></label>
-            <div className="btns">
-              <button className="btn" disabled={!!busy} onClick={() => send("Add margin", [C.percDeposit(publicKey, portfolioKey!, p, BigInt(Math.floor(Number(margin) * C.USDC)))])}>Add margin</button>
-              <button className="btn" disabled={!!busy || p.position !== 0n} onClick={() => send("Withdraw margin", [C.percWithdraw(publicKey, portfolioKey!, p, BigInt(Math.floor(Number(margin) * C.USDC)))])}>Withdraw</button>
-            </div>
-            <Faucet />
-          </>
-        )}
+        <h3>Risk limits (fixed forever)</h3>
+        <label className="field"><span>Max vault position (USD)</span><input value={maxPos} onChange={e => setMaxPos(e.target.value)} inputMode="decimal" /></label>
+        <div className="muted small">= {String(invUnits)} {feed.symbol} at today's price</div>
+        <label className="field"><span>Max per trade (USD)</span><input value={maxFill} onChange={e => setMaxFill(e.target.value)} inputMode="decimal" /></label>
+        <div className="muted small">= {String(fillUnits)} {feed.symbol}</div>
+        <label className="field"><span>Insurance kept for traders (USD)</span><input value={floor} onChange={e => setFloor(e.target.value)} inputMode="decimal" /></label>
+        <div className="field"><span>Epoch length</span>
+          <div className="seg">{EPOCHS.map((e, i) => <button key={e.label} className={i === epoch ? "seg-b active" : "seg-b"} onClick={() => setEpoch(i)}>{e.label}</button>)}</div>
+        </div>
       </section>
       <section className="card">
-        <h3>Trade</h3>
-        <label className="field"><span>Size (SOL)</span><input value={size} onChange={e => setSize(e.target.value)} inputMode="decimal" /></label>
-        <div className="muted small">Notional ≈ ${notional.toFixed(2)} · margin needed ≈ ${(notional / 10).toFixed(2)}</div>
-        <div className="btns">
-          <button className="btn long" disabled={!p || !!busy} onClick={() => trade(1n)}>Long</button>
-          <button className="btn short" disabled={!p || !!busy} onClick={() => trade(-1n)}>Short</button>
-        </div>
-        <button className="btn ghost wide" disabled={!p || p.position === 0n || !!busy} onClick={close}>Close position</button>
-        <p className="muted small">Trades settle at Percolator's mark price. If the vault is at its limit or settling an epoch, it may fill less than you ask, or nothing.</p>
+        <h3>Go live</h3>
+        <label className="field"><span>Your seed deposit (USDC, optional)</span><input value={seedDeposit} onChange={e => setSeedDeposit(e.target.value)} inputMode="decimal" /></label>
+        <ol className="stepper">
+          <li className={step > 1 || created ? "done" : step === 1 ? "active" : ""}>Create the vault and its LP account</li>
+          <li className={step > 2 ? "done" : step === 2 ? "active" : ""}>List {feed.symbol}-PERP with its Pyth feed</li>
+          <li className={step === 3 ? "active" : ""}>Seed deposit (settles when the first epoch ends)</li>
+        </ol>
+        <button className="btn primary wide" disabled={!publicKey || !valid || !!busy} onClick={launch}>
+          {!publicKey ? "Connect a wallet" : busy ? `${busy}…` : created ? `Retry listing ${feed.symbol}-PERP` : `Launch ${feed.symbol}-PERP`}
+        </button>
+        <Faucet />
       </section>
     </main>
   );
 }
 
-function HowTab() {
-  const steps = useMemo(
-    () => [
-      ["Anyone creates a vault", "Parameters are fixed forever at creation: spread, fill and inventory limits, epoch length, price feed, insurance floor. There is no admin instruction in the program."],
-      ["The vault lists its own market", "It activates a new Percolator asset and names itself as that asset's admin, insurance operator, backing authority and oracle authority. No person holds any of those keys; prices come from Pyth."],
-      ["The vault is the counterparty", "The vault program is also the matcher Percolator calls on every trade, with inventory caps enforced on-chain. Trades settle at Percolator's mark price."],
-      ["Fees become yield", "Trading fees land in the asset's insurance. Anyone can harvest what is above the fixed floor into the vault; the floor stays to protect traders."],
-      ["Epochs keep share prices honest", "Deposits and withdrawals queue during an epoch and settle together at one price once the vault is flat. Withdrawals are priced conservatively and deposits pay for unharvested fees, so neither side can dilute the other."],
-      ["Nobody can lock the exits", "After an epoch, the vault only takes trades that shrink its position. If someone holds a position to block exits, anyone can make the vault close it through Percolator one epoch later."],
-      ["If the market shuts down", "When the market is resolved, anyone can settle the vault's position; queued deposits are refunded and shares redeem pro rata."],
-    ],
-    [],
-  );
+// ---------------------------------------------------------------- how
+
+function HowPage() {
+  const steps = [
+    ["Percolator already lets anyone list a market", "Its engine supports permissionless listing for a fee. On its own, though, a new market has no liquidity, and whoever lists it holds its admin keys: they can shut it down, rotate its keys or withdraw its insurance."],
+    ["A vault lists the market instead of a person", "The vault program signs the listing, so the vault becomes the market's admin, insurance operator, backing authority and oracle authority. The program has no instruction that uses those powers, and the Pyth feed and every limit are fixed at creation."],
+    ["The vault is the market maker", "The vault program is also the matcher Percolator calls on every trade. It fills takers against the vault's pooled capital, within a per-trade cap and a total position cap. Trades settle at Percolator's mark price."],
+    ["Fees become depositor yield", "Every trade pays a fee into the market's insurance. Anyone can harvest the part above the fixed floor into the vault. The floor stays to protect traders."],
+    ["Epochs keep share prices honest", "Deposits and withdrawals queue during an epoch and settle together at one price once the vault is flat. Withdrawals are priced conservatively and deposits pay for unharvested fees, so neither side can dilute the other."],
+    ["Nobody can lock the exits", "After an epoch, the vault only takes trades that shrink its position. If someone holds a position to stop it going flat, anyone can make the vault close its own position through Percolator one epoch later."],
+    ["If the market is shut down", "Anyone can settle the vault through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata."],
+  ];
   return (
     <main className="grid">
       <section className="card span2">
         <h2>How it works</h2>
-        <ol className="steps">
-          {steps.map(([t, d]) => (
-            <li key={t}><b>{t}.</b> {d}</li>
-          ))}
-        </ol>
-        <p className="muted small">Built on Anatoly Yakovenko's Percolator risk engine. The vault program has no admin instruction and is tested against the production Percolator binary, including attack scenarios. On devnet the program is still upgradeable by its deployer; a mainnet deployment would burn that authority. It has not been audited.</p>
+        <ol className="steps">{steps.map(([t, d]) => <li key={t}><b>{t}.</b> {d}</li>)}</ol>
+        <p className="muted small">
+          Built on Anatoly Yakovenko's Percolator risk engine. The vault program has 35 tests that run it against the production
+          Percolator binary, including attack scenarios. On devnet the program is still upgradeable by its deployer; a mainnet
+          deployment would burn that authority. Nothing here has been audited.
+        </p>
       </section>
     </main>
   );
