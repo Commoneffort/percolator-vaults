@@ -187,7 +187,7 @@ function VaultTab({ state, send, busy }: TabProps) {
         </p>
         <div className="stats">
           <Stat label="Net asset value" value={`$${fmtUsd(nav)}`} sub={`${fmtShares(state.shareSupply)} shares`} />
-          <Stat label="Share price" value={`$${(sharePrice * 1000).toFixed(4)}`} sub="per 1,000 shares" />
+          <Stat label="Share price" value={`$${sharePrice.toFixed(4)}`} sub="per share" />
           <Stat label="Fees harvested" value={`$${fmtUsd(v.feesHarvested)}`} sub={`insurance $${fmtUsd(state.asset.insurance)}`} />
           <Stat label="Vault position" value={`${fmtSol(v.inventory)} SOL`} sub={`limit ±${fmtSol(v.maxInventory)} SOL`} />
           <Stat label="SOL price" value={`$${fmtPrice(state.asset.price)}`} sub="Percolator mark (Pyth)" />
@@ -195,7 +195,7 @@ function VaultTab({ state, send, busy }: TabProps) {
         </div>
       </section>
 
-      <section className="card">
+      <section className="card span2">
         <h3>Your position</h3>
         {!publicKey ? (
           <p className="muted">Connect a wallet to deposit.</p>
