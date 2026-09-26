@@ -135,7 +135,7 @@ export default function App() {
 const ERRORS: Record<string, string> = {
   "0x5608": "vault not active", "0x560a": "claim your previous request first", "0x560b": "nothing to claim",
   "0x560c": "epoch not over", "0x560d": "epoch not settled yet", "0x560e": "vault not flat yet", "0x5610": "amount is zero",
-  "0x15": "market busy: try again in a few seconds", "0x13": "market state stale: try again", "0xe": "not enough margin",
+  "0x1": "not enough test USDC: use Get test USDC", "0x15": "market busy: try again in a few seconds", "0x13": "market state stale: try again", "0xe": "not enough margin",
 };
 const explainError = (code: string) => ERRORS[code] ?? code;
 
@@ -156,10 +156,14 @@ function VaultTab({ state, send, busy }: TabProps) {
   const pendingMine = t && (t.deposit > 0n || t.withdraw > 0n) && t.epoch === v.epoch;
   const myValue = Number(state.userShares) / 10 ** C.SHARE_DECIMALS * sharePrice;
 
+  const notEnough = BigInt(Math.floor(Number(amount || 0) * C.USDC)) > state.userCollateral;
   const deposit = () => {
     if (!publicKey) return;
     const atoms = BigInt(Math.floor(Number(amount) * C.USDC));
-    const ixs = [];
+    if (atoms <= 0n) return;
+    const ixs: TransactionInstruction[] = [
+      createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
+    ];
     if (claimable) ixs.push(...claimIxs(publicKey, t!.epoch));
     ixs.push(C.requestDeposit(publicKey, atoms));
     send("Deposit request", ixs);
@@ -167,7 +171,7 @@ function VaultTab({ state, send, busy }: TabProps) {
   const withdraw = () => {
     if (!publicKey) return;
     const s = shares ? BigInt(Math.floor(Number(shares) * 10 ** C.SHARE_DECIMALS)) : state.userShares;
-    const ixs = [];
+    const ixs: TransactionInstruction[] = [];
     if (claimable) ixs.push(...claimIxs(publicKey, t!.epoch));
     ixs.push(C.requestWithdraw(publicKey, s));
     send("Withdraw request", ixs);
@@ -225,9 +229,10 @@ function VaultTab({ state, send, busy }: TabProps) {
           <span>USDC</span>
           <input value={amount} onChange={e => setAmount(e.target.value)} inputMode="decimal" />
         </label>
-        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1} onClick={deposit}>
+        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1 || notEnough} onClick={deposit}>
           {busy === "Deposit request" ? "Sending…" : "Request deposit"}
         </button>
+        {publicKey && notEnough && <p className="small down">You have {fmtUsd(state.userCollateral)} test USDC. Use "Get test USDC" first.</p>}
         <p className="muted small">Priced at the next epoch roll, together with every other request, so nobody can trade against a stale share price.</p>
       </section>
 
