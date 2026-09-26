@@ -75,7 +75,7 @@ async function build() {
     const owner = new PublicKey(d.slice(P.owner, P.owner + 32)).toBase58();
     if (vaultKeys.has(owner)) continue; // vault LP portfolios are market makers, not traders
     const f = await flowsFor(conn, p.pubkey);
-    if (f.deposits === 0n && f.trades === 0) continue;
+    if (f.trades === 0) continue; // only wallets that have traded are ranked
     const equity = u128(d, P.capital) + i128(d, P.pnl);
     const positions: { symbol: string; size: number }[] = [];
     for (let i = 0; i < 16; i++) {
