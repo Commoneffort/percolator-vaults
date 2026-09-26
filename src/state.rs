@@ -108,7 +108,11 @@ pub struct VaultState {
     pub created_slot: u64,
     pub total_fills: u64,
     pub total_fees_harvested: u64,
-    pub _reserved: [u8; 56],
+    /// Canonical vaults: the opener's share of harvested fees, set aside in the buffer (and
+    /// counted in `reserved_assets`) until the opener claims it.
+    pub opener_fees_owed: u64,
+    pub opener_fees_total: u64,
+    pub _reserved: [u8; 40],
 }
 
 pub const VAULT_STATE_LEN: usize = core::mem::size_of::<VaultState>();

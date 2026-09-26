@@ -20,7 +20,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 1. **One market per feed.** An operate-mode vault's address is derived from (market, Pyth feed), so each price feed can have exactly one vault, and so one market and one shared liquidity pool. Whoever opens it only picks the feed: every canonical vault runs on the same fixed template, so nobody can open a market set up to fail. Its caps scale with its own NAV (position up to 3×, each fill up to 0.75×), so an empty vault quotes nothing and every deposit deepens the market. Attach mode, with custom limits, remains for providing liquidity on assets listed by others.
 2. **List.** The vault activates a new Percolator asset. Because the vault PDA signs the activation, it becomes the asset's admin, and it names itself as insurance operator, backing authority and oracle authority. It configures the asset's Pyth feed from the fixed parameters, and nothing can reconfigure it afterwards.
 3. **Make markets.** The vault owns a Percolator LP portfolio and is also that portfolio's matcher: Percolator calls the vault program on every trade. The matcher enforces a per-fill cap and an inventory cap, and it only accepts calls signed by Percolator's delegate PDA for this vault's portfolio.
-4. **Earn.** Takers' fees land in the asset's insurance. `HarvestFees` (anyone can call it) moves everything above the fixed floor into the vault. The floor stays in place to protect traders.
+4. **Earn.** Takers' fees land in the asset's insurance. `HarvestFees` (anyone can call it) moves everything above the fixed floor into the vault. The floor stays in place to protect traders. Of what is harvested, 90% belongs to the depositors pro rata and 10% is set aside for whoever opened the market (Hyperliquid HIP-3 style), who claims it with `ClaimOpenerFees` and has no other powers.
 5. **Settle in epochs.** Deposits and withdrawals are queued, then priced together at one net asset value when the epoch rolls and the LP portfolio is flat. Percolator only allows withdrawals from a flat portfolio, and pricing only at flat points removes every stale-price game.
 6. **Keep exits open.** After an epoch ends with requests waiting, the vault only accepts trades that shrink its position. If a trader holds a position on purpose, anyone can call `Unwind` one epoch later, and the vault closes its own position through Percolator's unilateral `RebalanceReduce`.
 7. **Wind down.** If the market is resolved, `SettleResolved` (anyone can call it) closes the portfolio through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata.
@@ -39,6 +39,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 22 | `ConvertPnl` | anyone | Turns released profit into withdrawable capital |
 | 21 | `RefreshMatcher` | anyone | Renews Percolator's time-limited matcher approval |
 | 28 | `Unwind` | anyone | Liveness backstop: the vault closes its own position |
+| 29 | `ClaimOpenerFees` | market opener | Collects the opener's 10% share of harvested fees |
 | 23 / 24 | `SettleResolved` / `RedeemTerminal` | anyone / holder | Wind-down after market resolution |
 | 25 | `Sweep` | anyone | Moves stray vault-owned collateral into the buffer |
 

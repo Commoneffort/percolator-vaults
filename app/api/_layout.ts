@@ -80,6 +80,8 @@ export default {
     "max_fill_abs": 368,
     "max_inventory_abs": 384,
     "mode": 416,
+    "opener_fees_owed": 672,
+    "opener_fees_total": 680,
     "oracle_feeds": 464,
     "pending_deposit_assets": 616,
     "pending_withdraw_shares": 624,

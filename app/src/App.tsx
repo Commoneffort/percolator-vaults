@@ -301,6 +301,7 @@ function MarketInner({ vaultKey, send, busy, tick }: { vaultKey: PublicKey; send
               <div className="muted small">
                 Pyth {v.feed?.name} feed{age !== undefined && ` · updated ${ago(age)}`} · vault{" "}
                 <a href={explorer("address", v.key.toString())} target="_blank" rel="noreferrer">{short(v.key)}</a>
+                {v.canonical && <> · opened by <a href={explorer("address", v.creator.toString())} target="_blank" rel="noreferrer">{short(v.creator)}</a></>}
               </div>
             </div>
           </div>
@@ -314,10 +315,11 @@ function MarketInner({ vaultKey, send, busy, tick }: { vaultKey: PublicKey; send
             : `limit ±${units(v.maxInventory)}, ≤${units(v.maxFill)} per fill`} />
           <Stat label="Open interest" value={`${units(state.asset.oiLong)} ${sym}`} sub="long = short" />
           <Stat label="Fees" value={usd(v.feesHarvested + state.asset.insurance)} sub={`${usd(v.feesHarvested)} harvested · floor ${usd(v.insuranceFloor, 0)}`} />
-          <Stat label="Leverage" value="10×" sub="0.05% fee per trade" />
+          <DepthStat state={state} />
           <EpochStat state={state} />
         </div>
       </section>
+      <OpenerPanel state={state} send={wrapped} busy={busy} />
       <div className="span2 subtabs">
         <button className={tab === "trade" ? "tab active" : "tab"} onClick={() => setTab("trade")}>Trade</button>
         <button className={tab === "lp" ? "tab active" : "tab"} onClick={() => setTab("lp")}>Provide liquidity</button>
@@ -325,6 +327,37 @@ function MarketInner({ vaultKey, send, busy, tick }: { vaultKey: PublicKey; send
       {tab === "trade" ? <TradePanel state={state} send={wrapped} busy={busy} /> : <LiquidityPanel state={state} send={wrapped} busy={busy} />}
       <Activity vault={v} tick={tick} />
     </main>
+  );
+}
+
+function DepthStat({ state }: { state: C.State }) {
+  const d = C.depth(state);
+  const sym = state.vault.feed?.symbol ?? "";
+  const usdOf = (q: bigint) => fmt(num(q, 1e6) * num(state.asset.price, 1e6), 0);
+  return <Stat label="Max trade now" value={`${units(d.long)} / ${units(d.short)} ${sym}`} sub={`long $${usdOf(d.long)} · short $${usdOf(d.short)} · 10×`} />;
+}
+
+function OpenerPanel({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
+  const { publicKey } = useWallet();
+  const v = state.vault;
+  if (!v.canonical || !publicKey || !publicKey.equals(v.creator)) return null;
+  return (
+    <section className="card span2 opener">
+      <div className="card-head">
+        <div>
+          <h3>You opened this market</h3>
+          <p className="muted small">You earn {C.OPENER_FEE_BPS / 100}% of every fee this market harvests, forever. You have no other powers over it.</p>
+        </div>
+        <div className="opener-num">
+          <div className="stat-value">{usd(v.openerFeesOwed)}</div>
+          <div className="muted small">claimable · {usd(v.openerFeesTotal)} earned in total</div>
+        </div>
+      </div>
+      <button className="btn primary" disabled={!!busy || v.openerFeesOwed === 0n} onClick={() => send("Claim opener fees", [
+        createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
+        C.claimOpenerFees(v, publicKey),
+      ])}>Claim opener fees</button>
+    </section>
   );
 }
 
@@ -637,7 +670,8 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <p className="muted">
           Each Pyth feed gets exactly one market and one shared liquidity vault, enforced on-chain: the vault's address is derived
           from the feed, so a second one can't exist. Whoever opens it pays about 0.12 devnet SOL of rent and a 1 USDC listing fee,
-          and chooses nothing else. Every market runs on the same fixed rules, so nobody can open a market set up to fail.
+          and chooses nothing else. Every market runs on the same fixed rules, so nobody can open a market set up to fail. In
+          return, the opener earns 10% of the market's fees for as long as it trades.
         </p>
         <div className="feed-grid">
           {C.FEEDS.map(f => (
@@ -658,7 +692,8 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <div className="row"><span>Insurance kept for traders</span><b>$100</b></div>
         <div className="row"><span>Price</span><b>Pyth, ≤ 5 min old</b></div>
         <div className="row"><span>Leverage, fee</span><b>10×, 0.05%</b></div>
-        <p className="muted small">Limits scale with the vault: an empty vault quotes nothing, and every deposit deepens the market.</p>
+        <div className="row"><span>Opener's share of fees</span><b>10%, forever</b></div>
+        <p className="muted small">Limits scale with the vault: an empty vault quotes nothing, and every deposit deepens the market. Depositors share the other 90% of fees pro rata.</p>
       </section>
       <section className="card">
         <h3>{st === 1 ? `${feed.symbol}-PERP is live` : st === 0 ? `Finish listing ${feed.symbol}-PERP` : `Open ${feed.symbol}-PERP`}</h3>

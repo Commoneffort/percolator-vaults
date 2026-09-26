@@ -132,3 +132,5 @@ h3 { margin: 0 0 12px; font-size: 16px; }
 .you { margin-left: 8px; font-size: 11px; padding: 2px 6px; border-radius: 6px; background: var(--accent-2); color: #fff; }
 .section-title { margin: 32px 0 4px; }
 .warn-tag { color: #e0b252; }
+.opener { border-color: #2c4a3a; background: linear-gradient(180deg, #13201b, var(--panel)); }
+.opener-num { text-align: right; }

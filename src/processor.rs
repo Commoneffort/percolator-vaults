@@ -48,6 +48,18 @@ pub const CANON_POSITION_NAV_BPS: u16 = 30_000; // position up to 3x the vault's
 pub const CANON_FILL_NAV_BPS: u16 = 7_500; // each fill up to 0.75x the vault's NAV
 pub const CANON_MATCHER_TTL_SLOTS: u64 = 216_000;
 pub const UNCAPPED: u128 = (i128::MAX as u128) / 4;
+/// Share of a canonical market's harvested fees paid to whoever opened it (Hyperliquid HIP-3
+/// style). It carries no powers: the opener can only claim what has accrued.
+pub const OPENER_FEE_BPS: u64 = 1_000;
+
+/// The opener's cut of `amount` of harvested fees for vault `v`.
+pub fn opener_cut(v: &VaultState, amount: u64) -> u64 {
+    if v.vault_kind == KIND_CANONICAL {
+        ((amount as u128 * OPENER_FEE_BPS as u128) / 10_000) as u64
+    } else {
+        0
+    }
+}
 
 impl InitParams {
     /// The fixed template for canonical vaults: only the seed-free feed choice and the listing
@@ -97,6 +109,7 @@ pub const TAG_SWEEP: u8 = 25;
 pub const TAG_LIST_ASSET: u8 = 26;
 pub const TAG_HARVEST_FEES: u8 = 27;
 pub const TAG_UNWIND: u8 = 28;
+pub const TAG_CLAIM_OPENER_FEES: u8 = 29;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitParams {
@@ -438,6 +451,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             no_args(rest)?;
             unwind(program_id, accounts)
         }
+        TAG_CLAIM_OPENER_FEES => {
+            no_args(rest)?;
+            claim_opener_fees(program_id, accounts)
+        }
         TAG_LIST_ASSET => list_asset(program_id, accounts, ListArgs::decode(rest)?),
         TAG_HARVEST_FEES => {
             if rest.len() != 16 {
@@ -668,7 +685,9 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         created_slot: now,
         total_fills: 0,
         total_fees_harvested: 0,
-        _reserved: [0; 56],
+        opener_fees_owed: 0,
+        opener_fees_total: 0,
+        _reserved: [0; 40],
     };
     state::store_vault(vault_ai, &v)?;
 
@@ -927,8 +946,10 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     let nav_after_out_low = sub(nav_low, assets_out)?;
     // Fees sitting in the vault's asset insurance above the floor belong to current holders too;
     // counting them in the deposit price stops a deposit from buying into them at a discount.
+    // Only the depositors' part: the opener's cut of those fees will not belong to the pool.
     let pending_fees = if v.mode == MODE_OPERATE {
-        insurance_excess(market, &v)?
+        let excess = insurance_excess(market, &v)?;
+        excess - opener_cut(&v, excess)
     } else {
         0
     };
@@ -1620,6 +1641,11 @@ fn harvest_fees(
     )?;
     let received = sub(token_amount(buffer)?, before)?;
     v.total_fees_harvested = v.total_fees_harvested.saturating_add(received);
+    // Set the opener's cut aside: it stays in the buffer but is owed, like a settled withdrawal.
+    let cut = opener_cut(&v, received);
+    v.opener_fees_owed = add(v.opener_fees_owed, cut)?;
+    v.opener_fees_total = v.opener_fees_total.saturating_add(cut);
+    v.reserved_assets = add(v.reserved_assets, cut)?;
     state::store_vault(vault_ai, &v)
 }
 
@@ -1676,4 +1702,39 @@ fn unwind(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         state::store_vault(vault_ai, &v)?;
     }
     Ok(())
+}
+
+/// The opener of a canonical market collects its accrued share of the market's fees.
+/// Accounts: 0 opener [s], 1 vault [w], 2 destination collateral account [w], 3 buffer [w],
+/// 4 token program.
+fn claim_opener_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let opener = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    let dest = acc(accounts, 2)?;
+    let buffer = acc(accounts, 3)?;
+    let token = acc(accounts, 4)?;
+    signer(opener)?;
+    for w in [vault_ai, dest, buffer] {
+        writable(w)?;
+    }
+    key_is(token, &spl_token::ID)?;
+    let mut v = state::load_vault(vault_ai, program_id)?;
+    if v.vault_kind != KIND_CANONICAL {
+        return Err(VaultError::WrongMode.into());
+    }
+    key_is(opener, &v.creator)?;
+    check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, vault_ai.key)?;
+    let amount = v.opener_fees_owed;
+    if amount == 0 {
+        return Err(VaultError::NothingToClaim.into());
+    }
+    v.opener_fees_owed = 0;
+    v.reserved_assets = sub(v.reserved_assets, amount)?;
+    state::store_vault(vault_ai, &v)?;
+    let bump = v.vault_bump;
+    invoke_signed(
+        &spl_token::instruction::transfer(&spl_token::ID, buffer.key, dest.key, vault_ai.key, &[], amount)?,
+        &[buffer.clone(), dest.clone(), vault_ai.clone(), token.clone()],
+        &[vault_seeds!(v, bump)],
+    )
 }

@@ -24,6 +24,7 @@
 - Pre-funding a PDA address with lamports cannot block account creation.
 - There is at most one operate-mode vault per (market, feed), and it cannot be squatted: anyone can finish listing a created-but-unlisted vault.
 - Canonical vaults never take on more than 3x their NAV in position, or 0.75x per fill, on top of Percolator's margin rules.
+- The opener's fee share is exactly 10% of each harvest, is held in the buffer as a reserved liability (so it never counts toward NAV), and only the opener can claim it. A closed or frozen opener token account cannot block harvests, because nothing is paid to it during a harvest.
 
 ## Known limits
 

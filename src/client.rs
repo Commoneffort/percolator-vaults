@@ -311,3 +311,11 @@ pub fn sweep(k: &VaultKeys, stray: &Pubkey) -> Instruction {
         data: vec![processor::TAG_SWEEP],
     }
 }
+
+pub fn claim_opener_fees(k: &VaultKeys, opener: &Pubkey, dest: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: k.program,
+        accounts: vec![AccountMeta::new_readonly(*opener, true), w(k.vault), w(*dest), w(k.buffer), ro(spl_token::ID)],
+        data: vec![processor::TAG_CLAIM_OPENER_FEES],
+    }
+}

@@ -85,6 +85,8 @@ export type Vault = {
   canonical: boolean;
   positionNavBps: number;
   fillNavBps: number;
+  openerFeesOwed: bigint;
+  openerFeesTotal: bigint;
 };
 
 export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
@@ -122,6 +124,8 @@ export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
     canonical: d[v.vault_kind] === 1,
     positionNavBps: u16(d, v.position_nav_bps),
     fillNavBps: u16(d, v.fill_nav_bps),
+    openerFeesOwed: u64(d, v.opener_fees_owed),
+    openerFeesTotal: u64(d, v.opener_fees_total),
   };
 }
 
@@ -296,6 +300,44 @@ export function claim(v: Vault, user: PublicKey, epoch: bigint) {
     keys: [ro(user, true), rw(v.key), rw(ticketAddress(v.key, user)), ro(epochAddress(v.key, epoch)), rw(ata(user, MINT)), rw(ata(user, v.shareMint)), rw(v.buffer), rw(v.escrow), ro(TOKEN_PROGRAM_ID)],
     data: new W().u8(20).done(),
   });
+}
+
+export const OPENER_FEE_BPS = 1_000;
+
+export function claimOpenerFees(v: Vault, opener: PublicKey) {
+  return new TransactionInstruction({
+    programId: VAULT_PROGRAM,
+    keys: [ro(opener, true), rw(v.key), rw(ata(opener, MINT)), rw(v.buffer), ro(TOKEN_PROGRAM_ID)],
+    data: new W().u8(29).done(),
+  });
+}
+
+/** The largest fill the vault would take right now in each direction (mirrors the matcher). */
+export function depth(s: State): { long: bigint; short: bigint } {
+  const v = s.vault;
+  const price = s.asset.price;
+  let maxFill = v.maxFill, maxInv = v.maxInventory;
+  if (v.positionNavBps && price > 0n) {
+    const cap = (bps: number) => (v.lastNav * BigInt(bps) / 10_000n) * UNIT / price;
+    maxInv = maxInv < cap(v.positionNavBps) ? maxInv : cap(v.positionNavBps);
+    maxFill = maxFill < cap(v.fillNavBps) ? maxFill : cap(v.fillNavBps);
+  }
+  const inv = v.inventory;
+  const room = (lpSign: 1n | -1n) => {
+    const reducing = inv !== 0n && (inv > 0n) !== (lpSign > 0n);
+    const abs = inv < 0n ? -inv : inv;
+    const r = reducing ? abs + maxInv : maxInv > abs ? maxInv - abs : 0n;
+    return r < maxFill ? r : maxFill;
+  };
+  const epochOver = s.slot >= v.epochStart + v.epochLen && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
+  if (epochOver) {
+    const abs = inv < 0n ? -inv : inv;
+    const f = abs < maxFill ? abs : maxFill;
+    // Reduce-only: a taker long is only filled if the vault is long (and vice versa).
+    return { long: inv > 0n ? f : 0n, short: inv < 0n ? f : 0n };
+  }
+  // A taker long moves the vault short (lpSign -1).
+  return { long: room(-1n), short: room(1n) };
 }
 
 // ---- Percolator (trader side) ----

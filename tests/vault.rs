@@ -5,7 +5,7 @@ use common::*;
 #[allow(unused_imports)]
 use common::v16_svm::MarketConfig as _Mc;
 use percolator_prog::ix::Instruction as ProgIx;
-use percolator_vault::{percolator as perc, processor::{self, InitParams}, state};
+use percolator_vault::{client, percolator as perc, processor::{self, InitParams}, state};
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
 #[allow(unused_imports)]
 use solana_sdk::signature::Keypair;
@@ -228,6 +228,25 @@ fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     let alice_after = w.tokens(alice.collateral);
     println!("alice collateral: before 100000000, after {alice_after}");
     assert!(alice_after > 100_000_000, "fee income reaches depositors");
+
+    // The opener's 10% of harvested fees was set aside, and only the opener can take it.
+    let v = w.vault_state();
+    assert_eq!({ v.opener_fees_owed }, harvested / 10);
+    let k = w.keys.unwrap();
+    let thief = w.new_user(0);
+    let ix = client::claim_opener_fees(&k, &thief.kp.pubkey(), &thief.collateral);
+    assert!(w.send(vec![ix], &[&thief.kp]).is_err(), "only the opener can claim");
+    let opener_dest = Pubkey::new_unique();
+    let (mint, creator) = (w.env.mint, w.creator.pubkey());
+    set_token(&mut w.env.svm, opener_dest, mint, creator, 0);
+    let creator_kp = w.creator.insecure_clone();
+    let ix = client::claim_opener_fees(&k, &creator, &opener_dest);
+    w.send(vec![ix], &[&creator_kp]).unwrap();
+    assert_eq!(w.tokens(opener_dest), harvested / 10);
+    assert_eq!({ w.vault_state().opener_fees_owed }, 0);
+    assert_eq!(w.tokens(w.buffer), { w.vault_state().reserved_assets }, "buffer holds exactly what is owed");
+    let ix = client::claim_opener_fees(&k, &creator, &opener_dest);
+    assert!(w.send(vec![ix], &[&creator_kp]).is_err(), "nothing left to claim");
 }
 
 #[test]
@@ -480,7 +499,7 @@ fn export_layout_for_frontend() {
     let layout = serde_json::json!({
         "vault": f!(V, o, magic, status, share_decimals, market, creator, seed, collateral_mint, share_mint, buffer, share_escrow,
             lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_inventory_abs,
-            epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, vault_kind, position_nav_bps, fill_nav_bps, asset_market_id, inventory, epoch, epoch_start_slot,
+            epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, vault_kind, position_nav_bps, fill_nav_bps, opener_fees_owed, opener_fees_total, asset_market_id, inventory, epoch, epoch_start_slot,
             pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested),
         "vault_len": state::VAULT_ACCOUNT_LEN,
         "ticket": f!(Ticket, 0, vault, owner, epoch, deposit_assets, withdraw_shares),
