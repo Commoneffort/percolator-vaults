@@ -2,7 +2,7 @@
 import { ComputeBudgetProgram, Connection, Keypair, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as fs from "fs";
-import * as C from "./src/chain";
+import * as C from "../src/chain";
 
 const kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.argv[2], "utf8"))));
 const conn = new Connection(process.env.RPC ?? C.RPC_URL, "confirmed");
