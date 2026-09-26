@@ -110,9 +110,7 @@ impl World {
         self.env.set_clock(slot, *ts);
         self.env.update_pyth_price(pyth, &FEED, price, -8, 0, *ts);
         let asset = self.vault_state().asset_index;
-        let hint = percolator_prog::ix::CrankObservationHint { asset_index: asset, oracle_accounts: 1 };
-        let _ = self.env.crank_with_oracles(0, slot, vec![hint], &[pyth]);
-        let _ = self.env.crank(0, slot, vec![]);
+        self.catch_up(asset, slot, &[pyth]);
     }
 
     pub fn taker_trade_asset(&mut self, taker: usize, asset: u16, size_q: i128) -> Result<u64, String> {
@@ -464,8 +462,25 @@ impl World {
         let target = self.env.current_slot() + slots;
         self.env.warp_to_slot(target);
         self.env.push_auth_mark(0, target, price).expect("push mark");
-        let hint = percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 };
-        self.env.crank(0, target, vec![hint]).expect("crank asset 0");
+        self.catch_up(0, target, &[]);
+    }
+
+    /// Cranks an asset until its accrual clock reaches `slot`, as a keeper would: each crank
+    /// advances accrual by at most `max_accrual_dt_slots`.
+    pub fn catch_up(&mut self, asset: u16, slot: u64, oracles: &[Pubkey]) {
+        for _ in 0..64 {
+            let hint = percolator_prog::ix::CrankObservationHint {
+                asset_index: asset,
+                oracle_accounts: oracles.len() as u8,
+            };
+            let r = self.env.crank_with_oracles(0, slot, vec![hint], oracles);
+            let last = self.env.primary_market_state().1.assets[asset as usize].slot_last;
+            if last >= slot {
+                return;
+            }
+            r.expect("keeper crank");
+        }
+        panic!("asset {asset} did not catch up to slot {slot}");
     }
 
     /// A harness actor trades against the vault through Percolator's TradeCpi.

@@ -29,6 +29,7 @@ pub const MIN_EPOCH_LEN_SLOTS: u64 = 10;
 pub const MAX_EPOCH_LEN_SLOTS: u64 = 7 * 216_000; // about a week of 400 ms slots
 pub const MIN_MATCHER_TTL_SLOTS: u64 = 100;
 pub const MAX_MATCHER_TTL_SLOTS: u64 = 30 * 216_000;
+pub const MAX_ORACLE_STALENESS_SECS: u64 = 300;
 
 pub const TAG_INIT_VAULT: u8 = 16;
 pub const TAG_REQUEST_DEPOSIT: u8 = 17;
@@ -42,6 +43,7 @@ pub const TAG_REDEEM_TERMINAL: u8 = 24;
 pub const TAG_SWEEP: u8 = 25;
 pub const TAG_LIST_ASSET: u8 = 26;
 pub const TAG_HARVEST_FEES: u8 = 27;
+pub const TAG_UNWIND: u8 = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitParams {
@@ -156,8 +158,11 @@ impl InitParams {
                 self.insurance_floor == 0 && self.listing_fee_max == 0 && self.oracle_leg_count == 0
             }
             // Percolator validates the oracle parameters themselves when the asset is listed.
+            // A long staleness window would let takers trade against an old price, so it is
+            // bounded here as well as by Percolator.
             MODE_OPERATE => {
-                (1..=3).contains(&self.oracle_leg_count) && self.oracle_max_staleness_secs > 0
+                (1..=3).contains(&self.oracle_leg_count)
+                    && (1..=MAX_ORACLE_STALENESS_SECS).contains(&self.oracle_max_staleness_secs)
             }
             _ => false,
         };
@@ -367,6 +372,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         TAG_SWEEP => {
             no_args(rest)?;
             sweep(program_id, accounts)
+        }
+        TAG_UNWIND => {
+            no_args(rest)?;
+            unwind(program_id, accounts)
         }
         TAG_LIST_ASSET => list_asset(program_id, accounts, ListArgs::decode(rest)?),
         TAG_HARVEST_FEES => {
@@ -1536,4 +1545,59 @@ fn harvest_fees(
     let received = sub(token_amount(buffer)?, before)?;
     v.total_fees_harvested = v.total_fees_harvested.saturating_add(received);
     state::store_vault(vault_ai, &v)
+}
+
+/// Liveness backstop. If an epoch has been over for a further full epoch with requests still
+/// waiting (reduce-only quoting did not bring the vault flat, for example because a taker holds
+/// its position on purpose), anyone can make the vault close its own position through
+/// Percolator's unilateral `RebalanceReduce`, at the engine's effective price. A taker holding a
+/// position therefore cannot keep withdrawals locked.
+///
+/// Accounts: 0 vault [w], 1 market [w], 2 LP portfolio [w], 3 Percolator program.
+fn unwind(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let vault_ai = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let portfolio = acc(accounts, 2)?;
+    let percolator = acc(accounts, 3)?;
+    for w in [vault_ai, market, portfolio] {
+        writable(w)?;
+    }
+    key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
+    let mut v = state::load_vault(vault_ai, program_id)?;
+    if v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    key_is(market, &v.market)?;
+    key_is(portfolio, &v.lp_portfolio)?;
+    let now = Clock::get()?.slot;
+    let overdue = v
+        .epoch_start_slot
+        .saturating_add(v.epoch_len_slots.saturating_mul(2));
+    let has_requests = v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0;
+    if now < overdue || !has_requests {
+        return Err(VaultError::EpochNotOver.into());
+    }
+    let view = perc::read_portfolio(portfolio, market.key, vault_ai.key)?;
+    if view.flat {
+        return Err(VaultError::NothingToClaim.into());
+    }
+    let bump = v.vault_bump;
+    invoke_signed(
+        &perc::rebalance_reduce(
+            vault_ai.key,
+            market.key,
+            portfolio.key,
+            view.portfolio_id,
+            view.position_epoch,
+            v.asset_index,
+            u128::MAX >> 1,
+        ),
+        &[vault_ai.clone(), market.clone(), portfolio.clone(), percolator.clone()],
+        &[vault_seeds!(v, bump)],
+    )?;
+    if perc::read_portfolio(portfolio, market.key, vault_ai.key)?.flat {
+        v.inventory = 0;
+        state::store_vault(vault_ai, &v)?;
+    }
+    Ok(())
 }

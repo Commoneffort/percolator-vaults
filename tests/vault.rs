@@ -2,6 +2,8 @@
 
 mod common;
 use common::*;
+#[allow(unused_imports)]
+use common::v16_svm::MarketConfig as _Mc;
 use percolator_prog::ix::Instruction as ProgIx;
 use percolator_vault::{percolator as perc, state};
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
@@ -386,4 +388,27 @@ fn vault_profit_and_loss_reach_depositors() {
     assert!(down > 100_000_000, "vault gains reach depositors");
     assert!(up < 100_000_000, "vault losses reach depositors");
     assert!(up >= 100_000_000 - 1_000_001, "loss is exactly the move, not more");
+}
+
+#[test]
+fn roll_is_exact_with_maintenance_fees_charged() {
+    let mut w = World::with_config(MarketConfig { maintenance_fee_per_slot: 3, ..MarketConfig::default() });
+    w.env.warp_to_slot(5);
+    w.create_vault(default_params(1)).unwrap();
+    let alice = w.new_user(100_000_000);
+    w.deposit(&alice, 50_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.roll().unwrap();
+    w.claim(&alice, 0).unwrap();
+    w.taker_trade(0, TEN_M).unwrap();
+    w.advance(7, INITIAL_PRICE);
+    w.taker_trade(0, -TEN_M).unwrap();
+    w.withdraw(&alice, w.tokens(alice.shares)).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.roll().unwrap();
+    w.claim(&alice, 1).unwrap();
+    let paid = 100_000_000 - w.tokens(alice.collateral);
+    println!("maintenance fees borne by the vault: {paid}");
+    assert!(paid > 0 && paid < 1_000, "fees are charged, and only fees");
+    assert_eq!(w.tokens(w.buffer), { w.vault_state().reserved_assets });
 }

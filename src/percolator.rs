@@ -88,6 +88,7 @@ const TAG_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const TAG_CONFIGURE_HYBRID_ORACLE: u8 = 34;
 const TAG_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 pub const ASSET_ACTION_ACTIVATE: u8 = 0;
+const TAG_REBALANCE_REDUCE: u8 = 44;
 
 fn rd_u64(d: &[u8], off: usize) -> Result<u64, ProgramError> {
     let b = d.get(off..off + 8).ok_or(VaultError::BadPercolatorAccount)?;
@@ -487,6 +488,33 @@ pub fn withdraw_insurance_asset(
             AccountMeta::new(*percolator_vault, false),
             AccountMeta::new_readonly(*percolator_vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Owner-signed unilateral reduction of one leg toward zero, at the engine's effective price and
+/// within its unilateral close capacity. Never over-closes.
+pub fn rebalance_reduce(
+    owner: &Pubkey,
+    market: &Pubkey,
+    portfolio: &Pubkey,
+    portfolio_id: u64,
+    position_epoch: u64,
+    asset_index: u16,
+    reduce_q: u128,
+) -> Instruction {
+    let mut data = vec![TAG_REBALANCE_REDUCE];
+    data.extend_from_slice(&portfolio_id.to_le_bytes());
+    data.extend_from_slice(&position_epoch.to_le_bytes());
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.extend_from_slice(&reduce_q.to_le_bytes());
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*owner, true),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*portfolio, false),
         ],
         data,
     }

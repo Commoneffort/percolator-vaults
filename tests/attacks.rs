@@ -395,3 +395,32 @@ fn sweep_moves_stray_vault_owned_collateral_into_the_buffer() {
 fn unused() -> Pubkey {
     system_program::ID
 }
+
+#[test]
+fn a_taker_holding_a_position_cannot_lock_withdrawals() {
+    let (mut w, alice) = funded();
+    // Mallory opens a position against the vault and never closes it.
+    w.taker_trade(0, TEN_M).unwrap();
+    w.withdraw(&alice, 1_000_000).unwrap();
+    let unwind = |w: &World| Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new(w.env.market, false),
+            AccountMeta::new(w.portfolio, false),
+            AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
+        ],
+        data: vec![processor::TAG_UNWIND],
+    };
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    expect_err(w.roll(), VaultError::NotFlat);
+    // One epoch of reduce-only grace first.
+    expect_err(w.send(vec![unwind(&w)], &[]), VaultError::EpochNotOver);
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    let cu = w.send(vec![unwind(&w)], &[]).unwrap();
+    println!("unwind CU: {cu}");
+    assert!(w.portfolio_view().flat, "the vault closed its own position");
+    w.roll().unwrap();
+    w.claim(&alice, 1).unwrap();
+    assert!(w.tokens(alice.collateral) > 50_000_000);
+}
