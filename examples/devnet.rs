@@ -363,8 +363,15 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                 continue;
             }
             let now = rpc.get_slot().unwrap_or(0);
-            if let Err(e) = crank_vault(rpc, payer, &k.market, &v) {
-                eprintln!("{} crank: {}", k.vault, e.lines().next().unwrap_or(""));
+            // Accrual only matters while positions are open; idle markets are left alone so the
+            // keeper stays well inside RPC rate limits.
+            let busy = market_state(rpc, &k.market).1.assets.get(v.asset_index as usize)
+                .map(|a| a.oi_eff_long_q != 0 || a.oi_eff_short_q != 0)
+                .unwrap_or(false);
+            if busy {
+                if let Err(e) = crank_vault(rpc, payer, &k.market, &v) {
+                    eprintln!("{} crank: {}", k.vault, e.lines().next().unwrap_or(""));
+                }
             }
             let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots;
             if tick % 15 != 0 && !epoch_over {
@@ -394,7 +401,7 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                 }
             }
         }
-        sleep(Duration::from_secs(2));
+        sleep(Duration::from_secs(3));
     }
 }
 
