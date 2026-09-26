@@ -94,6 +94,7 @@ export default function App() {
         <nav className="tabs">
           <a className={page === "" || page === "m" ? "tab active" : "tab"} href="#/">Markets</a>
           <a className={page === "launch" ? "tab active" : "tab"} href="#/launch">Launch a market</a>
+          <a className={page === "leaderboard" ? "tab active" : "tab"} href="#/leaderboard">Leaderboard</a>
           <a className={page === "how" ? "tab active" : "tab"} href="#/how">How it works</a>
         </nav>
         <WalletMultiButton />
@@ -105,6 +106,8 @@ export default function App() {
         <LaunchPage send={send} busy={busy} go={go} />
       ) : page === "how" ? (
         <HowPage />
+      ) : page === "leaderboard" ? (
+        <LeaderboardPage />
       ) : (
         <MarketsPage go={go} tick={tick} />
       )}
@@ -184,6 +187,7 @@ function MarketsPage({ go, tick }: { go: (to: string) => void; tick: number }) {
         </p>
         <div className="hero-cta">
           <button className="btn primary" onClick={() => go("/launch")}>Launch a market</button>
+          <button className="btn ghost" onClick={() => go("/leaderboard")}>Leaderboard</button>
           <button className="btn ghost" onClick={() => go("/how")}>How it works</button>
         </div>
         <div className="stats four">
@@ -667,6 +671,64 @@ function LaunchPage({ send, busy, go }: { send: Send; busy?: string; go: (to: st
           {!publicKey ? "Connect a wallet" : busy ? `${busy}…` : created ? `Retry listing ${feed.symbol}-PERP` : `Launch ${feed.symbol}-PERP`}
         </button>
         <Faucet />
+      </section>
+    </main>
+  );
+}
+
+// ---------------------------------------------------------------- leaderboard
+
+type Row = { wallet: string; pnl: number; roi: number; volume: number; trades: number; equity: number; markets: string[]; positions: { symbol: string; size: number }[] };
+
+function LeaderboardPage() {
+  const { publicKey } = useWallet();
+  const [data, setData] = useState<{ updated: number; rows: Row[] }>();
+  const [err, setErr] = useState<string>();
+  const [sort, setSort] = useState<"pnl" | "roi" | "volume">("pnl");
+  useEffect(() => {
+    const load = () => fetch("/api/leaderboard").then(r => r.json()).then(j => (j.error ? setErr(j.error) : (setData(j), setErr(undefined)))).catch(e => setErr(e.message));
+    load();
+    const id = setInterval(load, 30000);
+    return () => clearInterval(id);
+  }, []);
+  const rows = [...(data?.rows ?? [])].sort((a, b) => b[sort] - a[sort]);
+  const me = publicKey?.toString();
+  const signed = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}$${fmt(Math.abs(x), dp)}`;
+  return (
+    <main className="grid">
+      <section className="card span2">
+        <div className="card-head">
+          <div>
+            <h2>Trader leaderboard</h2>
+            <p className="muted small">Every trader on every vault market, ranked from on-chain data: PnL is account equity minus net deposits. Trade against any vault to get on the board.</p>
+          </div>
+          <div className="seg narrow">
+            {(["pnl", "roi", "volume"] as const).map(k => <button key={k} className={sort === k ? "seg-b active" : "seg-b"} onClick={() => setSort(k)}>{k === "pnl" ? "PnL" : k === "roi" ? "Return" : "Volume"}</button>)}
+          </div>
+        </div>
+        {err && <div className="banner warn">{err}</div>}
+        {!data ? <div className="loading">Reading the chain…</div> : rows.length === 0 ? <div className="muted">No trades yet. Be the first.</div> : (
+          <div className="table-wrap">
+            <table className="lb">
+              <thead><tr><th>#</th><th>Trader</th><th className="r">PnL</th><th className="r">Return</th><th className="r">Volume</th><th className="r">Trades</th><th>Markets</th><th>Open</th></tr></thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={r.wallet} className={r.wallet === me ? "me" : ""}>
+                    <td className="rank">{i < 3 ? ["🥇", "🥈", "🥉"][i] : i + 1}</td>
+                    <td><a href={explorer("address", r.wallet)} target="_blank" rel="noreferrer">{short(r.wallet)}</a>{r.wallet === me && <span className="you">you</span>}</td>
+                    <td className={`r mono ${r.pnl >= 0 ? "up" : "down"}`}>{signed(r.pnl)}</td>
+                    <td className={`r mono ${r.roi >= 0 ? "up" : "down"}`}>{(r.roi * 100).toFixed(2)}%</td>
+                    <td className="r mono">${fmt(r.volume, 0)}</td>
+                    <td className="r mono">{r.trades}</td>
+                    <td>{r.markets.join(", ") || "—"}</td>
+                    <td className="small">{r.positions.length ? r.positions.map(p => `${p.size > 0 ? "+" : ""}${p.size} ${p.symbol}`).join(", ") : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {data && <p className="muted small">Updated {ago((Date.now() - data.updated) / 1000)}. Open positions count at their last settled value until they are closed.</p>}
       </section>
     </main>
   );
