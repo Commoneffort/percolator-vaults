@@ -147,7 +147,7 @@ function VaultTab({ state, send, busy }: TabProps) {
   const [shares, setShares] = useState("");
   const v = state.vault;
   const nav = state.lp.capital + (state.lp.pnl > 0n ? state.lp.pnl : 0n) + state.buffer - v.reserved - v.pendingDeposit;
-  const sharePrice = state.shareSupply > 0n ? Number(nav) / C.USDC / (Number(state.shareSupply) / 10 ** C.SHARE_DECIMALS) : 0.001;
+  const sharePrice = state.shareSupply > 0n ? Number(nav) / C.USDC / (Number(state.shareSupply) / 10 ** C.SHARE_DECIMALS) : 1;
   const epochEnd = v.epochStart + v.epochLen;
   const slotsLeft = epochEnd > state.slot ? epochEnd - state.slot : 0n;
   const reduceOnly = slotsLeft === 0n && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
