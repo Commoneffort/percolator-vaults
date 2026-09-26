@@ -358,6 +358,24 @@ export const percWithdraw = (owner: PublicKey, portfolio: PublicKey, p: Portfoli
     data: new W().u8(4).u64(p.id).u64(p.sequence).i128(amount).done(),
   });
 
+/** Cranks that bring the vault's asset current before a trade. Percolator refuses new risk once
+ *  positions exist and the asset's accrual clock lags; each crank advances it at most 10 slots
+ *  (the market's max_accrual_dt), and a crank with nothing to do fails the transaction, so the
+ *  count must be exact. */
+export async function catchUpCranks(conn: Connection, v: Vault, payer: PublicKey): Promise<TransactionInstruction[]> {
+  const [m, slot] = await Promise.all([conn.getAccountInfo(MARKET, "confirmed"), conn.getSlot("processed")]);
+  const asset = decodeAsset(new Uint8Array(m!.data), v.assetIndex);
+  if (asset.oiLong === 0n && asset.oiShort === 0n) return [];
+  const lag = BigInt(slot) - asset.slotLast;
+  if (lag <= 0n) return [];
+  const n = Number((lag + 9n) / 10n);
+  return Array.from({ length: Math.min(n, 6) }, () => new TransactionInstruction({
+    programId: PERCOLATOR,
+    keys: [rw(payer, true), rw(MARKET), rw(v.lpPortfolio), ro(v.oracle)],
+    data: new W().u8(5).u64(BigInt(slot)).u8(1).u16(v.assetIndex).u8(1).done(),
+  }));
+}
+
 /** The trader takes `sizeQ` (positive = long) against the vault through Percolator's TradeCpi. */
 export const tradeAgainstVault = (v: Vault, owner: PublicKey, portfolio: PublicKey, taker: Portfolio, lp: Portfolio, asset: Asset, sizeQ: bigint) =>
   new TransactionInstruction({

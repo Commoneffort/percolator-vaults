@@ -9,9 +9,10 @@ import "@solana/wallet-adapter-react-ui/styles.css";
 import "./styles.css";
 import App from "./App";
 import { RPC_URL } from "./chain";
+import { DevnetBurnerAdapter } from "./burner";
 
 function Root() {
-  const wallets = useMemo(() => [new PhantomWalletAdapter(), new SolflareWalletAdapter()], []);
+  const wallets = useMemo(() => [new PhantomWalletAdapter(), new SolflareWalletAdapter(), new DevnetBurnerAdapter()], []);
   return (
     <ConnectionProvider endpoint={RPC_URL}>
       <WalletProvider wallets={wallets} autoConnect>

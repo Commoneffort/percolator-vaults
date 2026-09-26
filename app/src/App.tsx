@@ -4,6 +4,7 @@ import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { ComputeBudgetProgram, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
+import Docs from "./Docs";
 
 const SLOT_SECONDS = 0.4;
 const num = (x: bigint, scale: number) => Number(x) / scale;
@@ -97,7 +98,7 @@ export default function App() {
           <a className={page === "" || page === "m" ? "tab active" : "tab"} href="#/">Markets</a>
           <a className={page === "launch" ? "tab active" : "tab"} href="#/launch">Open a market</a>
           <a className={page === "leaderboard" ? "tab active" : "tab"} href="#/leaderboard">Leaderboard</a>
-          <a className={page === "how" ? "tab active" : "tab"} href="#/how">How it works</a>
+          <a className={page === "how" || page === "docs" ? "tab active" : "tab"} href="#/docs">Docs</a>
         </nav>
         <WalletMultiButton />
       </header>
@@ -106,8 +107,8 @@ export default function App() {
         <MarketPage vaultKey={route[1]} send={send} busy={busy} tick={tick} />
       ) : page === "launch" ? (
         <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} />
-      ) : page === "how" ? (
-        <HowPage />
+      ) : page === "how" || page === "docs" ? (
+        <Docs />
       ) : page === "leaderboard" ? (
         <LeaderboardPage />
       ) : (
@@ -218,7 +219,7 @@ function MarketsPage({ go, tick }: { go: (to: string) => void; tick: number }) {
         <div className="hero-cta">
           <button className="btn primary" onClick={() => go("/launch")}>Open a market</button>
           <button className="btn ghost" onClick={() => go("/leaderboard")}>Leaderboard</button>
-          <button className="btn ghost" onClick={() => go("/how")}>How it works</button>
+          <button className="btn ghost" onClick={() => go("/docs")}>Read the docs</button>
         </div>
         <div className="stats four">
           <Stat label="Markets" value={cards ? `${live.length} / ${C.FEEDS.length}` : "…"} sub="open / possible" />
@@ -480,14 +481,16 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
       C.initPortfolio(publicKey, pf),
     ]);
   };
-  const trade = (sign: 1n | -1n) => {
+  const trade = async (sign: 1n | -1n) => {
     if (!publicKey || !pf || !p) return;
     const q = BigInt(Math.round(Number(size) * 1e6)) * sign;
-    send(`${sign > 0n ? "Long" : "Short"} ${size} ${sym}`, [C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, q)]);
+    const cranks = await C.catchUpCranks(connection, v, publicKey);
+    send(`${sign > 0n ? "Long" : "Short"} ${size} ${sym}`, [...cranks, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, q)]);
   };
-  const close = () => {
+  const close = async () => {
     if (!publicKey || !pf || !p || p.position === 0n) return;
-    send("Close position", [C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, -p.position)]);
+    const cranks = await C.catchUpCranks(connection, v, publicKey);
+    send("Close position", [...cranks, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, -p.position)]);
   };
 
   return (
@@ -723,7 +726,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
 
 // ---------------------------------------------------------------- leaderboard
 
-type Row = { wallet: string; pnl: number; roi: number; volume: number; trades: number; equity: number; markets: string[]; positions: { symbol: string; size: number }[] };
+type Row = { wallet: string; seed?: string; pnl: number; roi: number; volume: number; trades: number; equity: number; markets: string[]; positions: { symbol: string; size: number }[] };
 
 function LeaderboardPage() {
   const { publicKey } = useWallet();
@@ -745,7 +748,7 @@ function LeaderboardPage() {
         <div className="card-head">
           <div>
             <h2>Trader leaderboard</h2>
-            <p className="muted small">Every trader on every vault market, ranked from on-chain data: PnL is account equity minus net deposits. Trade against any vault to get on the board.</p>
+            <p className="muted small">Every trader on every vault market, ranked from on-chain data: PnL is account equity minus net deposits. Trade against any vault to get on the board. Wallets tagged "seed" are demo activity we created ourselves, labelled so they are never mistaken for users.</p>
           </div>
           <div className="seg narrow">
             {(["pnl", "roi", "volume"] as const).map(k => <button key={k} className={sort === k ? "seg-b active" : "seg-b"} onClick={() => setSort(k)}>{k === "pnl" ? "PnL" : k === "roi" ? "Return" : "Volume"}</button>)}
@@ -760,7 +763,7 @@ function LeaderboardPage() {
                 {rows.map((r, i) => (
                   <tr key={r.wallet} className={r.wallet === me ? "me" : ""}>
                     <td className="rank">{i < 3 ? ["🥇", "🥈", "🥉"][i] : i + 1}</td>
-                    <td><a href={explorer("address", r.wallet)} target="_blank" rel="noreferrer">{short(r.wallet)}</a>{r.wallet === me && <span className="you">you</span>}</td>
+                    <td><a href={explorer("address", r.wallet)} target="_blank" rel="noreferrer">{short(r.wallet)}</a>{r.wallet === me && <span className="you">you</span>}{r.seed && <span className="seed" title="Demo activity seeded by the team, labelled on purpose">{r.seed}</span>}</td>
                     <td className={`r mono ${r.pnl >= 0 ? "up" : "down"}`}>{signed(r.pnl)}</td>
                     <td className={`r mono ${r.roi >= 0 ? "up" : "down"}`}>{(r.roi * 100).toFixed(2)}%</td>
                     <td className="r mono">${fmt(r.volume, 0)}</td>
@@ -774,33 +777,6 @@ function LeaderboardPage() {
           </div>
         )}
         {data && <p className="muted small">Updated {ago((Date.now() - data.updated) / 1000)}. Open positions count at their last settled value until they are closed.</p>}
-      </section>
-    </main>
-  );
-}
-
-// ---------------------------------------------------------------- how
-
-function HowPage() {
-  const steps = [
-    ["Percolator already lets anyone list a market", "Its engine supports permissionless listing for a fee. On its own, though, a new market has no liquidity, and whoever lists it holds its admin keys: they can shut it down, rotate its keys or withdraw its insurance."],
-    ["A vault lists the market instead of a person", "The vault program signs the listing, so the vault becomes the market's admin, insurance operator, backing authority and oracle authority. The program has no instruction that uses those powers, and the Pyth feed and every limit are fixed at creation."],
-    ["The vault is the market maker", "The vault program is also the matcher Percolator calls on every trade. It fills takers against the vault's pooled capital, within a per-trade cap and a total position cap. Trades settle at Percolator's mark price."],
-    ["Fees become depositor yield", "Every trade pays a fee into the market's insurance. Anyone can harvest the part above the fixed floor into the vault. The floor stays to protect traders."],
-    ["Epochs keep share prices honest", "Deposits and withdrawals queue during an epoch and settle together at one price once the vault is flat. Withdrawals are priced conservatively and deposits pay for unharvested fees, so neither side can dilute the other."],
-    ["Nobody can lock the exits", "After an epoch, the vault only takes trades that shrink its position. If someone holds a position to stop it going flat, anyone can make the vault close its own position through Percolator one epoch later."],
-    ["If the market is shut down", "Anyone can settle the vault through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata."],
-  ];
-  return (
-    <main className="grid">
-      <section className="card span2">
-        <h2>How it works</h2>
-        <ol className="steps">{steps.map(([t, d]) => <li key={t}><b>{t}.</b> {d}</li>)}</ol>
-        <p className="muted small">
-          Built on Anatoly Yakovenko's Percolator risk engine. The vault program has 35 tests that run it against the production
-          Percolator binary, including attack scenarios. On devnet the program is still upgradeable by its deployer; a mainnet
-          deployment would burn that authority. Nothing here has been audited.
-        </p>
       </section>
     </main>
   );

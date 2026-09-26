@@ -11,3 +11,11 @@ export const FEED_SYMBOLS: Record<string, string> = {
   "0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d06719579ff": "PYTH",
   "91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a": "RAY",
 };
+
+/** Wallets that seeded demo activity (scripts/seed.ts). The site labels them. */
+export const SEED_WALLETS: Record<string, string> = {
+  HRKeXCveDknpLQTuc6FiUzGoxabU53USwJEMbguMPnj9: "seed LP",
+  BobEW42aDUTzntjiqavc5fRQWt9VnN1JMBG8dcLV4xRQ: "seed trader 1",
+  HoNb9L6dM25qHMQWjn7FqX7CvDWN8g97sdb56UqYtPZF: "seed trader 2",
+  "6Bosp4sCkYs2Fbzt2PYY4whVMaL5xUhfkUoytZvbnRWa": "seed trader 3",
+};

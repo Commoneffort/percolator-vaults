@@ -81,6 +81,6 @@ app/            web app (Vite + React + wallet adapter) and the devnet faucet AP
 pusher/         optional Pyth price pusher (needs a Hermes API key)
 ```
 
-See [SECURITY.md](SECURITY.md) for the threat model and known limits.
+See [SECURITY.md](SECURITY.md) for the threat model and known limits, the live [docs page](https://percolator-vaults.vercel.app/#/docs) for the full protocol description, [docs/SUBMISSION.md](docs/SUBMISSION.md) for the hackathon write-up and [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) for the demo.
 
 Built on Percolator (Apache-2.0).

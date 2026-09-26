@@ -3,7 +3,7 @@
 // and the volume of its trades against the vaults.
 import { Connection, PublicKey } from "@solana/web3.js";
 import L from "./_layout.js";
-import { FEED_SYMBOLS, MARKET, PERCOLATOR, VAULT_PROGRAM } from "./_config.js";
+import { FEED_SYMBOLS, MARKET, PERCOLATOR, SEED_WALLETS, VAULT_PROGRAM } from "./_config.js";
 
 const dv = (d: Uint8Array) => new DataView(d.buffer, d.byteOffset, d.byteLength);
 const u64 = (d: Uint8Array, o: number) => dv(d).getBigUint64(o, true);
@@ -101,7 +101,7 @@ async function build() {
   const rows = [...byWallet.values()].map(w => {
     const net = w.deposited - w.withdrawn;
     const pnl = w.equity - net;
-    return { wallet: w.wallet, pnl, roi: w.deposited > 0 ? pnl / w.deposited : 0, volume: w.volume, trades: w.trades, equity: w.equity, markets: [...w.markets], positions: w.positions };
+    return { wallet: w.wallet, seed: SEED_WALLETS[w.wallet], pnl, roi: w.deposited > 0 ? pnl / w.deposited : 0, volume: w.volume, trades: w.trades, equity: w.equity, markets: [...w.markets], positions: w.positions };
   });
   rows.sort((a, b) => b.pnl - a.pnl);
   return { updated: Date.now(), rows };

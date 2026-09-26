@@ -1,0 +1,25 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#0b0e13;color:#e6ebf2;font-family:Inter,sans-serif}
+  .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:18px;padding:0 80px}
+  .logo{font-size:64px;color:#7c9cff}
+  h1{font-size:64px;margin:0;letter-spacing:-.02em}
+  .grad{background:linear-gradient(90deg,#7c9cff,#3ecf8e);-webkit-background-clip:text;background-clip:text;color:transparent}
+  p{font-size:26px;color:#8b96a8;margin:0;max-width:980px;line-height:1.4}
+  .links{font-size:22px;color:#c3cad6;margin-top:18px;line-height:1.7}
+  .tag{font-size:16px;color:#8b96a8;margin-top:28px}
+</style></head>
+<body><div class="wrap" id="w"></div>
+<script>
+  const kind = new URLSearchParams(location.search).get("k");
+  const w = document.getElementById("w");
+  w.innerHTML = kind === "outro"
+    ? `<div class="logo">◈</div><h1>Percolator <span class="grad">Vaults</span></h1>
+       <p>Keyless perp markets, with liquidity built in.</p>
+       <div class="links">percolator-vaults.vercel.app<br>github.com/Commoneffort/percolator-vaults</div>
+       <div class="tag">Live on Solana devnet · unaudited · narration is machine-generated</div>`
+    : `<div class="logo">◈</div><h1>Percolator <span class="grad">Vaults</span></h1>
+       <p>Open a perpetual market on any Pyth price.<br>Liquidity included. No keys.</p>
+       <div class="tag">Built on Anatoly Yakovenko's Percolator · Solana devnet</div>`;
+</script></body></html>

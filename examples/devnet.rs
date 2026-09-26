@@ -295,12 +295,17 @@ fn push_feed_account(feed: &[u8; 32]) -> Pubkey {
 /// `max_accrual_dt_slots`), reading its Pyth account, with the LP portfolio as the target.
 fn crank_vault(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState) -> Result<(), String> {
     let oracle = push_feed_account(&v.oracle_feeds[0]);
-    for _ in 0..3 {
+    // Each crank advances accrual by at most max_accrual_dt (10) slots, and a crank with nothing
+    // to do fails its transaction, so every transaction carries exactly the cranks it needs, up
+    // to 8 (80 slots): enough to outrun the chain and catch up from a long idle gap.
+    for _ in 0..40 {
         let now = rpc.get_slot().map_err(|e| e.to_string())?;
         let (_, g, _) = market_state(rpc, market);
-        if g.assets[v.asset_index as usize].slot_last + 2 >= now {
+        let last = g.assets[v.asset_index as usize].slot_last;
+        if last + 2 >= now {
             return Ok(());
         }
+        let k = ((now - last + 9) / 10).min(8) as usize;
         let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 1 };
         let ix = prog(ProgIx::PermissionlessCrank { now_slot: now, observations: vec![hint] }, vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -308,9 +313,9 @@ fn crank_vault(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState
             AccountMeta::new(v.lp_portfolio, false),
             AccountMeta::new_readonly(oracle, false),
         ]);
-        if let Err(e) = send(rpc, payer, vec![ix], &[]) {
+        if let Err(e) = send(rpc, payer, vec![ix; k], &[]) {
             if e.contains("0x16") {
-                return Ok(()); // NonProgress: nothing to do this slot
+                return Ok(()); // NonProgress: someone else caught it up meanwhile
             }
             return Err(e);
         }
