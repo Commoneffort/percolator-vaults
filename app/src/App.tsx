@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 
@@ -67,7 +67,8 @@ export default function App() {
       if (!wallet.publicKey) return;
       setBusy(label);
       try {
-        const tx = new Transaction().add(...ixs);
+        // Percolator trades can use several hundred thousand compute units.
+        const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }), ...ixs);
         const sig = await wallet.sendTransaction(tx, connection, { skipPreflight: false });
         await connection.confirmTransaction(sig, "confirmed");
         setToast({ ok: true, text: `${label}: confirmed`, sig });

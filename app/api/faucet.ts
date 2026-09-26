@@ -2,7 +2,8 @@
 // FAUCET_SECRET holds the faucet keypair (JSON byte array); it is the test USDC mint authority.
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruction, getAssociatedTokenAddressSync } from "@solana/spl-token";
-import M from "../src/devnet.json";
+// Test USDC mint of the devnet market (deploy/devnet.json: collateral_mint).
+const TEST_USDC_MINT = "FT7B8rR8NN1ciyGPmTDT8AxUUWtF1PGc4NCmuisYVPkh";
 
 const USDC = 1_000_000;
 const DRIP_USDC = 1_000;
@@ -21,7 +22,7 @@ export default async function handler(req: any, res: any) {
   if (!secret) return res.status(500).json({ error: "faucet not configured" });
   const faucet = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(secret)));
   const conn = new Connection(process.env.RPC_URL ?? "https://api.devnet.solana.com", "confirmed");
-  const mint = new PublicKey(M.collateral_mint);
+  const mint = new PublicKey(TEST_USDC_MINT);
   const ata = getAssociatedTokenAddressSync(mint, to);
 
   const held = await conn.getTokenAccountBalance(ata).then(b => Number(b.value.amount) / USDC).catch(() => 0);
