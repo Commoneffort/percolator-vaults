@@ -23,7 +23,7 @@ CURSOR_JS = """
     if (document.getElementById('__cursor')) return;
     const c = document.createElement('div');
     c.id = '__cursor';
-    c.style.cssText = 'position:fixed;left:0;top:0;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;' +
+    c.style.cssText = 'position:fixed;left:640px;top:360px;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;' +
       'background:rgba(124,156,255,.35);border:2px solid #7c9cff;z-index:2147483647;pointer-events:none;transition:transform .12s';
     document.body.appendChild(c);
     addEventListener('mousemove', e => { c.style.left = e.clientX + 'px'; c.style.top = e.clientY + 'px'; }, true);

@@ -18,4 +18,5 @@ export const SEED_WALLETS: Record<string, string> = {
   BobEW42aDUTzntjiqavc5fRQWt9VnN1JMBG8dcLV4xRQ: "seed trader 1",
   HoNb9L6dM25qHMQWjn7FqX7CvDWN8g97sdb56UqYtPZF: "seed trader 2",
   "6Bosp4sCkYs2Fbzt2PYY4whVMaL5xUhfkUoytZvbnRWa": "seed trader 3",
+  "4caXfNghsBer5SVEykPZhqNTq7te7LTQ9MQ8rVLGUYzK": "demo video",
 };
