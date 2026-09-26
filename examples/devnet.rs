@@ -309,7 +309,7 @@ fn vault_state(rpc: &RpcClient, vault: &Pubkey) -> VaultState {
 fn crank(rpc: &RpcClient, payer: &Keypair, m: &Value, v: &VaultState) -> Result<(), String> {
     let market = key(m, "market");
     let oracle = Pubkey::from_str(SOL_USD_ACCOUNT).unwrap();
-    for _ in 0..20 {
+    for _ in 0..3 {
         let now = rpc.get_slot().map_err(|e| e.to_string())?;
         let (_, g, _) = market_state(rpc, &market);
         if g.assets[v.asset_index as usize].slot_last + 2 >= now {
@@ -337,11 +337,19 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
     let m = load();
     let creator = key(&m, "vault_creator");
     let k = keys(&m, &creator);
+    let mut tick: u64 = 0;
     loop {
+        tick += 1;
         let v = vault_state(rpc, &k.vault);
         let now = rpc.get_slot().unwrap_or(0);
+        // Keep the vault's asset within Percolator's accrual window so takers can add risk.
         if let Err(e) = crank(rpc, payer, &m, &v) {
             eprintln!("crank: {}", e.lines().next().unwrap_or(""));
+        }
+        let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots;
+        if tick % 15 != 0 && !epoch_over {
+            sleep(Duration::from_secs(2));
+            continue;
         }
         let (_, g, data) = market_state(rpc, &k.market);
         // Harvest fees above the floor.
@@ -370,7 +378,7 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                 }
             }
         }
-        sleep(Duration::from_secs(20));
+        sleep(Duration::from_secs(2));
     }
 }
 
