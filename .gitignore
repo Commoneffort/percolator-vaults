@@ -1,2 +1,5 @@
 target/
 keys/
+pusher/node_modules/
+deploy/devnet-tool
+deploy/logs/

@@ -16,7 +16,7 @@ use crate::error::VaultError;
 
 #[cfg(feature = "devnet")]
 pub const PERCOLATOR_PROGRAM_ID: Pubkey =
-    solana_program::pubkey!("HasHUx6abPMX8jxLa1591tqvBbZtJBKvN4pPLo68qAnq");
+    solana_program::pubkey!("8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P");
 #[cfg(not(feature = "devnet"))]
 pub const PERCOLATOR_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("Perco1ator111111111111111111111111111111111");
