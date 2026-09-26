@@ -3,3 +3,7 @@ keys/
 pusher/node_modules/
 deploy/devnet-tool
 deploy/logs/
+app/node_modules/
+app/dist/
+app/*.tsbuildinfo
+.vercel/

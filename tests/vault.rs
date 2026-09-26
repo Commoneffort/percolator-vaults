@@ -463,3 +463,51 @@ fn devnet_like_market_trades_at_realistic_size() {
     w.taker_trade_asset(0, asset, -2 * UNIT as i128).unwrap();
     println!("vault after SOL +$1 on 2 SOL short: {:?}", w.portfolio_view());
 }
+
+/// Writes the vault account layout for the frontend decoder (app/src/layout.json).
+#[test]
+fn export_layout_for_frontend() {
+    use percolator_vault::state::{EpochRecord, Ticket, VaultState as V};
+    use std::mem::{offset_of, size_of};
+    let o = state::VAULT_STATE_OFF;
+    macro_rules! f {
+        ($t:ty, $base:expr, $($name:ident),*) => {{
+            let mut m = serde_json::Map::new();
+            $( m.insert(stringify!($name).into(), serde_json::json!($base + offset_of!($t, $name))); )*
+            serde_json::Value::Object(m)
+        }};
+    }
+    let layout = serde_json::json!({
+        "vault": f!(V, o, magic, status, share_decimals, market, creator, seed, collateral_mint, share_mint, buffer, share_escrow,
+            lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_fill_abs, max_inventory_abs,
+            epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, asset_market_id, inventory, epoch, epoch_start_slot,
+            pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested),
+        "vault_len": state::VAULT_ACCOUNT_LEN,
+        "ticket": f!(Ticket, 0, vault, owner, epoch, deposit_assets, withdraw_shares),
+        "ticket_len": size_of::<Ticket>(),
+        "epoch_record": f!(EpochRecord, 0, epoch, deposit_assets, shares_minted, withdraw_shares, assets_out, nav_low, nav_high, supply_before, rolled_slot, deposits_refunded),
+        "portfolio": {
+            "capital": perc::PORTFOLIO_CAPITAL_OFF, "pnl": perc::PORTFOLIO_PNL_OFF, "fee_credits": perc::PORTFOLIO_FEE_CREDITS_OFF,
+            "active_bitmap": perc::PORTFOLIO_ACTIVE_BITMAP_OFF, "owner": perc::PORTFOLIO_OWNER_OFF, "control": perc::PORTFOLIO_MATCHER_CONTROL_OFF,
+            "id": perc::PORTFOLIO_ID_OFF, "sequence": perc::PORTFOLIO_SEQUENCE_OFF,
+            "legs": 16 + offset_of!(percolator::PortfolioAccountV16Account, legs),
+            "leg_len": size_of::<percolator::PortfolioLegV16Account>(),
+            "len": perc::PORTFOLIO_ACCOUNT_LEN
+        },
+        "leg": {
+            "asset_index": offset_of!(percolator::PortfolioLegV16Account, asset_index),
+            "basis_pos_q": offset_of!(percolator::PortfolioLegV16Account, basis_pos_q),
+            "side": offset_of!(percolator::PortfolioLegV16Account, side),
+            "active": offset_of!(percolator::PortfolioLegV16Account, active)
+        },
+        "market": { "slots": perc::MARKET_SLOTS_OFF, "slot_len": perc::MARKET_ASSET_SLOT_LEN, "engine": 512,
+            "market_id": 0,
+            "effective_price": offset_of!(percolator::AssetStateV16Account, effective_price),
+            "slot_last": offset_of!(percolator::AssetStateV16Account, slot_last),
+            "oi_long": offset_of!(percolator::AssetStateV16Account, oi_eff_long_q),
+            "oi_short": offset_of!(percolator::AssetStateV16Account, oi_eff_short_q),
+            "ins_budget_long": 515, "ins_budget_short": 531, "ins_spent_long": 547, "ins_spent_short": 563 }
+    });
+    std::fs::create_dir_all("app/src").unwrap();
+    std::fs::write("app/src/layout.json", serde_json::to_string_pretty(&layout).unwrap()).unwrap();
+}

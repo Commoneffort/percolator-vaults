@@ -226,10 +226,12 @@ fn faucet(rpc: &RpcClient, admin: &Keypair, to: &Pubkey, amount: u64) -> Pubkey 
     let m = load();
     let mint = key(&m, "collateral_mint");
     let ata = client::associated_token_address(to, &mint);
+    // The mint authority moved to a dedicated faucet key (keys/faucet.json) after setup.
+    let authority = read_keypair_file("keys/faucet.json").unwrap_or_else(|_| admin.insecure_clone());
     send(rpc, admin, vec![
         create_ata_idempotent(&admin.pubkey(), to, &mint),
-        spl_token::instruction::mint_to(&spl_token::ID, &mint, &ata, &admin.pubkey(), &[], amount).unwrap(),
-    ], &[]).expect("faucet");
+        spl_token::instruction::mint_to(&spl_token::ID, &mint, &ata, &authority.pubkey(), &[], amount).unwrap(),
+    ], &[&authority]).expect("faucet");
     ata
 }
 

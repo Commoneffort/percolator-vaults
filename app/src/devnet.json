@@ -1,0 +1,21 @@
+{
+  "admin": "6tukrXNVMiutg2HrRAoHgvec4NDizuZUmvdHHScn6CMk",
+  "asset_index": 2,
+  "buffer": "EfiC3mhyZFZ5vf1W5PP4CS3aM84tpWBof88jDc76rkZx",
+  "collateral_mint": "FT7B8rR8NN1ciyGPmTDT8AxUUWtF1PGc4NCmuisYVPkh",
+  "escrow": "FXDcFJVnBqy8hiC4Moer4GhJuGAuqU4m3hFZ5pVXxpvc",
+  "lp_portfolio": "ASM64KZLdMzLE2HKnJfA2MFzajS3Vs5WHRiJkwGqVvxG",
+  "market": "F9zUEE5MZqTLafnFxW2Zp7rKCQ3Wi3Dh1Mvra5eGMq4n",
+  "matcher_delegate": "7NGScN5zGSSwcP9WSwm5f5dFqLMRiNoVd6TWzjSKvAPz",
+  "network": "devnet",
+  "oracle_account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+  "percolator_program": "8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P",
+  "percolator_vault": "9VFaQe7MDstkp8JFUXDxjxUgnZB6Aejx5NsdfufXtMfa",
+  "percolator_vault_authority": "3WnaqT6sKxaWkKK1hU7y6nXf9EkSDWA8eZ4dGA61zqfc",
+  "share_mint": "8p7RzE4fris6kauAryp24jWpDdCx8kNWekWUVweZz5Mr",
+  "taker_portfolio": "6xTPjTmrKSyEWRQDA7qB5XQvaSLLfNbV8H16LQh7DC7d",
+  "vault": "6QFyaoJ6A4D9cM3n7hVHgEdZoqvEQFAZfX5ucjmUEC5P",
+  "vault_creator": "6tukrXNVMiutg2HrRAoHgvec4NDizuZUmvdHHScn6CMk",
+  "vault_program": "BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX",
+  "vault_seed": 2
+}
