@@ -51,7 +51,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 ## Tests
 
-`./test.sh` builds the on-chain program and runs 35 tests. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness.
+`./test.sh` builds the on-chain program and runs 35 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `owl/trunk` of `Commoneffort/percolator-prog`) with its SBF binary built. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness.
 
 - **Math and property tests:** withdrawals never exceed NAV, deposit-then-withdraw never profits, incumbents are never diluted, fills never break the inventory cap.
 - **Layout tests:** every account offset and every Percolator instruction encoding the vault uses is checked against Percolator's own types and decoder.
