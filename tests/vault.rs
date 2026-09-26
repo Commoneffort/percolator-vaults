@@ -31,8 +31,8 @@ const EPOCH_LEN: u64 = 20;
 const SPREAD_BPS: u16 = 50;
 /// One unit of position size (Percolator's POS_SCALE).
 const UNIT: u128 = 1_000_000;
-/// 10M units: 10M collateral atoms of notional at the initial price of 1.0.
-const TEN_M: i128 = 10_000_000 * UNIT as i128;
+/// 10 units: 10M collateral atoms of notional at the initial price (1M atoms per unit).
+const TEN_M: i128 = 10 * UNIT as i128;
 
 pub struct World {
     pub env: V16Svm,
