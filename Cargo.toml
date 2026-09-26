@@ -1,0 +1,41 @@
+[package]
+name = "percolator-vault"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Permissionless, adminless pooled LP vault and matcher for Percolator markets"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "percolator_vault"
+
+[features]
+default = []
+no-entrypoint = []
+# Which Percolator deployment the vault is allowed to talk to. Exactly one ID is compiled in;
+# the default is the ID used by Percolator's own LiteSVM harness.
+devnet = []
+
+[dependencies]
+solana-program = "1.18"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
+
+[dev-dependencies]
+percolator_prog = { package = "percolator-prog", path = "../percolator-prog", default-features = false, features = ["no-entrypoint"] }
+percolator = { git = "https://github.com/Commoneffort/percolator", rev = "6de466b99512b2a05c9a73ebff42011409473841" }
+litesvm = "0.1"
+solana-sdk = "1.18"
+proptest = "1.4"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("solana"))',
+    'cfg(feature, values("custom-heap", "custom-panic"))',
+] }
