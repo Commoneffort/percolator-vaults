@@ -39,7 +39,24 @@ impl VaultKeys {
         seed: u64,
         collateral_mint: &Pubkey,
     ) -> Self {
-        let vault = state::vault_address(&program, &market, &creator, seed).0;
+        Self::with_vault(program, market, creator, seed, collateral_mint, state::vault_address(&program, &market, &creator, seed).0)
+    }
+
+    /// Keys of the canonical (operate-mode) vault for a feed.
+    pub fn canonical(program: Pubkey, market: Pubkey, feed: &[u8; 32], collateral_mint: &Pubkey) -> Self {
+        let vault = state::canonical_vault_address(&program, &market, feed).0;
+        Self::with_vault(program, market, Pubkey::default(), 0, collateral_mint, vault)
+    }
+
+    /// Keys for a vault whose own address is already known (read it from the account).
+    pub fn with_vault(
+        program: Pubkey,
+        market: Pubkey,
+        creator: Pubkey,
+        seed: u64,
+        collateral_mint: &Pubkey,
+        vault: Pubkey,
+    ) -> Self {
         let child = |t| state::child_address(&program, t, &vault).0;
         let portfolio = child(state::SEED_PORTFOLIO);
         let percolator_vault_authority = perc::vault_authority(&market);

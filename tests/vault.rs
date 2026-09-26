@@ -5,7 +5,7 @@ use common::*;
 #[allow(unused_imports)]
 use common::v16_svm::MarketConfig as _Mc;
 use percolator_prog::ix::Instruction as ProgIx;
-use percolator_vault::{percolator as perc, processor::InitParams, state};
+use percolator_vault::{percolator as perc, processor::{self, InitParams}, state};
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
 #[allow(unused_imports)]
 use solana_sdk::signature::Keypair;
@@ -448,8 +448,8 @@ fn devnet_like_market_trades_at_realistic_size() {
     let sol = 12_107_261_038i64; // $121.07261038, expo -8
     let pyth = w.env.set_pyth_price(&FEED, sol, -8, 0, 1_000);
     w.list_asset(&lister, pyth).unwrap();
-    let alice = w.new_user(100_000_000);
-    w.deposit(&alice, 50_000_000).unwrap(); // 50 USDC
+    let alice = w.new_user(1_000_000_000);
+    w.deposit(&alice, 500_000_000).unwrap(); // 500 USDC: caps are 3x NAV, 0.75x NAV per fill
     let mut ts = 1_000i64;
     w.advance_oracle(pyth, EPOCH_LEN, &mut ts, sol);
     w.roll().unwrap();
@@ -480,7 +480,7 @@ fn export_layout_for_frontend() {
     let layout = serde_json::json!({
         "vault": f!(V, o, magic, status, share_decimals, market, creator, seed, collateral_mint, share_mint, buffer, share_escrow,
             lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_inventory_abs,
-            epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, asset_market_id, inventory, epoch, epoch_start_slot,
+            epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, vault_kind, position_nav_bps, fill_nav_bps, asset_market_id, inventory, epoch, epoch_start_slot,
             pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested),
         "vault_len": state::VAULT_ACCOUNT_LEN,
         "ticket": f!(Ticket, 0, vault, owner, epoch, deposit_assets, withdraw_shares),
@@ -531,4 +531,51 @@ fn pyth_push_feed_address_derivation() {
     for i in 0..32 { feed[i] = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap(); }
     let (k, _) = Pubkey::find_program_address(&[&0u16.to_le_bytes(), &feed], &push);
     assert_eq!(k.to_string(), "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE");
+}
+
+#[test]
+fn canonical_vaults_are_unique_per_feed_and_scale_with_nav() {
+    // 10% margin, so the vault's own 3x-NAV cap binds before Percolator's margin check.
+    let mut w = World::with_config(devnet_like_config());
+    w.env.set_clock(5, 1_000);
+    w.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
+    // A creator asks for absurd limits; the canonical template replaces them.
+    let greedy = InitParams { max_inventory_abs: 1, max_fill_abs: 1, epoch_len_slots: 999, ..operate_params(7) };
+    w.create_vault(greedy).unwrap();
+    let v = w.vault_state();
+    assert_eq!({ v.vault_kind }, state::KIND_CANONICAL);
+    assert_eq!({ v.epoch_len_slots }, processor::CANON_EPOCH_LEN_SLOTS);
+    assert_eq!({ v.position_nav_bps }, processor::CANON_POSITION_NAV_BPS);
+
+    // Nobody can open a second vault for the same feed, whatever the seed or creator.
+    let other = Keypair::new();
+    w.env.svm.airdrop(&other.pubkey(), 1_000_000_000).unwrap();
+    let first_creator = std::mem::replace(&mut w.creator, other);
+    assert!(w.create_vault(operate_params(8)).is_err(), "second vault for the same feed");
+    w.creator = first_creator;
+
+    // A stranger can finish the listing, so a created-but-unlisted vault can't squat the feed.
+    let stranger = w.new_user(10_000_000);
+    let pyth = w.env.set_pyth_price(&FEED, 100_000_000, -8, 0, 1_000);
+    w.list_asset(&stranger, pyth).unwrap();
+
+    // Empty vault: quotes nothing.
+    let alice = w.new_user(1_000_000_000);
+    let mut ts = 1_000i64;
+    w.advance_oracle(pyth, 2, &mut ts, 100_000_000);
+    let asset = w.vault_state().asset_index;
+    w.taker_trade_asset(0, asset, 5 * UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, 0, "no NAV, no fills");
+
+    // 20 USDC of NAV at $1: fills up to 15 units (0.75x), position up to 60 units (3x).
+    w.deposit(&alice, 20_000_000).unwrap();
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
+    w.roll().unwrap();
+    w.taker_trade_asset(0, asset, 40 * UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -15 * UNIT as i128, "per-fill cap is 0.75x NAV");
+    for _ in 0..4 {
+        w.advance_oracle(pyth, 1, &mut ts, 100_000_000);
+        w.taker_trade_asset(0, asset, 40 * UNIT as i128).unwrap();
+    }
+    assert_eq!({ w.vault_state().inventory }, -60 * UNIT as i128, "position cap is 3x NAV");
 }

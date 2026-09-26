@@ -240,38 +240,14 @@ fn create_vault(rpc: &RpcClient, admin: &Keypair, seed: u64) {
     let market = key(&m, "market");
     let mint = key(&m, "collateral_mint");
     m["vault_seed"] = json!(seed);
-    let k = keys(&m, &admin.pubkey());
     let (_, g, _) = market_state(rpc, &market);
     let mut feed = [0u8; 32];
     for i in 0..32 {
         feed[i] = u8::from_str_radix(&SOL_USD_FEED[2 * i..2 * i + 2], 16).unwrap();
     }
-    let p = InitParams {
-        seed,
-        asset_index: 0,
-        spread_bps: 10,
-        unwind_spread_bps: 0,
-        trade_fee_cap_bps: 10_000,
-        backing_fee_cap_bps: 0,
-        max_fill_abs: 100 * UNIT,       // 100 SOL per fill
-        max_inventory_abs: 500 * UNIT,  // 500 SOL net
-        epoch_len_slots: 1_500,         // about ten minutes
-        matcher_ttl_slots: 216_000,     // about a day
-        asset_generation_frontier: g.next_market_id,
-        mode: state::MODE_OPERATE,
-        insurance_floor: 100 * USDC,
-        listing_fee_max: 2 * USDC,
-        oracle_leg_count: 1,
-        oracle_leg_flags: 0,
-        oracle_invert: 0,
-        oracle_unit_scale: 0,
-        oracle_conf_filter_bps: 0,
-        oracle_max_staleness_secs: 300,
-        oracle_soft_stale_slots: 200,
-        oracle_ewma_halflife_slots: 1,
-        oracle_mark_min_fee: 0,
-        oracle_feeds: [feed, [0; 32], [0; 32]],
-    };
+    let _ = seed;
+    let p = InitParams::canonical(feed, 2 * USDC, g.next_market_id);
+    let k = VaultKeys::canonical(percolator_vault::id(), market, &feed, &mint);
     send(rpc, admin, vec![client::init_vault(&k, &admin.pubkey(), &mint, &p)], &[]).expect("InitVault");
     println!("vault {}", k.vault);
 
@@ -361,7 +337,11 @@ fn all_vaults(rpc: &RpcClient) -> Vec<(VaultKeys, VaultState)> {
             if v.magic != state::VAULT_MAGIC || v.status != state::STATUS_ACTIVE {
                 return None;
             }
-            let keys = VaultKeys::derive(percolator_vault::id(), v.market, v.creator, v.seed, &v.collateral_mint);
+            let keys = if v.vault_kind == state::KIND_CANONICAL {
+                VaultKeys::canonical(percolator_vault::id(), v.market, &v.oracle_feeds[0], &v.collateral_mint)
+            } else {
+                VaultKeys::derive(percolator_vault::id(), v.market, v.creator, v.seed, &v.collateral_mint)
+            };
             (keys.vault == k).then_some((keys, v))
         })
         .collect()

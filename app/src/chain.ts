@@ -82,6 +82,9 @@ export type Vault = {
   maxInventory: bigint;
   insuranceFloor: bigint;
   createdSlot: bigint;
+  canonical: boolean;
+  positionNavBps: number;
+  fillNavBps: number;
 };
 
 export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
@@ -116,6 +119,9 @@ export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
     maxInventory: u128(d, v.max_inventory_abs),
     insuranceFloor: u64(d, v.insurance_floor),
     createdSlot: u64(d, v.created_slot),
+    canonical: d[v.vault_kind] === 1,
+    positionNavBps: u16(d, v.position_nav_bps),
+    fillNavBps: u16(d, v.fill_nav_bps),
   };
 }
 
@@ -193,6 +199,9 @@ const le8 = (n: bigint) => {
 const enc = (s: string) => new TextEncoder().encode(s);
 export const vaultAddress = (creator: PublicKey, seed: bigint) =>
   PublicKey.findProgramAddressSync([enc("vault"), MARKET.toBytes(), creator.toBytes(), le8(seed)], VAULT_PROGRAM)[0];
+/** The one vault (and so the one market) the program allows for a feed. */
+export const canonicalVaultAddress = (feedHex: string) =>
+  PublicKey.findProgramAddressSync([enc("canon"), MARKET.toBytes(), hexBytes(feedHex), le8(0n)], VAULT_PROGRAM)[0];
 export const childAddress = (tag: string, vault: PublicKey) =>
   PublicKey.findProgramAddressSync([enc(tag), vault.toBytes()], VAULT_PROGRAM)[0];
 export const ticketAddress = (v: PublicKey, user: PublicKey) =>
@@ -224,28 +233,20 @@ class W {
 const ro = (pubkey: PublicKey, isSigner = false): AccountMeta => ({ pubkey, isSigner, isWritable: false });
 const rw = (pubkey: PublicKey, isSigner = false): AccountMeta => ({ pubkey, isSigner, isWritable: true });
 
-export type LaunchParams = {
-  seed: bigint;
-  feedHex: string;
-  maxFillUnits: bigint;
-  maxInventoryUnits: bigint;
-  epochLenSlots: bigint;
-  insuranceFloor: bigint;
-  frontier: bigint;
-};
-
-/** InitVault in operate mode, with the Pyth feed and limits fixed forever. */
-export function initVault(payer: PublicKey, p: LaunchParams) {
-  const vault = vaultAddress(payer, p.seed);
+/** InitVault in operate mode. The program replaces every parameter with its canonical template;
+ *  only the feed and the listing-fee budget matter. */
+export function initVault(payer: PublicKey, feedHex: string, frontier: bigint) {
+  const vault = canonicalVaultAddress(feedHex);
   const portfolio = childAddress("portfolio", vault);
   const data = new W()
-    .u8(16).u64(p.seed).u16(0).u16(10).u16(0).u16(10_000).u16(0)
-    .i128(p.maxFillUnits * UNIT).i128(p.maxInventoryUnits * UNIT)
-    .u64(p.epochLenSlots).u64(216_000n).u64(p.frontier)
-    .u8(1).u64(p.insuranceFloor).u64(2n * BigInt(USDC))
+    .u8(16).u64(0n).u16(0).u16(10).u16(0).u16(10_000).u16(0)
+    .i128(1n).i128(1n)
+    .u64(1_500n).u64(216_000n).u64(frontier)
+    .u8(1).u64(0n).u64(2n * BigInt(USDC))
     .u8(1).u8(0).u8(0).u32(0).u16(0)
     .u64(300n).u64(200n).u64(1n).u64(0n)
-    .bytes(hexBytes(p.feedHex)).bytes(new Uint8Array(64))
+    .bytes(hexBytes(feedHex)).bytes(new Uint8Array(64))
+    .u16(0).u16(0)
     .done();
   return {
     vault,
@@ -334,7 +335,7 @@ export async function listVaults(conn: Connection): Promise<Vault[]> {
   const accs = await conn.getProgramAccounts(VAULT_PROGRAM, { commitment: "confirmed", filters: [{ dataSize: VAULT_LEN }] });
   return accs
     .map(a => decodeVault(a.pubkey, new Uint8Array(a.account.data)))
-    .filter(v => v.market.equals(MARKET) && v.status !== 0 && v.feed)
+    .filter(v => v.market.equals(MARKET) && v.feed && (v.status !== 0 || v.canonical))
     .sort((a, b) => Number(b.createdSlot - a.createdSlot));
 }
 

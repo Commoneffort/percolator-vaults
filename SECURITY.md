@@ -4,7 +4,7 @@
 
 | Party | Can | Cannot |
 |---|---|---|
-| Vault creator | Choose the parameters once, at creation | Change any parameter; move funds; pause; upgrade |
+| Vault creator | Operate mode: pick the feed (all other parameters come from the canonical template). Attach mode: choose the parameters once | Open a second market for a feed; change any parameter; move funds; pause; upgrade |
 | Depositors | Queue deposits and withdrawals; claim; redeem after wind-down | Affect other depositors' prices |
 | Anyone | Roll, harvest, convert, renew, unwind, settle, sweep | Choose amounts or destinations: each of these moves value only into the vault's own buffer or its own portfolio |
 | Takers | Trade against the vault within its caps | Call the matcher directly; route fills through another LP; lock withdrawals |
@@ -22,6 +22,8 @@
 - A ticket can be claimed once, only by its owner, only against the record of its own epoch. Records are created by the roll itself, at a PDA, so they cannot be forged.
 - Fee harvesting never takes insurance below the fixed floor while the vault is live.
 - Pre-funding a PDA address with lamports cannot block account creation.
+- There is at most one operate-mode vault per (market, feed), and it cannot be squatted: anyone can finish listing a created-but-unlisted vault.
+- Canonical vaults never take on more than 3x their NAV in position, or 0.75x per fill, on top of Percolator's margin rules.
 
 ## Known limits
 

@@ -93,6 +93,19 @@ pub fn allowed_fill(
     core::cmp::min(want, room)
 }
 
+/// A size cap (in position units) worth `bps` of `nav` in notional at `price_e6`:
+/// `nav * bps / 10_000` collateral atoms, divided by atoms per unit. Rounded down.
+pub fn nav_cap(nav: u64, bps: u16, price_e6: u64) -> u128 {
+    if price_e6 == 0 {
+        return 0;
+    }
+    let notional = (nav as u128) * (bps as u128) / BPS;
+    notional.saturating_mul(POS_SCALE) / price_e6 as u128
+}
+
+/// Percolator's position scale: one whole unit of the asset.
+pub const POS_SCALE: u128 = 1_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +142,14 @@ mod tests {
         assert_eq!(quote_price(3, false, 1).unwrap(), 2);
         assert!(quote_price(1, false, 5_000).is_err());
         assert!(quote_price(1_000_000, true, 10_000).is_err());
+    }
+
+    #[test]
+    fn nav_caps_scale_with_the_vault() {
+        // $1,000 of NAV (6 decimals) at $100 per unit: 3x NAV = $3,000 = 30 units.
+        assert_eq!(nav_cap(1_000_000_000, 30_000, 100_000_000), 30 * POS_SCALE);
+        assert_eq!(nav_cap(0, 30_000, 100_000_000), 0, "an empty vault quotes nothing");
+        assert_eq!(nav_cap(1_000_000_000, 0, 100_000_000), 0);
     }
 
     #[test]

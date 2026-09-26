@@ -30,6 +30,59 @@ pub const MAX_EPOCH_LEN_SLOTS: u64 = 7 * 216_000; // about a week of 400 ms slot
 pub const MIN_MATCHER_TTL_SLOTS: u64 = 100;
 pub const MAX_MATCHER_TTL_SLOTS: u64 = 30 * 216_000;
 pub const MAX_ORACLE_STALENESS_SECS: u64 = 300;
+/// A vault may hold at most 5x its NAV in notional. Percolator's margin rules apply on top.
+pub const MAX_POSITION_NAV_BPS: u16 = 50_000;
+
+// ---- canonical (operate-mode) vault template ----
+// Operate-mode vaults are unique per (market, feed), so whoever creates one must not be able to
+// choose parameters that cripple it. They all get this template; the creator only picks the feed.
+#[cfg(feature = "devnet")]
+pub const CANON_EPOCH_LEN_SLOTS: u64 = 1_500; // about ten minutes
+#[cfg(not(feature = "devnet"))]
+pub const CANON_EPOCH_LEN_SLOTS: u64 = 20;
+#[cfg(feature = "devnet")]
+pub const CANON_INSURANCE_FLOOR: u64 = 100_000_000; // 100 units of a 6-decimal collateral
+#[cfg(not(feature = "devnet"))]
+pub const CANON_INSURANCE_FLOOR: u64 = 10_000;
+pub const CANON_POSITION_NAV_BPS: u16 = 30_000; // position up to 3x the vault's NAV
+pub const CANON_FILL_NAV_BPS: u16 = 7_500; // each fill up to 0.75x the vault's NAV
+pub const CANON_MATCHER_TTL_SLOTS: u64 = 216_000;
+pub const UNCAPPED: u128 = (i128::MAX as u128) / 4;
+
+impl InitParams {
+    /// The fixed template for canonical vaults: only the seed-free feed choice and the listing
+    /// fee budget come from the caller.
+    pub fn canonical(feed: [u8; 32], listing_fee_max: u64, frontier: u64) -> Self {
+        Self {
+            seed: 0,
+            asset_index: 0,
+            spread_bps: 10,
+            unwind_spread_bps: 0,
+            trade_fee_cap_bps: 10_000,
+            backing_fee_cap_bps: 0,
+            max_fill_abs: UNCAPPED,
+            max_inventory_abs: UNCAPPED,
+            epoch_len_slots: CANON_EPOCH_LEN_SLOTS,
+            matcher_ttl_slots: CANON_MATCHER_TTL_SLOTS,
+            asset_generation_frontier: frontier,
+            mode: MODE_OPERATE,
+            insurance_floor: CANON_INSURANCE_FLOOR,
+            listing_fee_max,
+            oracle_leg_count: 1,
+            oracle_leg_flags: 0,
+            oracle_invert: 0,
+            oracle_unit_scale: 0,
+            oracle_conf_filter_bps: 0,
+            oracle_max_staleness_secs: MAX_ORACLE_STALENESS_SECS,
+            oracle_soft_stale_slots: 200,
+            oracle_ewma_halflife_slots: 1,
+            oracle_mark_min_fee: 0,
+            oracle_feeds: [feed, [0; 32], [0; 32]],
+            position_nav_bps: CANON_POSITION_NAV_BPS,
+            fill_nav_bps: CANON_FILL_NAV_BPS,
+        }
+    }
+}
 
 pub const TAG_INIT_VAULT: u8 = 16;
 pub const TAG_REQUEST_DEPOSIT: u8 = 17;
@@ -72,10 +125,12 @@ pub struct InitParams {
     pub oracle_ewma_halflife_slots: u64,
     pub oracle_mark_min_fee: u64,
     pub oracle_feeds: [[u8; 32]; 3],
+    pub position_nav_bps: u16,
+    pub fill_nav_bps: u16,
 }
 
 impl InitParams {
-    pub const LEN: usize = 8 + 2 * 5 + 16 * 2 + 8 * 3 + 1 + 8 * 2 + 3 + 4 + 2 + 8 * 4 + 96;
+    pub const LEN: usize = 8 + 2 * 5 + 16 * 2 + 8 * 3 + 1 + 8 * 2 + 3 + 4 + 2 + 8 * 4 + 96 + 4;
 
     pub fn encode(&self) -> Vec<u8> {
         let mut d = vec![TAG_INIT_VAULT];
@@ -105,6 +160,8 @@ impl InitParams {
         for f in &self.oracle_feeds {
             d.extend_from_slice(f);
         }
+        d.extend_from_slice(&self.position_nav_bps.to_le_bytes());
+        d.extend_from_slice(&self.fill_nav_bps.to_le_bytes());
         d
     }
 
@@ -138,6 +195,8 @@ impl InitParams {
             oracle_ewma_halflife_slots: r.u64(),
             oracle_mark_min_fee: r.u64(),
             oracle_feeds: [r.take(), r.take(), r.take()],
+            position_nav_bps: r.u16(),
+            fill_nav_bps: r.u16(),
         })
     }
 
@@ -152,7 +211,9 @@ impl InitParams {
             && self.max_inventory_abs > 0
             && self.max_inventory_abs <= (i128::MAX as u128) / 4
             && (MIN_EPOCH_LEN_SLOTS..=MAX_EPOCH_LEN_SLOTS).contains(&self.epoch_len_slots)
-            && (MIN_MATCHER_TTL_SLOTS..=MAX_MATCHER_TTL_SLOTS).contains(&self.matcher_ttl_slots);
+            && (MIN_MATCHER_TTL_SLOTS..=MAX_MATCHER_TTL_SLOTS).contains(&self.matcher_ttl_slots)
+            && self.position_nav_bps <= MAX_POSITION_NAV_BPS
+            && self.fill_nav_bps <= self.position_nav_bps;
         let mode_ok = match self.mode {
             MODE_ATTACH => {
                 self.insurance_floor == 0 && self.listing_fee_max == 0 && self.oracle_leg_count == 0
@@ -277,9 +338,9 @@ fn sub(a: u64, b: u64) -> Result<u64, VaultError> {
 macro_rules! vault_seeds {
     ($v:expr, $bump:expr) => {
         &[
-            SEED_VAULT,
+            if $v.vault_kind == KIND_CANONICAL { SEED_CANONICAL } else { SEED_VAULT },
             $v.market.as_ref(),
-            $v.creator.as_ref(),
+            if $v.vault_kind == KIND_CANONICAL { &$v.oracle_feeds[0][..] } else { $v.creator.as_ref() },
             &$v.seed.to_le_bytes(),
             &[$bump],
         ]
@@ -400,6 +461,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 /// 5 share mint [w], 6 buffer [w], 7 share escrow [w], 8 LP portfolio [w], 9 matcher delegate,
 /// 10 Percolator program, 11 this program, 12 token program, 13 system program.
 fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> ProgramResult {
+    // Operate mode is canonical: one vault per (market, feed), on the fixed template. The caller
+    // only chooses the feed (and how much listing fee it will pay).
+    let p = if p.mode == MODE_OPERATE {
+        InitParams::canonical(p.oracle_feeds[0], p.listing_fee_max, p.asset_generation_frontier)
+    } else {
+        p
+    };
     p.validate()?;
     let payer = acc(accounts, 0)?;
     let creator = acc(accounts, 1)?;
@@ -439,7 +507,12 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         .checked_add(3)
         .ok_or(VaultError::InvalidParams)?;
 
-    let (vault_key, vault_bump) = vault_address(program_id, market.key, creator.key, p.seed);
+    let kind = if p.mode == MODE_OPERATE { KIND_CANONICAL } else { KIND_LEGACY };
+    let (vault_key, vault_bump) = if kind == KIND_CANONICAL {
+        canonical_vault_address(program_id, market.key, &p.oracle_feeds[0])
+    } else {
+        vault_address(program_id, market.key, creator.key, p.seed)
+    };
     key_is(vault_ai, &vault_key)?;
     let (mint_key, mint_bump) = child_address(program_id, SEED_SHARES, &vault_key);
     let (buffer_key, buffer_bump) = child_address(program_id, SEED_BUFFER, &vault_key);
@@ -455,9 +528,9 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
 
     let seed_bytes = p.seed.to_le_bytes();
     let vault_signer: &[&[u8]] = &[
-        SEED_VAULT,
+        if kind == KIND_CANONICAL { SEED_CANONICAL } else { SEED_VAULT },
         market.key.as_ref(),
-        creator.key.as_ref(),
+        if kind == KIND_CANONICAL { &p.oracle_feeds[0][..] } else { creator.key.as_ref() },
         &seed_bytes,
         &[vault_bump],
     ];
@@ -562,7 +635,9 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         unwind_spread_bps: p.unwind_spread_bps,
         trade_fee_cap_bps: p.trade_fee_cap_bps,
         backing_fee_cap_bps: p.backing_fee_cap_bps,
-        _pad0: [0; 6],
+        position_nav_bps: p.position_nav_bps,
+        fill_nav_bps: p.fill_nav_bps,
+        _pad0: [0; 2],
         max_fill_abs: p.max_fill_abs,
         max_inventory_abs: p.max_inventory_abs,
         epoch_len_slots: p.epoch_len_slots,
@@ -573,7 +648,8 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         oracle_invert: p.oracle_invert,
         oracle_unit_scale: p.oracle_unit_scale,
         oracle_conf_filter_bps: p.oracle_conf_filter_bps,
-        _pad1: [0; 6],
+        vault_kind: kind,
+        _pad1: [0; 5],
         oracle_max_staleness_secs: p.oracle_max_staleness_secs,
         oracle_soft_stale_slots: p.oracle_soft_stale_slots,
         oracle_ewma_halflife_slots: p.oracle_ewma_halflife_slots,

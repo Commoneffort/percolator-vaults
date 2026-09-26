@@ -68,6 +68,7 @@ export default {
     "epoch": 600,
     "epoch_len_slots": 400,
     "epoch_start_slot": 608,
+    "fill_nav_bps": 364,
     "insurance_floor": 560,
     "inventory": 584,
     "last_nav": 640,
@@ -83,6 +84,7 @@ export default {
     "pending_deposit_assets": 616,
     "pending_withdraw_shares": 624,
     "portfolio_id": 344,
+    "position_nav_bps": 362,
     "reserved_assets": 632,
     "seed": 144,
     "share_decimals": 79,
@@ -92,7 +94,8 @@ export default {
     "status": 73,
     "total_fees_harvested": 664,
     "total_fills": 656,
-    "unwind_spread_bps": 356
+    "unwind_spread_bps": 356,
+    "vault_kind": 426
   },
   "vault_len": 728
 } as const;

@@ -208,6 +208,8 @@ pub fn default_params(seed: u64) -> InitParams {
         oracle_ewma_halflife_slots: 0,
         oracle_mark_min_fee: 0,
         oracle_feeds: [[0; 32]; 3],
+        position_nav_bps: 0,
+        fill_nav_bps: 0,
     }
 }
 
@@ -284,7 +286,11 @@ impl World {
 
     pub fn init_ix(&self, p: &InitParams) -> Instruction {
         let market = self.env.market;
-        let (vault, _) = state::vault_address(&pid(), &market, &self.creator.pubkey(), p.seed);
+        let (vault, _) = if p.mode == state::MODE_OPERATE {
+            state::canonical_vault_address(&pid(), &market, &p.oracle_feeds[0])
+        } else {
+            state::vault_address(&pid(), &market, &self.creator.pubkey(), p.seed)
+        };
         let child = |t| state::child_address(&pid(), t, &vault).0;
         let portfolio = child(state::SEED_PORTFOLIO);
         Instruction {
@@ -318,14 +324,22 @@ impl World {
         let creator = self.creator.insecure_clone();
         self.send(vec![ix], &[&creator])?;
         let market = self.env.market;
-        self.vault = state::vault_address(&pid(), &market, &creator.pubkey(), p.seed).0;
+        self.vault = if p.mode == state::MODE_OPERATE {
+            state::canonical_vault_address(&pid(), &market, &p.oracle_feeds[0]).0
+        } else {
+            state::vault_address(&pid(), &market, &creator.pubkey(), p.seed).0
+        };
         let child = |t| state::child_address(&pid(), t, &self.vault).0;
         self.share_mint = child(state::SEED_SHARES);
         self.buffer = child(state::SEED_BUFFER);
         self.escrow = child(state::SEED_ESCROW);
         self.portfolio = child(state::SEED_PORTFOLIO);
         self.delegate = perc::matcher_delegate(&market, &self.portfolio, &self.vault, &pid(), &self.vault);
-        let keys = client::VaultKeys::derive(pid(), market, creator.pubkey(), p.seed, &self.env.mint);
+        let keys = if p.mode == state::MODE_OPERATE {
+            client::VaultKeys::canonical(pid(), market, &p.oracle_feeds[0], &self.env.mint)
+        } else {
+            client::VaultKeys::derive(pid(), market, creator.pubkey(), p.seed, &self.env.mint)
+        };
         assert_eq!(keys.vault, self.vault);
         assert_eq!(keys.percolator_vault, self.env.vault, "canonical Percolator vault ATA");
         self.keys = Some(keys);

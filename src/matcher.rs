@@ -80,12 +80,20 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let taker_buys = req.req_size > 0;
     // The vault takes the other side: a taker buy moves the vault short.
     let lp_sign: i8 = if taker_buys { -1 } else { 1 };
+    // Caps are the tighter of the fixed limits and, when configured, multiples of the vault's
+    // NAV at the price of this request. An empty vault therefore quotes nothing.
+    let (mut max_fill, mut max_inventory) = (v.max_fill_abs, v.max_inventory_abs);
+    if v.position_nav_bps != 0 {
+        let nav = v.last_nav;
+        max_inventory = max_inventory.min(math::nav_cap(nav, v.position_nav_bps, req.oracle_price_e6));
+        max_fill = max_fill.min(math::nav_cap(nav, v.fill_nav_bps, req.oracle_price_e6));
+    }
     let fill = math::allowed_fill(
         req.req_size.unsigned_abs(),
-        v.max_fill_abs,
+        max_fill,
         v.inventory,
         lp_sign,
-        v.max_inventory_abs,
+        max_inventory,
         ro,
     );
 

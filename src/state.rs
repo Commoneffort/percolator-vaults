@@ -20,6 +20,9 @@ pub const MODE_ATTACH: u8 = 0;
 /// The vault lists its own asset, holds every authority over it, and harvests its trading fees.
 pub const MODE_OPERATE: u8 = 1;
 
+pub const KIND_LEGACY: u8 = 0;
+pub const KIND_CANONICAL: u8 = 1;
+
 /// The first 64 bytes of the vault account are Percolator's matcher return slot: the vault
 /// account is also the matcher context Percolator passes to the vault's matcher entrypoint.
 pub const MATCHER_RETURN_LEN: usize = 64;
@@ -55,7 +58,11 @@ pub struct VaultState {
     pub unwind_spread_bps: u16,
     pub trade_fee_cap_bps: u16,
     pub backing_fee_cap_bps: u16,
-    pub _pad0: [u8; 6],
+    /// Position cap as a multiple of the vault's NAV (basis points of NAV in notional); 0 = off.
+    pub position_nav_bps: u16,
+    /// Per-fill cap as a multiple of the vault's NAV (basis points of NAV in notional); 0 = off.
+    pub fill_nav_bps: u16,
+    pub _pad0: [u8; 2],
     pub max_fill_abs: u128,
     pub max_inventory_abs: u128,
     pub epoch_len_slots: u64,
@@ -68,7 +75,10 @@ pub struct VaultState {
     pub oracle_invert: u8,
     pub oracle_unit_scale: u32,
     pub oracle_conf_filter_bps: u16,
-    pub _pad1: [u8; 6],
+    /// KIND_CANONICAL vaults live at the one address for (market, feed); KIND_LEGACY at
+    /// (market, creator, seed).
+    pub vault_kind: u8,
+    pub _pad1: [u8; 5],
     pub oracle_max_staleness_secs: u64,
     pub oracle_soft_stale_slots: u64,
     pub oracle_ewma_halflife_slots: u64,
@@ -203,6 +213,7 @@ pub fn store_epoch(ai: &AccountInfo, r: &EpochRecord) -> Result<(), ProgramError
 
 // ---- PDA seeds ----
 pub const SEED_VAULT: &[u8] = b"vault";
+pub const SEED_CANONICAL: &[u8] = b"canon";
 pub const SEED_SHARES: &[u8] = b"shares";
 pub const SEED_BUFFER: &[u8] = b"buffer";
 pub const SEED_ESCROW: &[u8] = b"escrow";
@@ -218,6 +229,14 @@ pub fn vault_address(
 ) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[SEED_VAULT, market.as_ref(), creator.as_ref(), &seed.to_le_bytes()],
+        program_id,
+    )
+}
+
+/// The one operate-mode vault a market can have for a price feed.
+pub fn canonical_vault_address(program_id: &Pubkey, market: &Pubkey, feed: &[u8; 32]) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[SEED_CANONICAL, market.as_ref(), feed, &0u64.to_le_bytes()],
         program_id,
     )
 }

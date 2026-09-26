@@ -17,7 +17,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 ## How it works
 
-1. **Create.** Anyone creates a vault with fixed parameters: price feed, fill and inventory limits, epoch length, insurance floor. The program has no instruction that changes them.
+1. **One market per feed.** An operate-mode vault's address is derived from (market, Pyth feed), so each price feed can have exactly one vault, and so one market and one shared liquidity pool. Whoever opens it only picks the feed: every canonical vault runs on the same fixed template, so nobody can open a market set up to fail. Its caps scale with its own NAV (position up to 3×, each fill up to 0.75×), so an empty vault quotes nothing and every deposit deepens the market. Attach mode, with custom limits, remains for providing liquidity on assets listed by others.
 2. **List.** The vault activates a new Percolator asset. Because the vault PDA signs the activation, it becomes the asset's admin, and it names itself as insurance operator, backing authority and oracle authority. It configures the asset's Pyth feed from the fixed parameters, and nothing can reconfigure it afterwards.
 3. **Make markets.** The vault owns a Percolator LP portfolio and is also that portfolio's matcher: Percolator calls the vault program on every trade. The matcher enforces a per-fill cap and an inventory cap, and it only accepts calls signed by Percolator's delegate PDA for this vault's portfolio.
 4. **Earn.** Takers' fees land in the asset's insurance. `HarvestFees` (anyone can call it) moves everything above the fixed floor into the vault. The floor stays in place to protect traders.
@@ -51,11 +51,11 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 ## Tests
 
-`./test.sh` builds the on-chain program and runs 35 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `owl/trunk` of `Commoneffort/percolator-prog`) with its SBF binary built. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness.
+`./test.sh` builds the on-chain program and runs 38 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `owl/trunk` of `Commoneffort/percolator-prog`) with its SBF binary built. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness.
 
 - **Math and property tests:** withdrawals never exceed NAV, deposit-then-withdraw never profits, incumbents are never diluted, fills never break the inventory cap.
 - **Layout tests:** every account offset and every Percolator instruction encoding the vault uses is checked against Percolator's own types and decoder.
-- **Flows:** create → deposit → trade → roll → withdraw. Operate mode: list → trade → harvest fees → exit with profit. Gains and losses reach depositors exactly. Maintenance fees. Market resolution with everyone exiting.
+- **Flows:** canonical vaults are unique per feed, ignore creator-chosen limits, can be listed by anyone, and scale their caps with NAV. Create → deposit → trade → roll → withdraw. Operate mode: list → trade → harvest fees → exit with profit. Gains and losses reach depositors exactly. Maintenance fees. Market resolution with everyone exiting.
 - **Attacks:** forged matcher calls; a foreign LP routing fills through the vault; inventory caps; rolling while not flat; reduce-only enforcement; matcher expiry and permissionless renewal; claims that are early, doubled, stolen or forged; stale tickets; fake buffers; donations; the first-depositor inflation attack; bad parameters, duplicates and a wrong mint; operate-only calls on the wrong mode; double listing; sweeps; a taker holding a position to lock withdrawals.
 
 ## Devnet
