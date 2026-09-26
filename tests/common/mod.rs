@@ -10,6 +10,7 @@ pub mod v16_svm;
 use litesvm::LiteSVM;
 use percolator_prog::ix::Instruction as ProgIx;
 use percolator_vault::{
+    client,
     percolator as perc,
     processor::{self, InitParams},
     state::{self, VaultState},
@@ -46,6 +47,7 @@ pub struct World {
     pub escrow: Pubkey,
     pub portfolio: Pubkey,
     pub delegate: Pubkey,
+    pub keys: Option<client::VaultKeys>,
 }
 
 impl World {
@@ -253,6 +255,7 @@ impl World {
             escrow: Pubkey::default(),
             portfolio: Pubkey::default(),
             delegate: Pubkey::default(),
+            keys: None,
         }
     }
 
@@ -322,6 +325,10 @@ impl World {
         self.escrow = child(state::SEED_ESCROW);
         self.portfolio = child(state::SEED_PORTFOLIO);
         self.delegate = perc::matcher_delegate(&market, &self.portfolio, &self.vault, &pid(), &self.vault);
+        let keys = client::VaultKeys::derive(pid(), market, creator.pubkey(), p.seed, &self.env.mint);
+        assert_eq!(keys.vault, self.vault);
+        assert_eq!(keys.percolator_vault, self.env.vault, "canonical Percolator vault ATA");
+        self.keys = Some(keys);
         Ok(())
     }
 
@@ -361,21 +368,7 @@ impl World {
     }
 
     pub fn deposit_ix(&self, u: &User, amount: u64) -> Instruction {
-        let mut data = vec![processor::TAG_REQUEST_DEPOSIT];
-        data.extend_from_slice(&amount.to_le_bytes());
-        Instruction {
-            program_id: pid(),
-            accounts: vec![
-                AccountMeta::new(u.kp.pubkey(), true),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new(self.ticket(&u.kp.pubkey()), false),
-                AccountMeta::new(u.collateral, false),
-                AccountMeta::new(self.buffer, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data,
-        }
+        client::request_deposit(self.keys.as_ref().unwrap(), &u.kp.pubkey(), &u.collateral, amount)
     }
 
     pub fn deposit(&mut self, u: &User, amount: u64) -> Result<u64, String> {
@@ -384,49 +377,13 @@ impl World {
     }
 
     pub fn withdraw(&mut self, u: &User, shares: u64) -> Result<u64, String> {
-        let mut data = vec![processor::TAG_REQUEST_WITHDRAW];
-        data.extend_from_slice(&shares.to_le_bytes());
-        let ix = Instruction {
-            program_id: pid(),
-            accounts: vec![
-                AccountMeta::new(u.kp.pubkey(), true),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new(self.ticket(&u.kp.pubkey()), false),
-                AccountMeta::new(u.shares, false),
-                AccountMeta::new(self.escrow, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data,
-        };
+        let ix = client::request_withdraw(self.keys.as_ref().unwrap(), &u.kp.pubkey(), &u.shares, shares);
         self.send(vec![ix], &[&u.kp])
     }
 
     pub fn roll_ix(&self, cranker: &Pubkey) -> Instruction {
-        let v = self.vault_state();
-        let mut data = vec![processor::TAG_ROLL_EPOCH];
-        data.extend_from_slice(&self.frontier().to_le_bytes());
-        Instruction {
-            program_id: pid(),
-            accounts: vec![
-                AccountMeta::new(*cranker, true),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new(self.env.market, false),
-                AccountMeta::new(self.portfolio, false),
-                AccountMeta::new(self.buffer, false),
-                AccountMeta::new(self.env.vault, false),
-                AccountMeta::new_readonly(self.env.vault_authority, false),
-                AccountMeta::new(self.share_mint, false),
-                AccountMeta::new(self.escrow, false),
-                AccountMeta::new(state::epoch_address(&pid(), &self.vault, v.epoch).0, false),
-                AccountMeta::new_readonly(self.delegate, false),
-                AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
-                AccountMeta::new_readonly(pid(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data,
-        }
+        let epoch = self.vault_state().epoch;
+        client::roll_epoch(self.keys.as_ref().unwrap(), cranker, epoch, self.frontier())
     }
 
     pub fn roll(&mut self) -> Result<u64, String> {
@@ -435,21 +392,7 @@ impl World {
     }
 
     pub fn claim_ix(&self, u: &User, epoch: u64) -> Instruction {
-        Instruction {
-            program_id: pid(),
-            accounts: vec![
-                AccountMeta::new_readonly(u.kp.pubkey(), true),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new(self.ticket(&u.kp.pubkey()), false),
-                AccountMeta::new_readonly(state::epoch_address(&pid(), &self.vault, epoch).0, false),
-                AccountMeta::new(u.collateral, false),
-                AccountMeta::new(u.shares, false),
-                AccountMeta::new(self.buffer, false),
-                AccountMeta::new(self.escrow, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: vec![processor::TAG_CLAIM],
-        }
+        client::claim(self.keys.as_ref().unwrap(), &u.kp.pubkey(), epoch, &u.collateral, &u.shares)
     }
 
     pub fn claim(&mut self, u: &User, epoch: u64) -> Result<u64, String> {

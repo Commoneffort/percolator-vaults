@@ -6,6 +6,8 @@
 //! the vault through `TradeCpi`, and the vault quotes around the market's own price with fixed,
 //! immutable risk limits.
 
+#[cfg(not(target_os = "solana"))]
+pub mod client;
 pub mod error;
 pub mod math;
 pub mod matcher;

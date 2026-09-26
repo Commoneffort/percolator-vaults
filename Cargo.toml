@@ -27,6 +27,8 @@ percolator_prog = { package = "percolator-prog", path = "../percolator-prog", de
 percolator = { git = "https://github.com/Commoneffort/percolator", rev = "6de466b99512b2a05c9a73ebff42011409473841" }
 litesvm = "0.1"
 solana-sdk = "1.18"
+solana-client = "1.18"
+serde_json = "1"
 proptest = "1.4"
 
 [profile.release]

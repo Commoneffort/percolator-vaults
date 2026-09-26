@@ -5,7 +5,7 @@ use common::*;
 #[allow(unused_imports)]
 use common::v16_svm::MarketConfig as _Mc;
 use percolator_prog::ix::Instruction as ProgIx;
-use percolator_vault::{percolator as perc, state};
+use percolator_vault::{percolator as perc, processor::InitParams, state};
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
 #[allow(unused_imports)]
 use solana_sdk::signature::Keypair;
@@ -411,4 +411,55 @@ fn roll_is_exact_with_maintenance_fees_charged() {
     println!("maintenance fees borne by the vault: {paid}");
     assert!(paid > 0 && paid < 1_000, "fees are charged, and only fees");
     assert_eq!(w.tokens(w.buffer), { w.vault_state().reserved_assets });
+}
+
+/// The parameters the devnet market uses: 10x leverage, SOL priced in USD atoms (6 decimals).
+pub fn devnet_like_config() -> MarketConfig {
+    MarketConfig {
+        initial_price: 1_000_000,
+        h_max: 6_480_000,
+        min_nonzero_mm_req: 500,
+        min_nonzero_im_req: 600,
+        maintenance_margin_bps: 1_000,
+        initial_margin_bps: 1_000,
+        max_price_move_bps_per_slot: 49,
+        max_accrual_dt_slots: 10,
+        min_funding_lifetime_slots: 10_000_000,
+        liquidation_fee_bps: 5,
+        liquidation_fee_cap: 50_000_000,
+        ..MarketConfig::default()
+    }
+}
+
+#[test]
+fn devnet_like_market_trades_at_realistic_size() {
+    let mut w = World::with_config(devnet_like_config());
+    w.env.set_clock(5, 1_000);
+    w.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
+    w.env.update_trade_fee_policy(5).unwrap();
+    let p = InitParams {
+        max_fill_abs: 200 * UNIT,
+        max_inventory_abs: 400 * UNIT,
+        oracle_max_staleness_secs: 300,
+        ..operate_params(1)
+    };
+    w.create_vault(p).unwrap();
+    let lister = w.new_user(10_000_000);
+    let sol = 12_107_261_038i64; // $121.07261038, expo -8
+    let pyth = w.env.set_pyth_price(&FEED, sol, -8, 0, 1_000);
+    w.list_asset(&lister, pyth).unwrap();
+    let alice = w.new_user(100_000_000);
+    w.deposit(&alice, 50_000_000).unwrap(); // 50 USDC
+    let mut ts = 1_000i64;
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, sol);
+    w.roll().unwrap();
+    let asset = w.vault_state().asset_index;
+    let px = w.env.primary_market_state().1.assets[asset as usize].effective_price;
+    println!("SOL effective price e6: {px}");
+    // 2 SOL long (~$242 notional) at 10x needs ~$24 margin from each side.
+    let cu = w.taker_trade_asset(0, asset, 2 * UNIT as i128).unwrap();
+    println!("2 SOL trade CU {cu}, vault inventory {}", { w.vault_state().inventory });
+    w.advance_oracle(pyth, 3, &mut ts, sol + 100_000_000); // +$1
+    w.taker_trade_asset(0, asset, -2 * UNIT as i128).unwrap();
+    println!("vault after SOL +$1 on 2 SOL short: {:?}", w.portfolio_view());
 }
