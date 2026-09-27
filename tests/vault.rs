@@ -52,6 +52,30 @@ fn cpi_encodings_match_percolator_decoder() {
         position_epoch: 9,
     };
     let cases = vec![
+        (
+            perc::trade_cpi(&k, &k, &k, &k, &k, &k, &k, &view, &view, 3, 11, -42, 7).data,
+            ProgIx::TradeCpi {
+                account_a_portfolio_id: 7,
+                account_a_position_epoch: 9,
+                account_b_portfolio_id: 7,
+                account_b_position_epoch: 9,
+                account_b_matcher_sequence: 3,
+                asset_index: 3,
+                market_id: 11,
+                size_q: -42,
+                fee_bps: 7,
+                limit_price: 0,
+                backing_fee_cap_bps: 0,
+            },
+        ),
+        (
+            perc::auth_mark(true, &k, &k, 3, 11, 99, 1_234, 5, 6).data,
+            ProgIx::PushAuthMark { asset_index: 3, market_id: 11, now_slot: 99, mark_e6: 1_234, observation_sequence: 5, authority_epoch: 6 },
+        ),
+        (
+            perc::auth_mark(false, &k, &k, 3, 11, 99, 1_234, 5, 6).data,
+            ProgIx::ConfigureAuthMark { asset_index: 3, market_id: 11, now_slot: 99, initial_mark_e6: 1_234, observation_sequence: 5, authority_epoch: 6 },
+        ),
         (perc::init_portfolio(&k, &k, &k).data, ProgIx::InitPortfolio),
         (
             perc::deposit(&k, &k, &k, &k, &k, 7, 3, 55).data,
@@ -97,7 +121,7 @@ fn cpi_encodings_match_percolator_decoder() {
 fn e2e_create_deposit_trade_roll_withdraw() {
     let mut w = World::new();
     w.env.warp_to_slot(5);
-    w.create_vault(default_params(1)).unwrap();
+    w.operate();
     let v = w.vault_state();
     assert_eq!({ v.status }, state::STATUS_ACTIVE);
     assert_eq!(w.portfolio_view().capital, 0);
@@ -119,7 +143,7 @@ fn e2e_create_deposit_trade_roll_withdraw() {
     let alice_shares = w.tokens(alice.shares);
     assert_eq!(alice_shares, 50_000_000 * 1_000, "first deposit mints at 1000 shares per atom");
 
-    // A taker buys from the vault, then sells back: the vault earns the spread both ways.
+    // A taker buys from the vault, then sells back (through the router, at the mark).
     let cu = w.taker_trade(0, TEN_M).unwrap();
     println!("trade CU: {cu}");
     assert_eq!({ w.vault_state().inventory }, -TEN_M);
@@ -144,7 +168,7 @@ fn e2e_create_deposit_trade_roll_withdraw() {
     w.claim(&bob, 1).unwrap();
     let alice_back = w.tokens(alice.collateral);
     println!("alice collateral after exit: {alice_back}");
-    assert!(alice_back >= 100_000_000 - 1, "alice keeps her principal (plus spread, minus rounding)");
+    assert!(alice_back >= 100_000_000 - 1, "alice keeps her principal (minus rounding)");
     assert!(w.tokens(bob.shares) > 0);
     // Buffer holds exactly what is still owed.
     assert_eq!(w.tokens(w.buffer), { w.vault_state().reserved_assets });
@@ -266,6 +290,28 @@ fn market_offsets_match_engine() {
         perc::market_account_len_for_slots(4),
         percolator_prog::state::market_account_len_for_capacity(4).unwrap()
     );
+    // Offsets the router's margin check and fill reads.
+    use percolator::{AssetStateV16Account as A, PortfolioAccountV16Account as P, PortfolioLegV16Account as L, V16ConfigAccount as C};
+    assert_eq!(perc::MARKET_CONFIG_OFF, c::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, config));
+    assert_eq!(perc::CONFIG_INITIAL_MARGIN_BPS, offset_of!(C, initial_margin_bps));
+    assert_eq!(perc::CONFIG_MIN_NONZERO_IM_REQ, offset_of!(C, min_nonzero_im_req));
+    assert_eq!(perc::WRAPPER_TRADE_FEE_BASE_BPS, c::HEADER_LEN + offset_of!(percolator_prog::state::WrapperConfigV16, trade_fee_base_bps));
+    assert_eq!(perc::ASSET_EFFECTIVE_PRICE, offset_of!(A, effective_price));
+    assert_eq!(perc::ASSET_SLOT_LAST, offset_of!(A, slot_last));
+    assert_eq!(perc::PORTFOLIO_LEGS_OFF, c::HEADER_LEN + offset_of!(P, legs));
+    assert_eq!(perc::PORTFOLIO_LEG_LEN, std::mem::size_of::<L>());
+    assert_eq!(perc::PORTFOLIO_LEG_COUNT, percolator::V16_MAX_PORTFOLIO_ASSETS_N);
+    assert_eq!(perc::LEG_ACTIVE, offset_of!(L, active));
+    assert_eq!(perc::LEG_ASSET_INDEX, offset_of!(L, asset_index));
+    assert_eq!(perc::LEG_BASIS_POS_Q, offset_of!(L, basis_pos_q));
+    // The vault reads the router book's pending count and trusts the router's authority address.
+    assert_eq!(percolator_vault::ROUTER_BOOK_LEN_OFF, offset_of!(percolator_router::state::Book, len));
+    assert_eq!(percolator_vault::ROUTER_PROGRAM_ID, percolator_router::id());
+    assert_eq!(percolator_vault::router_authority().0, percolator_router::state::authority_address(&percolator_router::id()).0);
+    assert_eq!(
+        percolator_vault::router_book(&Pubkey::new_from_array([3; 32])),
+        percolator_router::state::book_address(&percolator_router::id(), &Pubkey::new_from_array([3; 32])).0
+    );
 }
 
 fn settle_ix(w: &World) -> solana_sdk::instruction::Instruction {
@@ -309,7 +355,7 @@ fn redeem_ix(w: &World, u: &User, shares: u64) -> solana_sdk::instruction::Instr
 fn market_resolution_winds_the_vault_down_and_everyone_exits() {
     let mut w = World::new();
     w.env.warp_to_slot(5);
-    w.create_vault(default_params(1)).unwrap();
+    w.operate();
     let alice = w.new_user(100_000_000);
     let bob = w.new_user(100_000_000);
     w.deposit(&alice, 30_000_000).unwrap();
@@ -375,7 +421,7 @@ fn convert_ix(w: &World) -> solana_sdk::instruction::Instruction {
 fn price_move_round_trip(move_bps: i64) -> (u64, perc::PortfolioView) {
     let mut w = World::new();
     w.env.warp_to_slot(5);
-    w.create_vault(default_params(1)).unwrap();
+    w.operate();
     let alice = w.new_user(100_000_000);
     w.deposit(&alice, 50_000_000).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
@@ -384,9 +430,7 @@ fn price_move_round_trip(move_bps: i64) -> (u64, perc::PortfolioView) {
 
     w.taker_trade(0, TEN_M).unwrap(); // taker long 10 units, vault short
     let target = (INITIAL_PRICE as i64 * (10_000 + move_bps) / 10_000) as u64;
-    for _ in 0..5 {
-        w.advance(1, target); // price walks to target under the per-slot cap
-    }
+    w.advance(1, target); // the mark moves; Percolator's price walks to it under the per-slot cap
     w.taker_trade(0, -TEN_M).unwrap(); // taker closes; vault flat again
     w.advance(20, target); // let any profit lock mature
     let _ = w.send(vec![convert_ix(&w)], &[]); // no-op (and harmless) when nothing is released
@@ -413,7 +457,7 @@ fn vault_profit_and_loss_reach_depositors() {
 fn roll_is_exact_with_maintenance_fees_charged() {
     let mut w = World::with_config(MarketConfig { maintenance_fee_per_slot: 3, ..MarketConfig::default() });
     w.env.warp_to_slot(5);
-    w.create_vault(default_params(1)).unwrap();
+    w.operate();
     let alice = w.new_user(100_000_000);
     w.deposit(&alice, 50_000_000).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
@@ -430,24 +474,6 @@ fn roll_is_exact_with_maintenance_fees_charged() {
     println!("maintenance fees borne by the vault: {paid}");
     assert!(paid > 0 && paid < 1_000, "fees are charged, and only fees");
     assert_eq!(w.tokens(w.buffer), { w.vault_state().reserved_assets });
-}
-
-/// The parameters the devnet market uses: 10x leverage, SOL priced in USD atoms (6 decimals).
-pub fn devnet_like_config() -> MarketConfig {
-    MarketConfig {
-        initial_price: 1_000_000,
-        h_max: 6_480_000,
-        min_nonzero_mm_req: 500,
-        min_nonzero_im_req: 600,
-        maintenance_margin_bps: 1_000,
-        initial_margin_bps: 1_000,
-        max_price_move_bps_per_slot: 49,
-        max_accrual_dt_slots: 10,
-        min_funding_lifetime_slots: 10_000_000,
-        liquidation_fee_bps: 5,
-        liquidation_fee_cap: 50_000_000,
-        ..MarketConfig::default()
-    }
 }
 
 #[test]
@@ -690,11 +716,10 @@ fn idle_market_is_retired_and_its_slot_reused() {
     assert!(w.send(vec![retire_ix(&w)], &[]).is_err(), "retiring twice fails");
 
     // The feed can be opened again, into the freed slot (after Percolator's activation cooldown).
-    let slot = w.env.current_slot() + 2;
-    ts += 2;
-    w.env.set_clock(slot, ts);
-    w.env.update_pyth_price(pyth, &FEED, 100_000_000, -8, 0, ts);
-    w.list_asset_at(&lister, pyth, asset).unwrap();
+    w.tick(2);
+    let now = w.clock_ts();
+    let fresh = w.next_pyth((now - w.pyth_time).max(1), INITIAL_PRICE);
+    w.list_asset_at(&lister, fresh, asset).unwrap();
     let v = w.vault_state();
     assert_eq!({ v.status }, state::STATUS_ACTIVE);
     assert_eq!({ v.asset_index }, asset);

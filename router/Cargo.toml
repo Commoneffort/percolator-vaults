@@ -1,0 +1,33 @@
+[package]
+name = "percolator-router"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Front-running-proof order router for Percolator Vaults: every trade fills at the first Pyth price published after a fixed delay"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "percolator_router"
+
+[features]
+default = []
+no-entrypoint = []
+devnet = ["percolator-vault/devnet"]
+
+[dependencies]
+solana-program = "1.18"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
+percolator-vault = { path = "..", features = ["no-entrypoint"] }
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("solana"))',
+    'cfg(feature, values("custom-heap", "custom-panic"))',
+] }

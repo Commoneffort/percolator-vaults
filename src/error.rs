@@ -28,6 +28,12 @@ pub enum VaultError {
     /// RetireMarket: the market still has liquidity providers, requests, a position, or has not
     /// been listed long enough.
     NotIdle,
+    /// A Pyth account that is not a fully verified update for the vault's feed.
+    BadOracle,
+    /// Only the router's authority can move the mark or arm a fill.
+    NotRouter,
+    /// A fill that the router did not arm for this slot and size.
+    NotArmed,
 }
 
 impl From<VaultError> for ProgramError {

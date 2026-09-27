@@ -76,6 +76,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     }
 
     let now = Clock::get()?.slot;
+    // Only the fill the router armed for this slot and size: trades cannot bypass the router's
+    // sequencing, which is what makes them impossible to front-run. The arm is used up here.
+    if v.armed_slot != now || v.armed_size != req.req_size {
+        return Err(VaultError::NotArmed.into());
+    }
+    v.armed_size = 0;
+    v.armed_slot = 0;
     let ro = reduce_only(&v, now);
     let taker_buys = req.req_size > 0;
     // The vault takes the other side: a taker buy moves the vault short.

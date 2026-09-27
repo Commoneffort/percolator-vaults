@@ -2651,6 +2651,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "percolator-router"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "percolator-vault",
+ "solana-program 1.18.26",
+ "spl-token",
+]
+
+[[package]]
 name = "percolator-vault"
 version = "0.1.0"
 dependencies = [
@@ -2658,6 +2668,7 @@ dependencies = [
  "litesvm",
  "percolator",
  "percolator-prog",
+ "percolator-router",
  "proptest",
  "serde_json",
  "solana-account-decoder",

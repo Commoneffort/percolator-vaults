@@ -23,6 +23,7 @@ spl-token = { version = "4.0", features = ["no-entrypoint"] }
 bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
 
 [dev-dependencies]
+percolator-router = { path = "router", features = ["no-entrypoint"] }
 percolator_prog = { package = "percolator-prog", path = "../percolator-prog", default-features = false, features = ["no-entrypoint"] }
 percolator = { git = "https://github.com/Commoneffort/percolator", rev = "6de466b99512b2a05c9a73ebff42011409473841" }
 litesvm = "0.1"

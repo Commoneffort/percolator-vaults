@@ -9,12 +9,14 @@ pub mod v16_svm;
 
 use litesvm::LiteSVM;
 use percolator_prog::ix::Instruction as ProgIx;
+use percolator_router::client::{self as rclient, TraderKeys};
 use percolator_vault::{
     client,
     percolator as perc,
     processor::{self, InitParams},
     state::{self, VaultState},
 };
+use std::collections::HashMap;
 use solana_sdk::{
     account::Account,
     compute_budget::ComputeBudgetInstruction,
@@ -30,6 +32,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 pub use v16_svm::{MarketConfig, V16Svm, INITIAL_PRICE};
 
 const VAULT_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/deploy/percolator_vault.so");
+const ROUTER_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/deploy/percolator_router.so");
 pub const EPOCH_LEN: u64 = 20;
 pub const SPREAD_BPS: u16 = 50;
 /// One unit of position size (Percolator's POS_SCALE).
@@ -48,6 +51,11 @@ pub struct World {
     pub portfolio: Pubkey,
     pub delegate: Pubkey,
     pub keys: Option<client::VaultKeys>,
+    /// Publish time and price (e6) of the last Pyth update the harness published.
+    pub pyth_time: i64,
+    pub price: u64,
+    /// Router trading accounts of the harness takers, by taker index.
+    pub traders: HashMap<usize, (User, TraderKeys)>,
 }
 
 impl World {
@@ -83,7 +91,30 @@ impl World {
             ],
             data: args.encode(),
         };
-        self.send(vec![ix], &[&lister.kp])
+        let cu = self.send(vec![ix], &[&lister.kp])?;
+        // Keep the harness's Pyth clock in step with the update the vault listed at, and open
+        // the vault's router book (once).
+        let u = percolator_vault::pyth::decode(&self.env.svm.get_account(&pyth).unwrap().data).unwrap();
+        self.pyth_time = self.pyth_time.max(u.publish_time);
+        self.price = u.price_e6().unwrap();
+        let book = percolator_router::state::book_address(&percolator_router::id(), &self.vault).0;
+        if self.env.svm.get_account(&book).map_or(true, |a| a.data.is_empty()) {
+            let ix = rclient::open_book(&self.payer.pubkey(), &self.vault);
+            self.send(vec![ix], &[])?;
+        }
+        Ok(cu)
+    }
+
+    /// Creates an operate-mode vault for `FEED`, enables listing and lists it at the initial price.
+    pub fn operate(&mut self) -> User {
+        self.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
+        self.create_vault(operate_params(2)).unwrap();
+        let lister = self.new_user(10_000_000);
+        let ts = self.clock_ts().max(self.pyth_time);
+        self.pyth_time = ts;
+        let pyth = self.pyth_update(INITIAL_PRICE, ts, ts - 1);
+        self.list_asset(&lister, pyth).unwrap();
+        lister
     }
 
     pub fn harvest(&mut self, max_amount: u64) -> Result<u64, String> {
@@ -110,47 +141,184 @@ impl World {
 }
 
 impl World {
-    /// Moves time forward, republishes the Pyth price and cranks the vault's asset current.
-    pub fn advance_oracle(&mut self, pyth: Pubkey, slots: u64, ts: &mut i64, price: i64) {
-        let slot = self.env.current_slot() + slots;
-        *ts += (slots as i64 * 2) / 5 + 1;
-        self.env.set_clock(slot, *ts);
-        self.env.update_pyth_price(pyth, &FEED, price, -8, 0, *ts);
-        let asset = self.vault_state().asset_index;
-        self.catch_up(asset, slot, &[pyth]);
+    /// Publishes a fully verified Pyth update for `FEED` (a new receiver-owned account).
+    pub fn pyth_update(&mut self, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Pubkey {
+        let mut d = vec![0u8; 134];
+        d[..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
+        d[40] = 1;
+        d[41..73].copy_from_slice(&FEED);
+        d[73..81].copy_from_slice(&(price_e6 as i64).to_le_bytes());
+        d[89..93].copy_from_slice(&(-6i32).to_le_bytes());
+        d[93..101].copy_from_slice(&publish_time.to_le_bytes());
+        d[101..109].copy_from_slice(&prev_publish_time.to_le_bytes());
+        let key = Pubkey::new_unique();
+        self.env
+            .svm
+            .set_account(key, Account { lamports: 1_000_000_000, data: d, owner: percolator_vault::pyth::PYTH_RECEIVER_PROGRAM_ID, executable: false, rent_epoch: 0 })
+            .unwrap();
+        key
     }
 
-    pub fn taker_trade_asset(&mut self, taker: usize, asset: u16, size_q: i128) -> Result<u64, String> {
-        let market_id = self.env.primary_market_state().1.assets[asset as usize].market_id;
-        let pv = self.portfolio_view();
-        let ix = Instruction {
-            program_id: perc::PERCOLATOR_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new(self.env.actors[taker].signer.pubkey(), true),
-                AccountMeta::new(self.env.market, false),
-                AccountMeta::new(self.env.actors[taker].portfolio, false),
-                AccountMeta::new(self.portfolio, false),
-                AccountMeta::new_readonly(pid(), false),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new_readonly(self.delegate, false),
-            ],
-            data: ProgIx::TradeCpi {
-                account_a_portfolio_id: self.env.primary_portfolio_id(taker),
-                account_a_position_epoch: self.env.primary_portfolio_position_epoch(taker),
-                account_b_portfolio_id: pv.portfolio_id,
-                account_b_position_epoch: pv.position_epoch,
-                account_b_matcher_sequence: pv.sequence,
-                asset_index: asset,
-                market_id,
-                size_q,
-                fee_bps: 10_000,
-                limit_price: 0,
-                backing_fee_cap_bps: 0,
+    /// The next Pyth update after the last one: `secs` later, at `price_e6`.
+    pub fn next_pyth(&mut self, secs: i64, price_e6: u64) -> Pubkey {
+        let prev = self.pyth_time;
+        self.pyth_time += secs;
+        self.price = price_e6;
+        self.pyth_update(price_e6, self.pyth_time, prev)
+    }
+
+    /// Moves the clock to `slots` later and the Pyth clock with it (unix time never runs behind Pyth).
+    pub fn tick(&mut self, slots: u64) {
+        let slot = self.env.current_slot() + slots;
+        let ts = self.clock_ts().max(self.pyth_time) + ((slots as i64 * 2) / 5).max(1);
+        self.env.set_clock(slot, ts);
+    }
+
+    pub fn clock_ts(&self) -> i64 {
+        self.env.svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp
+    }
+
+    pub fn asset(&self) -> u16 {
+        self.vault_state().asset_index
+    }
+
+    pub fn book(&self) -> percolator_router::state::Book {
+        let k = percolator_router::state::book_address(&percolator_router::id(), &self.vault).0;
+        bytemuck::pod_read_unaligned(&self.env.svm.get_account(&k).unwrap().data)
+    }
+
+    /// Router `Advance` to a Pyth update.
+    pub fn advance_ix(&self, pyth: &Pubkey) -> Instruction {
+        let seq = self.env.primary_control_sequences(self.asset() as usize);
+        rclient::advance(self.keys.as_ref().unwrap(), pyth, seq.oracle_observation + 1, seq.authority_epoch)
+    }
+
+    pub fn advance_to(&mut self, pyth: Pubkey) -> Result<u64, String> {
+        let ix = self.advance_ix(&pyth);
+        self.send(vec![ix], &[])
+    }
+
+    /// Moves time forward, publishes a new Pyth price, moves the mark to it through the router and
+    /// cranks until Percolator's effective price has reached it.
+    pub fn advance_oracle(&mut self, _pyth: Pubkey, slots: u64, _ts: &mut i64, price: i64) {
+        self.move_price(slots, (price as u64) / 100);
+    }
+
+    /// Moves time forward by `slots`, then the mark to `price_e6` (a fresh Pyth update), converged.
+    pub fn move_price(&mut self, slots: u64, price_e6: u64) {
+        self.tick(slots);
+        let secs = (self.clock_ts() - self.pyth_time).max(1);
+        let u = self.next_pyth(secs, price_e6);
+        self.advance_to(u).expect("advance mark");
+        self.converge();
+    }
+
+    /// Cranks the vault's asset slot by slot until Percolator's effective price equals the mark
+    /// (it moves at most its per-slot cap toward it).
+    pub fn converge(&mut self) {
+        let asset = self.asset();
+        for _ in 0..200 {
+            self.tick(1);
+            let slot = self.env.current_slot();
+            self.catch_up(asset, slot, &[]);
+            let eff = self.env.primary_market_state().1.assets[asset as usize].effective_price;
+            if eff == self.book().mark_price {
+                self.settle();
+                return;
             }
-            .encode(),
-        };
-        let signer = self.env.actors[taker].signer.insecure_clone();
-        self.send(vec![ix], &[&signer])
+        }
+        panic!("effective price did not converge to the mark");
+    }
+
+    /// Settles every position a price move left out of date (as keepers and executors do):
+    /// a permissionless crank on each router trader portfolio and the vault's own, at this slot.
+    pub fn settle(&mut self) {
+        let asset = self.asset();
+        let slot = self.env.current_slot();
+        let mut portfolios: Vec<Pubkey> = self.traders.values().map(|(_, t)| t.portfolio).collect();
+        portfolios.push(self.portfolio);
+        for pf in portfolios {
+            let ix = Instruction {
+                program_id: perc::PERCOLATOR_PROGRAM_ID,
+                accounts: vec![
+                    AccountMeta::new(self.payer.pubkey(), true),
+                    AccountMeta::new(self.env.market, false),
+                    AccountMeta::new(pf, false),
+                ],
+                data: ProgIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: asset, oracle_accounts: 0 }],
+                }
+                .encode(),
+            };
+            let _ = self.send(vec![ix], &[]); // NonProgress when the leg is already current
+        }
+    }
+
+    /// A router trading account for harness taker `taker`, funded once.
+    pub fn trader(&mut self, taker: usize) -> TraderKeys {
+        if let Some((_, t)) = self.traders.get(&taker) {
+            return *t;
+        }
+        let u = self.new_user(10_000_000_000);
+        let t = TraderKeys::new(self.env.market, u.kp.pubkey());
+        let mint = self.env.mint;
+        let open = rclient::open_account(&t, &mint);
+        let dep = rclient::deposit(&t, &u.collateral, &self.env.vault, 1_000_000_000);
+        let kp = u.kp.insecure_clone();
+        self.send(vec![open, dep], &[&kp]).expect("open and fund router account");
+        self.traders.insert(taker, (u, t));
+        t
+    }
+
+    pub fn trader_kp(&self, taker: usize) -> Keypair {
+        self.traders[&taker].0.kp.insecure_clone()
+    }
+
+    /// Queues a trade for `taker`; returns the request id.
+    pub fn request(&mut self, taker: usize, size_q: i128) -> Result<u64, String> {
+        let t = self.trader(taker);
+        let id = self.book().next_id;
+        let ix = rclient::request(&t, &self.vault, id, size_q);
+        let kp = self.trader_kp(taker);
+        self.send(vec![ix], &[&kp])?;
+        Ok(id)
+    }
+
+    pub fn request_target(&self, id: u64) -> i64 {
+        let k = percolator_router::state::request_address(&percolator_router::id(), &self.vault, id).0;
+        let r: percolator_router::state::Request = bytemuck::pod_read_unaligned(&self.env.svm.get_account(&k).unwrap().data);
+        r.target_time
+    }
+
+    pub fn fill_ix(&self, taker: usize, id: u64, executor: &Pubkey) -> Instruction {
+        rclient::fill(executor, self.keys.as_ref().unwrap(), &self.traders[&taker].1, id)
+    }
+
+    /// Fills a request whose target the mark is at (executed by the payer).
+    pub fn fill(&mut self, taker: usize, id: u64) -> Result<u64, String> {
+        let ix = self.fill_ix(taker, id, &self.payer.pubkey());
+        self.send(vec![ix], &[])
+    }
+
+    /// The full router path, as keepers run it: request, then the first Pyth update at the target
+    /// (at the current price), advance, converge, fill. Returns the fill's compute units.
+    pub fn taker_trade_asset(&mut self, taker: usize, _asset: u16, size_q: i128) -> Result<u64, String> {
+        let id = self.request(taker, size_q)?;
+        let target = self.request_target(id);
+        let slot = self.env.current_slot() + 1;
+        self.env.set_clock(slot, target.max(self.clock_ts()));
+        let prev = self.pyth_time;
+        self.pyth_time = target;
+        let u = self.pyth_update(self.price, target, prev);
+        self.advance_to(u)?;
+        self.converge();
+        self.fill(taker, id)
+    }
+
+    /// A taker's router portfolio (for position checks).
+    pub fn taker_portfolio(&self, taker: usize) -> Pubkey {
+        self.traders[&taker].1.portfolio
     }
 }
 
@@ -248,6 +416,8 @@ impl World {
         let mut env = V16Svm::new([0x5a; 32], config);
         let bytes = std::fs::read(VAULT_SO).expect("build the vault with cargo build-sbf first");
         env.svm.add_program(pid(), &bytes);
+        let router = std::fs::read(ROUTER_SO).expect("build the router with cargo build-sbf first");
+        env.svm.add_program(percolator_router::id(), &router);
         let payer = Keypair::new();
         let creator = Keypair::new();
         env.svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
@@ -263,6 +433,9 @@ impl World {
             portfolio: Pubkey::default(),
             delegate: Pubkey::default(),
             keys: None,
+            pyth_time: 1_000,
+            price: INITIAL_PRICE,
+            traders: HashMap::new(),
         }
     }
 
@@ -419,12 +592,9 @@ impl World {
         self.send(vec![ix], &[&u.kp])
     }
 
-    /// Moves time forward and brings the market's price and accrual current.
+    /// Moves time forward and the vault asset's mark to `price` (through the router), converged.
     pub fn advance(&mut self, slots: u64, price: u64) {
-        let target = self.env.current_slot() + slots;
-        self.env.warp_to_slot(target);
-        self.env.push_auth_mark(0, target, price).expect("push mark");
-        self.catch_up(0, target, &[]);
+        self.move_price(slots, price);
     }
 
     /// Cranks an asset until its accrual clock reaches `slot`, as a keeper would: each crank
@@ -445,38 +615,27 @@ impl World {
         panic!("asset {asset} did not catch up to slot {slot}");
     }
 
-    /// A harness actor trades against the vault through Percolator's TradeCpi.
+    /// A harness taker trades against the vault through the router.
     pub fn taker_trade(&mut self, taker: usize, size_q: i128) -> Result<u64, String> {
-        let market_id = self.env.primary_market_state().1.assets[0].market_id;
-        let pv = self.portfolio_view();
-        let ix = Instruction {
-            program_id: perc::PERCOLATOR_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new(self.env.actors[taker].signer.pubkey(), true),
-                AccountMeta::new(self.env.market, false),
-                AccountMeta::new(self.env.actors[taker].portfolio, false),
-                AccountMeta::new(self.portfolio, false),
-                AccountMeta::new_readonly(pid(), false),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new_readonly(self.delegate, false),
-            ],
-            data: ProgIx::TradeCpi {
-                account_a_portfolio_id: self.env.primary_portfolio_id(taker),
-                account_a_position_epoch: self.env.primary_portfolio_position_epoch(taker),
-                account_b_portfolio_id: pv.portfolio_id,
-                account_b_position_epoch: pv.position_epoch,
-                account_b_matcher_sequence: pv.sequence,
-                asset_index: 0,
-                market_id,
-                size_q,
-                fee_bps: 0,
-                limit_price: 0,
-                backing_fee_cap_bps: 0,
-            }
-            .encode(),
-        };
-        let signer = self.env.actors[taker].signer.insecure_clone();
-        self.send(vec![ix], &[&signer])
+        let asset = self.asset();
+        self.taker_trade_asset(taker, asset, size_q)
     }
 }
 
+/// The parameters the devnet market uses: 10x leverage, SOL priced in USD atoms (6 decimals).
+pub fn devnet_like_config() -> MarketConfig {
+    MarketConfig {
+        initial_price: 1_000_000,
+        h_max: 6_480_000,
+        min_nonzero_mm_req: 500,
+        min_nonzero_im_req: 600,
+        maintenance_margin_bps: 1_000,
+        initial_margin_bps: 1_000,
+        max_price_move_bps_per_slot: 49,
+        max_accrual_dt_slots: 10,
+        min_funding_lifetime_slots: 10_000_000,
+        liquidation_fee_bps: 5,
+        liquidation_fee_cap: 50_000_000,
+        ..MarketConfig::default()
+    }
+}

@@ -351,6 +351,7 @@ pub fn retire_market(k: &VaultKeys, asset_authority_epoch: u64, market_authority
             ro(k.percolator_vault_authority),
             ro(spl_token::ID),
             ro(perc::PERCOLATOR_PROGRAM_ID),
+            ro(crate::router_book(&k.vault)),
         ],
         data,
     }

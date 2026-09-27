@@ -114,7 +114,11 @@ pub struct VaultState {
     pub opener_fees_total: u64,
     /// Slot the vault's current asset was listed (0 for vaults listed before this field).
     pub listed_slot: u64,
-    pub _reserved: [u8; 32],
+    /// The one fill the router armed: its size (taker side, positive = taker buys) and slot.
+    /// The matcher refuses every other fill, so trades can only happen through the router.
+    pub armed_size: i128,
+    pub armed_slot: u64,
+    pub _reserved: [u8; 8],
 }
 
 pub const VAULT_STATE_LEN: usize = core::mem::size_of::<VaultState>();

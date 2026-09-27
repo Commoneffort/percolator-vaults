@@ -25,7 +25,7 @@ fn expect_err(r: Result<u64, String>, e: VaultError) {
 fn funded() -> (World, User) {
     let mut w = World::new();
     w.env.warp_to_slot(5);
-    w.create_vault(default_params(1)).unwrap();
+    w.operate();
     let alice = w.new_user(100_000_000);
     w.deposit(&alice, 50_000_000).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
@@ -128,16 +128,27 @@ fn foreign_lp_cannot_route_fills_through_the_vault() {
 
 #[test]
 fn inventory_cap_limits_fills() {
-    let (mut w, _) = funded();
-    let fill = 40 * UNIT as i128;
-    w.taker_trade(0, fill).unwrap();
-    assert_eq!({ w.vault_state().inventory }, -fill);
-    // Cap is 45 units: the second 40-unit buy only fills 5.
-    w.taker_trade(0, fill).unwrap();
-    assert_eq!({ w.vault_state().inventory }, -45 * UNIT as i128);
+    // 10 USDC of NAV at 1.00: each fill up to 7.5 units (0.75x NAV), position up to 30 (3x).
+    // 10% margin, so the vault's own caps bind before Percolator's margin check.
+    let mut w = World::with_config(devnet_like_config());
+    w.env.warp_to_slot(5);
+    w.operate();
+    let alice = w.new_user(100_000_000);
+    w.deposit(&alice, 10_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.roll().unwrap();
+    let per_fill = 7_500_000i128;
+    w.taker_trade(0, 10 * UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -per_fill, "per-fill cap");
+    for _ in 0..3 {
+        w.taker_trade(0, 10 * UNIT as i128).unwrap();
+    }
+    assert_eq!({ w.vault_state().inventory }, -30 * UNIT as i128, "position cap");
+    w.taker_trade(0, 10 * UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -30 * UNIT as i128, "nothing past the position cap");
     // Selling back (reducing the vault's short) is always allowed.
-    w.taker_trade(0, -fill).unwrap();
-    assert_eq!({ w.vault_state().inventory }, -5 * UNIT as i128);
+    w.taker_trade(0, -5 * UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -25 * UNIT as i128);
 }
 
 #[test]
@@ -160,15 +171,20 @@ fn roll_needs_flat_portfolio_and_reduce_only_gets_there() {
 
 #[test]
 fn matcher_approval_expires_and_anyone_can_renew_it() {
-    let mut w = World::new();
-    w.env.warp_to_slot(5);
-    w.create_vault(InitParams { matcher_ttl_slots: 100, ..default_params(1) }).unwrap();
-    let alice = w.new_user(100_000_000);
-    w.deposit(&alice, 50_000_000).unwrap();
-    w.advance(EPOCH_LEN, INITIAL_PRICE);
-    w.roll().unwrap();
-    w.advance(150, INITIAL_PRICE);
-    assert!(w.taker_trade(0, TEN_M).is_err(), "expired approval refuses fills");
+    let (mut w, _) = funded();
+    // The approval lasts CANON_MATCHER_TTL_SLOTS (200 in test builds) and is renewed at rolls.
+    w.advance(processor::CANON_MATCHER_TTL_SLOTS + 10, INITIAL_PRICE);
+    // The request lands; its fill is refused while the approval is expired.
+    let id = w.request(0, TEN_M).unwrap();
+    let target = w.request_target(id);
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, target);
+    let prev = w.pyth_time;
+    w.pyth_time = target;
+    let u = w.pyth_update(w.price, target, prev);
+    w.advance_to(u).unwrap();
+    w.converge();
+    assert!(w.fill(0, id).is_err(), "expired approval refuses fills");
     let mut data = vec![processor::TAG_REFRESH_MATCHER];
     data.extend_from_slice(&w.frontier().to_le_bytes());
     let refresh = Instruction {
@@ -185,7 +201,8 @@ fn matcher_approval_expires_and_anyone_can_renew_it() {
     };
     // No signer beyond the fee payer: renewal is permissionless.
     w.send(vec![refresh], &[]).unwrap();
-    w.taker_trade(0, TEN_M).unwrap();
+    w.fill(0, id).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -TEN_M);
 }
 
 use percolator_vault::processor::InitParams;
@@ -268,7 +285,7 @@ fn inflation_attack_on_first_depositor_fails() {
     // before the victim's deposit is priced in the next epoch.
     let mut w = World::new();
     w.env.warp_to_slot(5);
-    w.create_vault(default_params(9)).unwrap();
+    w.operate();
     let attacker = w.new_user(20_000_000);
     let victim = w.new_user(10_000_000);
     w.deposit(&attacker, 1).unwrap();
@@ -302,46 +319,28 @@ fn inflation_attack_on_first_depositor_fails() {
 fn creation_rejects_bad_params_duplicates_and_wrong_mint() {
     let mut w = World::new();
     w.env.warp_to_slot(5);
-    for bad in [
-        InitParams { spread_bps: 0, ..default_params(1) },
-        InitParams { spread_bps: 6_000, ..default_params(1) },
-        InitParams { unwind_spread_bps: 60, ..default_params(1) },
-        InitParams { epoch_len_slots: 1, ..default_params(1) },
-        InitParams { max_inventory_abs: 0, ..default_params(1) },
-        InitParams { mode: 7, ..default_params(1) },
-        InitParams { insurance_floor: 5, ..default_params(1) }, // attach mode has no floor
-    ] {
+    // Attach mode (quoting on an asset whose price the vault does not control) is refused: its
+    // fills could not be sequenced by the router. So is an unknown mode.
+    for bad in [default_params(1), InitParams { mode: 7, ..default_params(1) }] {
         let e = w.create_vault(bad).unwrap_err();
         assert!(e.contains(&code(VaultError::InvalidParams)), "{bad:?}: {e}");
     }
-    // An asset that does not exist cannot be attached.
-    let e = w.create_vault(InitParams { asset_index: 40, ..default_params(1) }).unwrap_err();
-    assert!(e.contains(&code(VaultError::BadPercolatorAccount)), "{e}");
 
-    // Pre-funding the vault address does not block creation.
-    let (vault, _) = state::vault_address(&pid(), &w.env.market, &w.creator.pubkey(), 1);
+    // Pre-funding the canonical vault address does not block creation.
+    let (vault, _) = state::canonical_vault_address(&pid(), &w.env.market, &FEED);
     w.env.svm.airdrop(&vault, 12_345).unwrap();
-    w.create_vault(default_params(1)).unwrap();
-    // A second creation at the same address fails.
-    assert!(w.create_vault(default_params(1)).is_err());
+    w.create_vault(operate_params(1)).unwrap();
+    // A second creation for the same feed fails.
+    assert!(w.create_vault(operate_params(1)).is_err());
 
     // Wrong collateral mint.
-    let mut p = default_params(2);
+    let mut p = InitParams { oracle_feeds: [[8; 32], [0; 32], [0; 32]], ..operate_params(2) };
     p.asset_generation_frontier = w.frontier();
     let mut ix = w.init_ix(&p);
     let fake_mint = Pubkey::new_unique();
     ix.accounts[4] = AccountMeta::new_readonly(fake_mint, false);
     let creator = w.creator.insecure_clone();
     expect_err(w.send(vec![ix], &[&creator]), VaultError::BadAccount);
-}
-
-#[test]
-fn operate_only_instructions_refuse_attach_vaults() {
-    let (mut w, _) = funded();
-    expect_err(w.harvest(u64::MAX), VaultError::WrongMode);
-    let lister = w.new_user(10_000_000);
-    let pyth = w.env.set_pyth_price(&FEED, 100_000_000, -8, 0, 1_000);
-    expect_err(w.list_asset(&lister, pyth), VaultError::WrongMode);
 }
 
 #[test]

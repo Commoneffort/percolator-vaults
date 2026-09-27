@@ -46,7 +46,10 @@ pub const CANON_INSURANCE_FLOOR: u64 = 100_000_000; // 100 units of a 6-decimal 
 pub const CANON_INSURANCE_FLOOR: u64 = 10_000;
 pub const CANON_POSITION_NAV_BPS: u16 = 30_000; // position up to 3x the vault's NAV
 pub const CANON_FILL_NAV_BPS: u16 = 7_500; // each fill up to 0.75x the vault's NAV
+#[cfg(feature = "devnet")]
 pub const CANON_MATCHER_TTL_SLOTS: u64 = 216_000;
+#[cfg(not(feature = "devnet"))]
+pub const CANON_MATCHER_TTL_SLOTS: u64 = 200; // short in tests, so expiry and renewal can be exercised
 pub const UNCAPPED: u128 = (i128::MAX as u128) / 4;
 /// Share of a canonical market's harvested fees paid to whoever opened it (Hyperliquid HIP-3
 /// style). It carries no powers: the opener can only claim what has accrued.
@@ -112,6 +115,8 @@ pub const TAG_UNWIND: u8 = 28;
 pub const TAG_CLAIM_OPENER_FEES: u8 = 29;
 pub const TAG_ACCEPT_GOVERNANCE: u8 = 30;
 pub const TAG_RETIRE_MARKET: u8 = 31;
+pub const TAG_PUSH_MARK: u8 = 32;
+pub const TAG_ARM_FILL: u8 = 33;
 
 /// A market with no liquidity providers can be retired this many epochs after it was listed.
 pub const RETIRE_IDLE_EPOCHS: u64 = 3;
@@ -233,9 +238,9 @@ impl InitParams {
             && self.position_nav_bps <= MAX_POSITION_NAV_BPS
             && self.fill_nav_bps <= self.position_nav_bps;
         let mode_ok = match self.mode {
-            MODE_ATTACH => {
-                self.insurance_floor == 0 && self.listing_fee_max == 0 && self.oracle_leg_count == 0
-            }
+            // Attach mode quoted on assets whose price the vault does not control, so their
+            // fills could not be sequenced by the router and could be front-run. Not offered.
+            MODE_ATTACH => false,
             // Percolator validates the oracle parameters themselves when the asset is listed.
             // A long staleness window would let takers trade against an old price, so it is
             // bounded here as well as by Percolator.
@@ -462,6 +467,19 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
         TAG_LIST_ASSET => list_asset(program_id, accounts, ListArgs::decode(rest)?),
         TAG_ACCEPT_GOVERNANCE => accept_governance(program_id, accounts, arg_u64(rest)?),
+        TAG_PUSH_MARK => {
+            if rest.len() != 24 {
+                return Err(VaultError::InvalidInstruction.into());
+            }
+            let r = |i: usize| u64::from_le_bytes(rest[i..i + 8].try_into().unwrap());
+            push_mark(program_id, accounts, r(0), r(8), r(16))
+        }
+        TAG_ARM_FILL => {
+            if rest.len() != 16 {
+                return Err(VaultError::InvalidInstruction.into());
+            }
+            arm_fill(program_id, accounts, i128::from_le_bytes(rest.try_into().unwrap()))
+        }
         TAG_RETIRE_MARKET => {
             if rest.len() != 16 {
                 return Err(VaultError::InvalidInstruction.into());
@@ -705,7 +723,9 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         opener_fees_owed: 0,
         opener_fees_total: 0,
         listed_slot: 0,
-        _reserved: [0; 32],
+        armed_size: 0,
+        armed_slot: 0,
+        _reserved: [0; 8],
     };
     state::store_vault(vault_ai, &v)?;
 
@@ -1479,14 +1499,19 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
     }
     key_is(market, &v.market)?;
     check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, vault_ai.key)?;
-    if a.initial_price == 0 || a.asset_index == u16::MAX {
+    if a.asset_index == u16::MAX {
         return Err(VaultError::InvalidParams.into());
     }
-    let legs = v.oracle_leg_count as usize;
-    let oracle_accounts = accounts.get(9..9 + legs).ok_or(VaultError::BadAccount)?;
-    if accounts.len() != 9 + legs {
+    // One Pyth account: a fully verified, fresh update for the vault's feed sets the listing price.
+    if accounts.len() != 10 || v.oracle_leg_count != 1 || v.oracle_invert != 0 || v.oracle_unit_scale != 0 {
         return Err(VaultError::BadAccount.into());
     }
+    let clock = Clock::get()?;
+    let update = crate::pyth::read(acc(accounts, 9)?, &v.oracle_feeds[0])?;
+    if update.publish_time < clock.unix_timestamp.saturating_sub(v.oracle_max_staleness_secs as i64) {
+        return Err(VaultError::BadOracle.into());
+    }
+    let price = update.price_e6().ok_or(VaultError::BadOracle)?;
 
     // Rent for the market account's new asset slot.
     let new_len = perc::market_account_len_for_slots(a.asset_index as usize + 1);
@@ -1509,7 +1534,6 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
         &[payer_collateral.clone(), buffer.clone(), payer.clone(), token.clone()],
     )?;
     let before = token_amount(buffer)?;
-    let clock = Clock::get()?;
     let bump = v.vault_bump;
     let vault_key = *vault_ai.key;
     invoke_signed(
@@ -1522,7 +1546,7 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
             a.market_id,
             a.activation_authority_epoch,
             clock.slot,
-            a.initial_price,
+            price,
             fee_max as u128,
             &vault_key,
         ),
@@ -1539,36 +1563,21 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
         )?;
     }
 
-    let oracle = perc::HybridOracle {
-        leg_count: v.oracle_leg_count,
-        leg_flags: v.oracle_leg_flags,
-        max_staleness_secs: v.oracle_max_staleness_secs,
-        soft_stale_slots: v.oracle_soft_stale_slots,
-        ewma_halflife_slots: v.oracle_ewma_halflife_slots,
-        mark_min_fee: v.oracle_mark_min_fee,
-        invert: v.oracle_invert,
-        unit_scale: v.oracle_unit_scale,
-        conf_filter_bps: v.oracle_conf_filter_bps,
-        feeds: v.oracle_feeds,
-    };
-    let oracle_keys: Vec<Pubkey> = oracle_accounts.iter().map(|ai| *ai.key).collect();
-    let mut infos = vec![vault_ai.clone(), market.clone()];
-    infos.extend(oracle_accounts.iter().cloned());
-    infos.push(percolator.clone());
+    // The asset's mark is whatever its oracle authority (this vault) pushes, and the vault only
+    // pushes on the router's instruction, with a verified Pyth price. It starts at the listing price.
     invoke_signed(
-        &perc::configure_hybrid_oracle(
+        &perc::auth_mark(
+            false,
             &vault_key,
             market.key,
-            &oracle_keys,
             a.asset_index,
             a.market_id,
             clock.slot,
-            clock.unix_timestamp,
-            &oracle,
+            price,
             a.oracle_observation_sequence,
             a.oracle_authority_epoch,
         ),
-        &infos,
+        &[vault_ai.clone(), market.clone(), percolator.clone()],
         &[vault_seeds!(v, bump)],
     )?;
 
@@ -1582,6 +1591,79 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
     v.status = STATUS_ACTIVE;
     v.epoch_start_slot = clock.slot;
     v.listed_slot = clock.slot;
+    state::store_vault(vault_ai, &v)
+}
+
+/// Checks that `ai` is the router's authority and signed.
+fn router_signed(ai: &AccountInfo) -> Result<(), VaultError> {
+    if !ai.is_signer || *ai.key != crate::router_authority().0 {
+        return Err(VaultError::NotRouter);
+    }
+    Ok(())
+}
+
+/// Moves the vault's asset mark. Only the router calls it, and only with a verified Pyth price:
+/// the latest one, or the first one published at a queued trade's target time. The vault is the
+/// asset's oracle authority, so Percolator takes the mark as given (and moves its effective
+/// price toward it at most its per-slot cap).
+///
+/// Accounts: 0 router authority [signer], 1 vault, 2 market [w], 3 Percolator program.
+/// Data: mark (e6), the oracle observation sequence and the asset's authority epoch.
+fn push_mark(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    mark_e6: u64,
+    observation_sequence: u64,
+    authority_epoch: u64,
+) -> ProgramResult {
+    let router = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    let market = acc(accounts, 2)?;
+    let percolator = acc(accounts, 3)?;
+    router_signed(router)?;
+    writable(market)?;
+    key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
+    let v = state::load_vault(vault_ai, program_id)?;
+    if v.mode != MODE_OPERATE || v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    key_is(market, &v.market)?;
+    let bump = v.vault_bump;
+    invoke_signed(
+        &perc::auth_mark(
+            true,
+            vault_ai.key,
+            market.key,
+            v.asset_index,
+            v.asset_market_id,
+            Clock::get()?.slot,
+            mark_e6,
+            observation_sequence,
+            authority_epoch,
+        ),
+        &[vault_ai.clone(), market.clone(), percolator.clone()],
+        &[vault_seeds!(v, bump)],
+    )
+}
+
+/// Arms the one fill the matcher will accept in this slot: the router calls it right before the
+/// trade it executes. Every other fill (a taker trading directly) is refused by the matcher.
+///
+/// Accounts: 0 router authority [signer], 1 vault [w]. Data: taker size (i128, + = taker buys).
+fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> ProgramResult {
+    let router = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    router_signed(router)?;
+    writable(vault_ai)?;
+    let mut v = state::load_vault(vault_ai, program_id)?;
+    if v.mode != MODE_OPERATE || v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    if size == 0 || size == i128::MIN {
+        return Err(VaultError::InvalidParams.into());
+    }
+    v.armed_size = size;
+    v.armed_slot = Clock::get()?.slot;
     state::store_vault(vault_ai, &v)
 }
 
@@ -1617,7 +1699,7 @@ fn accept_governance(program_id: &Pubkey, accounts: &[AccountInfo], authority_ep
 ///
 /// Accounts: 0 vault [w], 1 market [w], 2 governor PDA, 3 share mint, 4 LP portfolio,
 /// 5 buffer [w], 6 Percolator collateral vault [w], 7 Percolator vault authority,
-/// 8 token program, 9 Percolator program.
+/// 8 token program, 9 Percolator program, 10 the vault's router book (no requests may be queued).
 /// Data: the asset's authority epoch (for the insurance withdrawal) and the market's authority
 /// epoch (for the retirement), both checked by Percolator.
 fn retire_market(
@@ -1636,6 +1718,7 @@ fn retire_market(
     let perc_vault_auth = acc(accounts, 7)?;
     let token = acc(accounts, 8)?;
     let percolator = acc(accounts, 9)?;
+    let book = acc(accounts, 10)?;
     for w in [vault_ai, market, buffer, perc_vault] {
         writable(w)?;
     }
@@ -1649,6 +1732,14 @@ fn retire_market(
     }
     key_is(market, &v.market)?;
     key_is(share_mint, &v.share_mint)?;
+    // A queued trade must be able to fill (or expire) against the market it was made on.
+    key_is(book, &crate::router_book(vault_ai.key))?;
+    if book.owner == &crate::ROUTER_PROGRAM_ID {
+        let d = book.try_borrow_data()?;
+        if d.get(crate::ROUTER_BOOK_LEN_OFF).copied().unwrap_or(1) != 0 {
+            return Err(VaultError::NotIdle.into());
+        }
+    }
     key_is(portfolio, &v.lp_portfolio)?;
     key_is(perc_vault_auth, &perc::vault_authority(&v.market))?;
     check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, vault_ai.key)?;

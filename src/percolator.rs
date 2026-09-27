@@ -90,7 +90,10 @@ const TAG_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 pub const ASSET_ACTION_ACTIVATE: u8 = 0;
 const ASSET_ACTION_RETIRE: u8 = 2;
 const TAG_UPDATE_AUTHORITY: u8 = 32;
+const TAG_CONFIGURE_AUTH_MARK: u8 = 62;
+const TAG_PUSH_AUTH_MARK: u8 = 63;
 const TAG_REBALANCE_REDUCE: u8 = 44;
+const TAG_TRADE_CPI: u8 = 10;
 
 fn rd_u64(d: &[u8], off: usize) -> Result<u64, ProgramError> {
     let b = d.get(off..off + 8).ok_or(VaultError::BadPercolatorAccount)?;
@@ -124,6 +127,52 @@ pub fn expect_market(ai: &AccountInfo) -> Result<(), ProgramError> {
         return Err(VaultError::BadPercolatorAccount.into());
     }
     check_header(&ai.try_borrow_data()?, KIND_MARKET)
+}
+
+// ---- market config and asset price (offsets pinned to Percolator's types in tests/vault.rs) ----
+pub const MARKET_CONFIG_OFF: usize = 464 + 32;
+pub const CONFIG_INITIAL_MARGIN_BPS: usize = 62;
+pub const CONFIG_MIN_NONZERO_IM_REQ: usize = 22;
+pub const WRAPPER_TRADE_FEE_BASE_BPS: usize = HEADER_LEN + 128;
+pub const ASSET_EFFECTIVE_PRICE: usize = 25;
+pub const ASSET_SLOT_LAST: usize = 41;
+pub const PORTFOLIO_LEGS_OFF: usize = 356;
+pub const PORTFOLIO_LEG_LEN: usize = 152;
+pub const PORTFOLIO_LEG_COUNT: usize = 16;
+pub const LEG_ACTIVE: usize = 0;
+pub const LEG_ASSET_INDEX: usize = 1;
+pub const LEG_BASIS_POS_Q: usize = 14;
+
+/// Market-wide margin parameters: initial margin in bps, the minimum nonzero initial margin
+/// requirement (quote atoms) and the base trade fee in bps.
+pub fn margin_params(d: &[u8]) -> Result<(u64, u128, u64), ProgramError> {
+    Ok((
+        rd_u64(d, MARKET_CONFIG_OFF + CONFIG_INITIAL_MARGIN_BPS)?,
+        rd_u128(d, MARKET_CONFIG_OFF + CONFIG_MIN_NONZERO_IM_REQ)?,
+        rd_u64(d, WRAPPER_TRADE_FEE_BASE_BPS)?,
+    ))
+}
+
+/// An asset's generation (`market_id`), effective price (e6) and last accrual slot.
+pub fn asset_price(d: &[u8], asset_index: u16) -> Result<(u64, u64, u64), ProgramError> {
+    let e = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
+    Ok((rd_u64(d, e)?, rd_u64(d, e + ASSET_EFFECTIVE_PRICE)?, rd_u64(d, e + ASSET_SLOT_LAST)?))
+}
+
+/// A portfolio's capital, PnL and active legs as (asset, absolute position).
+pub fn portfolio_exposure(d: &[u8]) -> Result<(u128, i128, Vec<(u16, u128)>), ProgramError> {
+    let mut legs = Vec::new();
+    for i in 0..PORTFOLIO_LEG_COUNT {
+        let l = PORTFOLIO_LEGS_OFF + i * PORTFOLIO_LEG_LEN;
+        let active = *d.get(l + LEG_ACTIVE).ok_or(VaultError::BadPercolatorAccount)?;
+        if active != 1 {
+            continue;
+        }
+        let asset = u32::from_le_bytes(d[l + LEG_ASSET_INDEX..l + LEG_ASSET_INDEX + 4].try_into().unwrap());
+        let q = rd_i128(d, l + LEG_BASIS_POS_Q)?;
+        legs.push((u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?, q.unsigned_abs()));
+    }
+    Ok((rd_u128(d, PORTFOLIO_CAPITAL_OFF)?, rd_i128(d, PORTFOLIO_PNL_OFF)?, legs))
 }
 
 pub fn market_collateral_mint(ai: &AccountInfo) -> Result<Pubkey, ProgramError> {
@@ -424,6 +473,34 @@ pub struct HybridOracle {
     pub feeds: [[u8; 32]; 3],
 }
 
+/// Puts an asset in authority-mark mode: its mark is exactly what the oracle authority pushes.
+/// `push` selects `PushAuthMark` (move the mark) instead of `ConfigureAuthMark` (set it up).
+#[allow(clippy::too_many_arguments)]
+pub fn auth_mark(
+    push: bool,
+    authority: &Pubkey,
+    market: &Pubkey,
+    asset_index: u16,
+    market_id: u64,
+    now_slot: u64,
+    mark_e6: u64,
+    observation_sequence: u64,
+    authority_epoch: u64,
+) -> Instruction {
+    let mut data = vec![if push { TAG_PUSH_AUTH_MARK } else { TAG_CONFIGURE_AUTH_MARK }];
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.extend_from_slice(&market_id.to_le_bytes());
+    data.extend_from_slice(&now_slot.to_le_bytes());
+    data.extend_from_slice(&mark_e6.to_le_bytes());
+    data.extend_from_slice(&observation_sequence.to_le_bytes());
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![AccountMeta::new_readonly(*authority, true), AccountMeta::new(*market, false)],
+        data,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn configure_hybrid_oracle(
     authority: &Pubkey,
@@ -532,6 +609,50 @@ pub fn update_market_authority(current: &Pubkey, new: &Pubkey, market: &Pubkey, 
             AccountMeta::new_readonly(*current, true),
             AccountMeta::new_readonly(*new, true),
             AccountMeta::new(*market, false),
+        ],
+        data,
+    }
+}
+
+/// A taker trade against an LP portfolio whose matcher is `matcher_program` (the vault).
+#[allow(clippy::too_many_arguments)]
+pub fn trade_cpi(
+    taker: &Pubkey,
+    market: &Pubkey,
+    taker_portfolio: &Pubkey,
+    lp_portfolio: &Pubkey,
+    matcher_program: &Pubkey,
+    matcher_context: &Pubkey,
+    matcher_delegate: &Pubkey,
+    taker_view: &PortfolioView,
+    lp_view: &PortfolioView,
+    asset_index: u16,
+    market_id: u64,
+    size_q: i128,
+    fee_bps: u64,
+) -> Instruction {
+    let mut data = vec![TAG_TRADE_CPI];
+    data.extend_from_slice(&taker_view.portfolio_id.to_le_bytes());
+    data.extend_from_slice(&taker_view.position_epoch.to_le_bytes());
+    data.extend_from_slice(&lp_view.portfolio_id.to_le_bytes());
+    data.extend_from_slice(&lp_view.position_epoch.to_le_bytes());
+    data.extend_from_slice(&lp_view.sequence.to_le_bytes());
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.extend_from_slice(&market_id.to_le_bytes());
+    data.extend_from_slice(&size_q.to_le_bytes());
+    data.extend_from_slice(&fee_bps.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes()); // limit price: none, the fill is at the mark
+    data.extend_from_slice(&0u16.to_le_bytes()); // backing fee cap
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*taker, true),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*taker_portfolio, false),
+            AccountMeta::new(*lp_portfolio, false),
+            AccountMeta::new_readonly(*matcher_program, false),
+            AccountMeta::new(*matcher_context, false),
+            AccountMeta::new_readonly(*matcher_delegate, false),
         ],
         data,
     }
