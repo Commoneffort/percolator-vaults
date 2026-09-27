@@ -409,23 +409,38 @@ fn settle_stale_legs(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &Vaul
 
 /// Retires an operate-mode market nobody provides liquidity to, once the program allows it
 /// (no shares, no requests, listed `RETIRE_IDLE_EPOCHS` epochs ago), so its slot can be reused.
-/// Only possible once the program's governor PDA is the market's authority.
-fn maybe_retire(rpc: &RpcClient, payer: &Keypair, k: &VaultKeys, v: &VaultState, now: u64) -> Option<Result<String, String>> {
+/// Only possible once the program's governor PDA is the market's authority. `Err` carries the
+/// reason it was not attempted, or the failure.
+fn maybe_retire(rpc: &RpcClient, payer: &Keypair, k: &VaultKeys, v: &VaultState, now: u64) -> Result<String, String> {
     let idle_since = v.listed_slot.saturating_add(v.epoch_len_slots.saturating_mul(percolator_vault::processor::RETIRE_IDLE_EPOCHS));
-    if v.mode != state::MODE_OPERATE || v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0 || now < idle_since {
-        return None;
+    if v.mode != state::MODE_OPERATE || v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0 {
+        return Err("not idle: requests pending".into());
+    }
+    if now < idle_since {
+        return Err(format!("not idle: listed too recently ({} slots left)", idle_since - now));
     }
     let (cfg, _, data) = market_state(rpc, &k.market);
     if cfg.marketauth != state::governor_address(&percolator_vault::id(), &k.market).0.to_bytes() {
-        return None;
+        return Err("governor is not the market authority".into());
     }
-    let supply = rpc.get_token_supply(&k.share_mint).ok()?.amount.parse::<u64>().ok()?;
-    if supply != 0 {
-        return None;
+    let supply = rpc.get_token_supply(&k.share_mint).map_err(|e| e.to_string())?.amount;
+    if supply != "0" {
+        return Err(format!("not idle: {supply} shares outstanding"));
     }
-    let asset_epoch = pstate::read_asset_control_sequences(&data, v.asset_index as usize).ok()?.authority_epoch;
-    let market_epoch = pstate::read_asset_control_sequences(&data, 0).ok()?.authority_epoch;
-    Some(send(rpc, payer, vec![client::retire_market(k, asset_epoch, market_epoch)], &[]))
+    let asset_epoch = pstate::read_asset_control_sequences(&data, v.asset_index as usize).map_err(|e| format!("{e:?}"))?.authority_epoch;
+    let market_epoch = pstate::read_asset_control_sequences(&data, 0).map_err(|e| format!("{e:?}"))?.authority_epoch;
+    send(rpc, payer, vec![client::retire_market(k, asset_epoch, market_epoch)], &[])
+}
+
+/// Retires every idle market now, printing why the others stay.
+fn retire_idle(rpc: &RpcClient, payer: &Keypair) {
+    let now = rpc.get_slot().unwrap();
+    for (k, v) in all_vaults(rpc) {
+        match maybe_retire(rpc, payer, &k, &v, now) {
+            Ok(s) => println!("{} asset {}: retired ({s})", k.vault, { v.asset_index }),
+            Err(e) => println!("{} asset {}: {}", k.vault, { v.asset_index }, e.lines().next().unwrap_or("")),
+        }
+    }
 }
 
 /// One-time: makes the program's governor PDA the market authority (the payer must hold it now).
@@ -505,12 +520,12 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
             }
             if tick % 15 == 0 {
                 match maybe_retire(rpc, payer, &k, &v, now) {
-                    Some(Ok(s)) => {
+                    Ok(s) => {
                         println!("{} retired idle market on asset {} ({s})", k.vault, { v.asset_index });
                         continue;
                     }
-                    Some(Err(e)) => eprintln!("{} retire: {}", k.vault, e.lines().next().unwrap_or("")),
-                    None => {}
+                    Err(e) if e.starts_with("not idle") || e.starts_with("governor") => {}
+                    Err(e) => eprintln!("{} retire: {}", k.vault, e.lines().next().unwrap_or("")),
                 }
             }
             // A roll fails while the vault still holds a position, so an overdue epoch is only
@@ -664,6 +679,7 @@ fn main() {
             println!("{}", faucet(&rpc, &admin, &to, usdc * USDC));
         }
         Some("keeper") => keeper(&rpc, &admin),
+        Some("retire-idle") => retire_idle(&rpc, &admin),
         Some("accept-governance") => accept_governance(&rpc, &admin, &key(&load(), "market")),
         Some("status") => status(&rpc),
         _ => eprintln!("usage: devnet setup-market | create-vault | faucet <pubkey> <usdc> | keeper | accept-governance | status"),
