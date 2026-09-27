@@ -16,6 +16,7 @@ export default {
     "active": 0,
     "asset_index": 1,
     "basis_pos_q": 14,
+    "kf_epoch_snap": 78,
     "side": 13
   },
   "market": {
@@ -25,6 +26,9 @@ export default {
     "ins_budget_short": 531,
     "ins_spent_long": 547,
     "ins_spent_short": 563,
+    "kf_epoch_long": 145,
+    "kf_epoch_short": 153,
+    "lifecycle": 16,
     "market_id": 0,
     "oi_long": 289,
     "oi_short": 305,
@@ -72,6 +76,7 @@ export default {
     "insurance_floor": 560,
     "inventory": 584,
     "last_nav": 640,
+    "listed_slot": 688,
     "lp_portfolio": 280,
     "magic": 64,
     "market": 80,

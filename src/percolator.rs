@@ -88,6 +88,8 @@ const TAG_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const TAG_CONFIGURE_HYBRID_ORACLE: u8 = 34;
 const TAG_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 pub const ASSET_ACTION_ACTIVATE: u8 = 0;
+const ASSET_ACTION_RETIRE: u8 = 2;
+const TAG_UPDATE_AUTHORITY: u8 = 32;
 const TAG_REBALANCE_REDUCE: u8 = 44;
 
 fn rd_u64(d: &[u8], off: usize) -> Result<u64, ProgramError> {
@@ -488,6 +490,48 @@ pub fn withdraw_insurance_asset(
             AccountMeta::new(*percolator_vault, false),
             AccountMeta::new_readonly(*percolator_vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Retires an empty asset so its slot can be reused. Percolator gates retirement on the
+/// market-level authority (`marketauth`) and refuses unless the asset holds no positions,
+/// obligations or unspent insurance history it cannot clear.
+pub fn retire_asset(
+    marketauth: &Pubkey,
+    market: &Pubkey,
+    asset_index: u16,
+    market_id: u64,
+    authority_epoch: u64,
+    now_slot: u64,
+) -> Instruction {
+    let mut data = vec![TAG_UPDATE_ASSET_LIFECYCLE, ASSET_ACTION_RETIRE];
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.extend_from_slice(&market_id.to_le_bytes());
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    data.extend_from_slice(&now_slot.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_price: unused, must be zero
+    data.extend_from_slice(&0u128.to_le_bytes()); // max_init_fee: unused
+    data.extend_from_slice(&[0u8; 128]); // domain authorities: unused
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![AccountMeta::new_readonly(*marketauth, true), AccountMeta::new(*market, false)],
+        data,
+    }
+}
+
+/// Rotates the market-level authority. Both the current and the new authority sign.
+pub fn update_market_authority(current: &Pubkey, new: &Pubkey, market: &Pubkey, authority_epoch: u64) -> Instruction {
+    let mut data = vec![TAG_UPDATE_AUTHORITY];
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    data.extend_from_slice(new.as_ref());
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*current, true),
+            AccountMeta::new_readonly(*new, true),
+            AccountMeta::new(*market, false),
         ],
         data,
     }

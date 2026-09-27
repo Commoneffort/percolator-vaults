@@ -23,7 +23,8 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 4. **Earn.** Takers' fees land in the asset's insurance. `HarvestFees` (anyone can call it) moves everything above the fixed floor into the vault. The floor stays in place to protect traders. Of what is harvested, 90% belongs to the depositors pro rata and 10% is set aside for whoever opened the market (Hyperliquid HIP-3 style), who claims it with `ClaimOpenerFees` and has no other powers.
 5. **Settle in epochs.** Deposits and withdrawals are queued, then priced together at one net asset value when the epoch rolls and the LP portfolio is flat. Percolator only allows withdrawals from a flat portfolio, and pricing only at flat points removes every stale-price game.
 6. **Keep exits open.** After an epoch ends with requests waiting, the vault only accepts trades that shrink its position. If a trader holds a position on purpose, anyone can call `Unwind` one epoch later, and the vault closes its own position through Percolator's unilateral `RebalanceReduce`.
-7. **Wind down.** If the market is resolved, `SettleResolved` (anyone can call it) closes the portfolio through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata.
+7. **Retire dead markets.** When a market has had no liquidity providers for three epochs and holds no position, anyone can call `RetireMarket`: its leftover insurance (trading fees nobody else owns) goes to the opener, Percolator retires the asset, and its slot is reused by the next market opened (Percolator fills free slots before growing the market). The same feed can be opened again later.
+8. **Wind down.** If the market is resolved, `SettleResolved` (anyone can call it) closes the portfolio through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata.
 
 ## Instructions
 
@@ -42,6 +43,8 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 29 | `ClaimOpenerFees` | market opener | Collects the opener's 10% share of harvested fees |
 | 23 / 24 | `SettleResolved` / `RedeemTerminal` | anyone / holder | Wind-down after market resolution |
 | 25 | `Sweep` | anyone | Moves stray vault-owned collateral into the buffer |
+| 31 | `RetireMarket` | anyone | Frees the slot of an idle market (no shares, no requests, no position, listed 3+ epochs ago); its leftover insurance goes to the opener and the feed can be opened again |
+| 30 | `AcceptGovernance` | current market authority | One-time: hands Percolator's market authority to the program's governor PDA, which is only used by `RetireMarket` |
 
 ## Share pricing
 

@@ -22,7 +22,7 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function send(label: string, kp: Keypair, ixs: TransactionInstruction[], extra: Keypair[] = []) {
   for (let i = 0; i < 3; i++) {
     try {
-      const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }), ...ixs), [kp, ...extra]);
+      const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs), [kp, ...extra]);
       await conn.confirmTransaction(sig, "confirmed");
       console.log("ok  ", label);
       return true;
@@ -58,7 +58,7 @@ async function openMarket(sym: string) {
   if (v.status === 0) {
     const m = await C.fetchMarket(conn);
     const pyth = C.decodePyth(new Uint8Array((await conn.getAccountInfo(C.feedAccount(f.id)))!.data));
-    await send(`open ${sym}: list`, LP, [C.listAsset(LP.publicKey, vault, f.id, m.slots, m.nextMarketId, pyth.e6)]);
+    await send(`open ${sym}: list`, LP, [C.listAsset(LP.publicKey, vault, f.id, m.listSlot, m.nextMarketId, pyth.e6)]);
   }
   return vault;
 }
@@ -98,16 +98,16 @@ async function trade(kp: Keypair, sym: string, size: number, margin: number) {
     s = await C.fetchVault(conn, vault, kp.publicKey);
   }
   const q = BigInt(Math.round(size * 1e6));
-  const cranks = await C.catchUpCranks(conn, s.vault, kp.publicKey);
-  await send(`${kp.publicKey.toBase58().slice(0, 6)} ${size > 0 ? "long" : "short"} ${Math.abs(size)} ${sym}`, kp, [...cranks, C.tradeAgainstVault(s.vault, kp.publicKey, pf, s.portfolio!, s.lp, s.asset, q)]);
+  const ixs = await C.prepareTrade(conn, s.vault, kp.publicKey, C.tradeAgainstVault(s.vault, kp.publicKey, pf, s.portfolio!, s.lp, s.asset, q));
+  await send(`${kp.publicKey.toBase58().slice(0, 6)} ${size > 0 ? "long" : "short"} ${Math.abs(size)} ${sym}`, kp, ixs);
 }
 
 async function closeAll(kp: Keypair, sym: string) {
   const vault = C.canonicalVaultAddress(C.FEEDS.find(x => x.symbol === sym)!.id);
   const s = await C.fetchVault(conn, vault, kp.publicKey);
   if (!s.portfolio || s.portfolio.position === 0n) return;
-  const cranks = await C.catchUpCranks(conn, s.vault, kp.publicKey);
-  await send(`${kp.publicKey.toBase58().slice(0, 6)} close ${sym}`, kp, [...cranks, C.tradeAgainstVault(s.vault, kp.publicKey, s.portfolioKey!, s.portfolio, s.lp, s.asset, -s.portfolio.position)]);
+  const ixs = await C.prepareTrade(conn, s.vault, kp.publicKey, C.tradeAgainstVault(s.vault, kp.publicKey, s.portfolioKey!, s.portfolio, s.lp, s.asset, -s.portfolio.position));
+  await send(`${kp.publicKey.toBase58().slice(0, 6)} close ${sym}`, kp, ixs);
 }
 
 async function trades() {

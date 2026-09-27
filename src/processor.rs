@@ -110,6 +110,11 @@ pub const TAG_LIST_ASSET: u8 = 26;
 pub const TAG_HARVEST_FEES: u8 = 27;
 pub const TAG_UNWIND: u8 = 28;
 pub const TAG_CLAIM_OPENER_FEES: u8 = 29;
+pub const TAG_ACCEPT_GOVERNANCE: u8 = 30;
+pub const TAG_RETIRE_MARKET: u8 = 31;
+
+/// A market with no liquidity providers can be retired this many epochs after it was listed.
+pub const RETIRE_IDLE_EPOCHS: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitParams {
@@ -456,6 +461,18 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             claim_opener_fees(program_id, accounts)
         }
         TAG_LIST_ASSET => list_asset(program_id, accounts, ListArgs::decode(rest)?),
+        TAG_ACCEPT_GOVERNANCE => accept_governance(program_id, accounts, arg_u64(rest)?),
+        TAG_RETIRE_MARKET => {
+            if rest.len() != 16 {
+                return Err(VaultError::InvalidInstruction.into());
+            }
+            retire_market(
+                program_id,
+                accounts,
+                u64::from_le_bytes(rest[..8].try_into().unwrap()),
+                u64::from_le_bytes(rest[8..].try_into().unwrap()),
+            )
+        }
         TAG_HARVEST_FEES => {
             if rest.len() != 16 {
                 return Err(VaultError::InvalidInstruction.into());
@@ -687,7 +704,8 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         total_fees_harvested: 0,
         opener_fees_owed: 0,
         opener_fees_total: 0,
-        _reserved: [0; 40],
+        listed_slot: 0,
+        _reserved: [0; 32],
     };
     state::store_vault(vault_ai, &v)?;
 
@@ -1563,6 +1581,151 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
     v.asset_market_id = a.market_id;
     v.status = STATUS_ACTIVE;
     v.epoch_start_slot = clock.slot;
+    v.listed_slot = clock.slot;
+    state::store_vault(vault_ai, &v)
+}
+
+/// Makes the program's governor PDA the market's `marketauth`. Percolator requires the current
+/// authority to sign and the new one to co-sign; the PDA co-signs here. Afterwards the market has
+/// no admin key: the program only ever uses the governor to retire idle markets.
+///
+/// Accounts: 0 current marketauth [signer], 1 governor PDA, 2 market [w], 3 Percolator program.
+/// Data: the market's authority epoch (checked by Percolator).
+fn accept_governance(program_id: &Pubkey, accounts: &[AccountInfo], authority_epoch: u64) -> ProgramResult {
+    let current = acc(accounts, 0)?;
+    let governor = acc(accounts, 1)?;
+    let market = acc(accounts, 2)?;
+    let percolator = acc(accounts, 3)?;
+    signer(current)?;
+    writable(market)?;
+    key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
+    let (expected, bump) = state::governor_address(program_id, market.key);
+    key_is(governor, &expected)?;
+    invoke_signed(
+        &perc::update_market_authority(current.key, governor.key, market.key, authority_epoch),
+        &[current.clone(), governor.clone(), market.clone(), percolator.clone()],
+        &[&[SEED_GOVERNOR, market.key.as_ref(), &[bump]]],
+    )
+}
+
+/// Frees the market slot of an idle operate-mode vault, so a market can be opened in it again.
+/// Anyone can call it once the vault has no liquidity providers (no shares, no requests), holds
+/// no position, and was listed at least `RETIRE_IDLE_EPOCHS` epochs ago; Percolator additionally
+/// refuses unless the asset itself is empty. The asset's remaining insurance (trading fees that
+/// no depositor owns) is paid to the opener. The vault returns to pending listing, so the same
+/// feed can be opened again later, in any free slot.
+///
+/// Accounts: 0 vault [w], 1 market [w], 2 governor PDA, 3 share mint, 4 LP portfolio,
+/// 5 buffer [w], 6 Percolator collateral vault [w], 7 Percolator vault authority,
+/// 8 token program, 9 Percolator program.
+/// Data: the asset's authority epoch (for the insurance withdrawal) and the market's authority
+/// epoch (for the retirement), both checked by Percolator.
+fn retire_market(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    asset_authority_epoch: u64,
+    market_authority_epoch: u64,
+) -> ProgramResult {
+    let vault_ai = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let governor = acc(accounts, 2)?;
+    let share_mint = acc(accounts, 3)?;
+    let portfolio = acc(accounts, 4)?;
+    let buffer = acc(accounts, 5)?;
+    let perc_vault = acc(accounts, 6)?;
+    let perc_vault_auth = acc(accounts, 7)?;
+    let token = acc(accounts, 8)?;
+    let percolator = acc(accounts, 9)?;
+    for w in [vault_ai, market, buffer, perc_vault] {
+        writable(w)?;
+    }
+    programs(percolator, token)?;
+    let mut v = state::load_vault(vault_ai, program_id)?;
+    if v.mode != MODE_OPERATE {
+        return Err(VaultError::WrongMode.into());
+    }
+    if v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    key_is(market, &v.market)?;
+    key_is(share_mint, &v.share_mint)?;
+    key_is(portfolio, &v.lp_portfolio)?;
+    key_is(perc_vault_auth, &perc::vault_authority(&v.market))?;
+    check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, vault_ai.key)?;
+    let (expected_governor, governor_bump) = state::governor_address(program_id, market.key);
+    key_is(governor, &expected_governor)?;
+
+    let now = Clock::get()?.slot;
+    let idle_since = v
+        .listed_slot
+        .saturating_add(v.epoch_len_slots.saturating_mul(RETIRE_IDLE_EPOCHS));
+    if mint_supply(share_mint)? != 0
+        || v.pending_deposit_assets != 0
+        || v.pending_withdraw_shares != 0
+        || now < idle_since
+        || !perc::read_portfolio(portfolio, market.key, vault_ai.key)?.flat
+    {
+        return Err(VaultError::NotIdle.into());
+    }
+
+    // Insurance left on the asset must leave before the slot can be reused. With no depositors
+    // it belongs to nobody else, so it goes to the opener like the opener's fee share.
+    let (id, remaining) = perc::asset_insurance(market, v.asset_index)?;
+    if id != v.asset_market_id {
+        return Err(VaultError::UnknownAsset.into());
+    }
+    let bump = v.vault_bump;
+    if remaining != 0 {
+        let before = token_amount(buffer)?;
+        invoke_signed(
+            &perc::withdraw_insurance_asset(
+                vault_ai.key,
+                market.key,
+                buffer.key,
+                perc_vault.key,
+                perc_vault_auth.key,
+                v.asset_index,
+                v.asset_market_id,
+                asset_authority_epoch,
+                remaining,
+            ),
+            &[
+                vault_ai.clone(),
+                market.clone(),
+                buffer.clone(),
+                perc_vault.clone(),
+                perc_vault_auth.clone(),
+                token.clone(),
+                percolator.clone(),
+            ],
+            &[vault_seeds!(v, bump)],
+        )?;
+        let received = sub(token_amount(buffer)?, before)?;
+        v.total_fees_harvested = v.total_fees_harvested.saturating_add(received);
+        v.opener_fees_owed = add(v.opener_fees_owed, received)?;
+        v.opener_fees_total = v.opener_fees_total.saturating_add(received);
+        v.reserved_assets = add(v.reserved_assets, received)?;
+    }
+
+    invoke_signed(
+        &perc::retire_asset(
+            governor.key,
+            market.key,
+            v.asset_index,
+            v.asset_market_id,
+            market_authority_epoch,
+            now,
+        ),
+        &[governor.clone(), market.clone(), percolator.clone()],
+        &[&[SEED_GOVERNOR, market.key.as_ref(), &[governor_bump]]],
+    )?;
+
+    v.status = STATUS_PENDING_LISTING;
+    v.asset_index = u16::MAX;
+    v.asset_market_id = 0;
+    v.inventory = 0;
+    v.listed_slot = 0;
+    v.epoch_start_slot = now;
     state::store_vault(vault_ai, &v)
 }
 

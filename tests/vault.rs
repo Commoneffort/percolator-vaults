@@ -500,7 +500,7 @@ fn export_layout_for_frontend() {
         "vault": f!(V, o, magic, status, share_decimals, market, creator, seed, collateral_mint, share_mint, buffer, share_escrow,
             lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_inventory_abs,
             epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, vault_kind, position_nav_bps, fill_nav_bps, opener_fees_owed, opener_fees_total, asset_market_id, inventory, epoch, epoch_start_slot,
-            pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested),
+            pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested, listed_slot),
         "vault_len": state::VAULT_ACCOUNT_LEN,
         "ticket": f!(Ticket, 0, vault, owner, epoch, deposit_assets, withdraw_shares),
         "ticket_len": size_of::<Ticket>(),
@@ -517,7 +517,8 @@ fn export_layout_for_frontend() {
             "asset_index": offset_of!(percolator::PortfolioLegV16Account, asset_index),
             "basis_pos_q": offset_of!(percolator::PortfolioLegV16Account, basis_pos_q),
             "side": offset_of!(percolator::PortfolioLegV16Account, side),
-            "active": offset_of!(percolator::PortfolioLegV16Account, active)
+            "active": offset_of!(percolator::PortfolioLegV16Account, active),
+            "kf_epoch_snap": offset_of!(percolator::PortfolioLegV16Account, kf_epoch_snap)
         },
         "market_header": {
             "next_market_id": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, next_market_id),
@@ -530,6 +531,9 @@ fn export_layout_for_frontend() {
             "slot_last": offset_of!(percolator::AssetStateV16Account, slot_last),
             "oi_long": offset_of!(percolator::AssetStateV16Account, oi_eff_long_q),
             "oi_short": offset_of!(percolator::AssetStateV16Account, oi_eff_short_q),
+            "lifecycle": offset_of!(percolator::AssetStateV16Account, lifecycle),
+            "kf_epoch_long": offset_of!(percolator::AssetStateV16Account, kf_epoch_long),
+            "kf_epoch_short": offset_of!(percolator::AssetStateV16Account, kf_epoch_short),
             "ins_budget_long": 515, "ins_budget_short": 531, "ins_spent_long": 547, "ins_spent_short": 563 }
     });
     std::fs::create_dir_all("app/src").unwrap();
@@ -597,4 +601,105 @@ fn canonical_vaults_are_unique_per_feed_and_scale_with_nav() {
         w.taker_trade_asset(0, asset, 40 * UNIT as i128).unwrap();
     }
     assert_eq!({ w.vault_state().inventory }, -60 * UNIT as i128, "position cap is 3x NAV");
+}
+
+// ---------------------------------------------------------------- retiring idle markets
+
+fn retire_ix(w: &World) -> solana_sdk::instruction::Instruction {
+    let v = w.vault_state();
+    let asset_epoch = if v.asset_index == u16::MAX {
+        0 // unlisted: the program refuses before any epoch matters
+    } else {
+        w.env.primary_control_sequences(v.asset_index as usize).authority_epoch
+    };
+    let market_epoch = w.env.primary_control_sequences(0).authority_epoch;
+    client::retire_market(&w.keys.unwrap(), asset_epoch, market_epoch)
+}
+
+/// An operate-mode market nobody provides liquidity to can be retired by anyone once it has been
+/// listed for `RETIRE_IDLE_EPOCHS` epochs. Its unowned insurance goes to the opener, the slot
+/// becomes free, and the same vault can be listed again into it.
+#[test]
+fn idle_market_is_retired_and_its_slot_reused() {
+    let mut w = World::new();
+    w.env.set_clock(5, 1_000);
+    w.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
+    w.env.update_trade_fee_policy(10).unwrap();
+    w.create_vault(operate_params(2)).unwrap();
+    let lister = w.new_user(10_000_000);
+    let pyth = w.env.set_pyth_price(&FEED, 100_000_000, -8, 0, 1_000);
+    w.list_asset(&lister, pyth).unwrap();
+    let asset = w.vault_state().asset_index;
+
+    // Without governance the program cannot retire anything.
+    let mut ts = 1_000i64;
+    w.advance_oracle(pyth, EPOCH_LEN * processor::RETIRE_IDLE_EPOCHS + 1, &mut ts, 100_000_000);
+    assert!(w.send(vec![retire_ix(&w)], &[]).is_err(), "no marketauth, no retirement");
+
+    // Hand the market authority to a key the test holds, which then gives it to the governor.
+    w.env.update_market_authority_from_admin(4).unwrap();
+    let admin = w.env.actors[4].signer.insecure_clone();
+    let epoch0 = w.env.primary_control_sequences(0).authority_epoch;
+    let ix = client::accept_governance(&pid(), &admin.pubkey(), &w.env.market, epoch0);
+    w.send(vec![ix], &[&admin]).unwrap();
+    assert_eq!(
+        w.env.primary_market_state().0.marketauth,
+        state::governor_address(&pid(), &w.env.market).0.to_bytes(),
+        "the governor PDA is the market authority"
+    );
+
+    // A depositor earns fees on trades, so the market is not idle while they are in.
+    let alice = w.new_user(100_000_000);
+    w.deposit(&alice, 50_000_000).unwrap();
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
+    w.roll().unwrap();
+    w.claim(&alice, 0).unwrap();
+    let unit = UNIT as i128;
+    for size in [10 * unit, -10 * unit] {
+        w.advance_oracle(pyth, 2, &mut ts, 100_000_000);
+        w.taker_trade_asset(0, asset, size).unwrap();
+    }
+    w.advance_oracle(pyth, 1, &mut ts, 100_000_000);
+    assert!(w.send(vec![retire_ix(&w)], &[]).unwrap_err().contains("0x5616"), "shares outstanding");
+
+    // Alice leaves; the market is now idle.
+    w.withdraw(&alice, w.tokens(alice.shares)).unwrap();
+    assert!(w.send(vec![retire_ix(&w)], &[]).unwrap_err().contains("0x5616"), "a request is pending");
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
+    w.roll().unwrap();
+    w.claim(&alice, 1).unwrap();
+
+    let insurance = {
+        let data = w.env.market_data(false);
+        let base = perc::MARKET_SLOTS_OFF + asset as usize * perc::MARKET_ASSET_SLOT_LEN + 512;
+        let rd = |o: usize| u128::from_le_bytes(data[base + o..base + o + 16].try_into().unwrap());
+        rd(515) + rd(531) - rd(547) - rd(563)
+    };
+    assert!(insurance > 0, "trading fees sit in the asset's insurance");
+    let owed_before = w.vault_state().opener_fees_owed;
+    w.advance_oracle(pyth, 1, &mut ts, 100_000_000);
+    w.send(vec![retire_ix(&w)], &[]).unwrap();
+
+    let v = w.vault_state();
+    assert_eq!({ v.status }, state::STATUS_PENDING_LISTING);
+    assert_eq!({ v.asset_index }, u16::MAX);
+    assert_eq!(v.opener_fees_owed - owed_before, insurance as u64, "unowned insurance goes to the opener");
+    let (cfg, group) = w.env.primary_market_state();
+    assert_eq!(cfg.free_market_slot_count, 1);
+    assert_eq!(group.assets[asset as usize].lifecycle, percolator::AssetLifecycleV16::Retired);
+    assert!(w.send(vec![retire_ix(&w)], &[]).is_err(), "retiring twice fails");
+
+    // The feed can be opened again, into the freed slot (after Percolator's activation cooldown).
+    let slot = w.env.current_slot() + 2;
+    ts += 2;
+    w.env.set_clock(slot, ts);
+    w.env.update_pyth_price(pyth, &FEED, 100_000_000, -8, 0, ts);
+    w.list_asset_at(&lister, pyth, asset).unwrap();
+    let v = w.vault_state();
+    assert_eq!({ v.status }, state::STATUS_ACTIVE);
+    assert_eq!({ v.asset_index }, asset);
+    assert_eq!(w.env.primary_market_state().0.free_market_slot_count, 0);
+
+    // A freshly listed market cannot be retired before it has had time to attract liquidity.
+    assert!(w.send(vec![retire_ix(&w)], &[]).unwrap_err().contains("0x5616"), "too soon after listing");
 }

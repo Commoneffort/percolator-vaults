@@ -112,7 +112,9 @@ pub struct VaultState {
     /// counted in `reserved_assets`) until the opener claims it.
     pub opener_fees_owed: u64,
     pub opener_fees_total: u64,
-    pub _reserved: [u8; 40],
+    /// Slot the vault's current asset was listed (0 for vaults listed before this field).
+    pub listed_slot: u64,
+    pub _reserved: [u8; 32],
 }
 
 pub const VAULT_STATE_LEN: usize = core::mem::size_of::<VaultState>();
@@ -224,6 +226,13 @@ pub const SEED_ESCROW: &[u8] = b"escrow";
 pub const SEED_PORTFOLIO: &[u8] = b"portfolio";
 pub const SEED_TICKET: &[u8] = b"ticket";
 pub const SEED_EPOCH: &[u8] = b"epoch";
+/// The market-level authority (`marketauth`) of markets the vault program governs. The program
+/// uses it for one thing only: retiring an idle, empty market so its slot can be reused.
+pub const SEED_GOVERNOR: &[u8] = b"governor";
+
+pub fn governor_address(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_GOVERNOR, market.as_ref()], program_id)
+}
 
 pub fn vault_address(
     program_id: &Pubkey,

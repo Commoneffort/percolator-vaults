@@ -2,10 +2,13 @@
 // from layout.json, which a Rust test exports from the program and engine types.
 import {
   AccountMeta,
+  ComputeBudgetProgram,
   Connection,
   PublicKey,
   SystemProgram,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import L from "./layout.json";
@@ -170,10 +173,21 @@ export function decodeAsset(market: Uint8Array, index: number): Asset {
   };
 }
 
-export const marketHeader = (d: Uint8Array) => ({
-  nextMarketId: u64(d, L.market_header.next_market_id),
-  slots: u32(d, L.market_header.max_market_slots),
-});
+const LIFECYCLE_RETIRED = 4;
+
+export const marketHeader = (d: Uint8Array) => {
+  const slots = u32(d, L.market_header.max_market_slots);
+  // Percolator refuses to append a slot while a retired one is free, so a listing reuses the
+  // first retired slot and only appends when none is.
+  let listSlot = slots;
+  for (let i = 1; i < slots; i++) {
+    if (d[L.market.slots + i * L.market.slot_len + L.market.engine + L.market.lifecycle] === LIFECYCLE_RETIRED) {
+      listSlot = i;
+      break;
+    }
+  }
+  return { nextMarketId: u64(d, L.market_header.next_market_id), slots, listSlot };
+};
 
 /** Pyth price (e6 atoms per whole token) and publish time from a sponsored price account. */
 export function decodePyth(d: Uint8Array) {
@@ -358,22 +372,93 @@ export const percWithdraw = (owner: PublicKey, portfolio: PublicKey, p: Portfoli
     data: new W().u8(4).u64(p.id).u64(p.sequence).i128(amount).done(),
   });
 
-/** Cranks that bring the vault's asset current before a trade. Percolator refuses new risk once
- *  positions exist and the asset's accrual clock lags; each crank advances it at most 10 slots
- *  (the market's max_accrual_dt), and a crank with nothing to do fails the transaction, so the
- *  count must be exact. */
-export async function catchUpCranks(conn: Connection, v: Vault, payer: PublicKey): Promise<TransactionInstruction[]> {
-  const [m, slot] = await Promise.all([conn.getAccountInfo(MARKET, "confirmed"), conn.getSlot("processed")]);
-  const asset = decodeAsset(new Uint8Array(m!.data), v.assetIndex);
-  if (asset.oiLong === 0n && asset.oiShort === 0n) return [];
-  const lag = BigInt(slot) - asset.slotLast;
-  if (lag <= 0n) return [];
-  const n = Number((lag + 9n) / 10n);
-  return Array.from({ length: Math.min(n, 6) }, () => new TransactionInstruction({
+
+/** Candidate cranks that bring the market current before a trade. The engine's market-wide
+ *  loss-stale flag is recomputed from the asset an instruction touches: that asset is stale while
+ *  it lags the market clock, or while any stored position on it holds K/F snapshots from before the
+ *  last price move (each price move marks every position on the asset stale). So each asset with
+ *  open interest is brought to `slot` (one crank advances at most 10 slots), and every portfolio
+ *  with a leg on it is cranked at that slot to settle the leg. Whether a catch-up crank moves the
+ *  price is only known on chain, so the list can include cranks with nothing to do; `prepareTrade`
+ *  drops those by simulation. The traded asset comes first. */
+export async function catchUpCranks(conn: Connection, v: Vault | null, payer: PublicKey): Promise<TransactionInstruction[]> {
+  const [m, slot, vaults, portfolios] = await Promise.all([
+    conn.getAccountInfo(MARKET, "confirmed"),
+    conn.getSlot("confirmed"),
+    listVaults(conn),
+    conn.getProgramAccounts(PERCOLATOR, {
+      commitment: "confirmed",
+      filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }],
+    }),
+  ]);
+  const market = new Uint8Array(m!.data);
+  const byAsset = new Map<number, Vault>();
+  for (const x of [...(v ? [v] : []), ...vaults.filter(x => x.canonical && x.status === 1)]) {
+    if (byAsset.has(x.assetIndex)) continue;
+    const a = decodeAsset(market, x.assetIndex);
+    if (a.oiLong !== 0n || a.oiShort !== 0n) byAsset.set(x.assetIndex, x);
+  }
+  const crank = (x: Vault, portfolio: PublicKey) => new TransactionInstruction({
     programId: PERCOLATOR,
-    keys: [rw(payer, true), rw(MARKET), rw(v.lpPortfolio), ro(v.oracle)],
-    data: new W().u8(5).u64(BigInt(slot)).u8(1).u16(v.assetIndex).u8(1).done(),
-  }));
+    keys: [rw(payer, true), rw(MARKET), rw(portfolio), ro(x.oracle)],
+    data: new W().u8(5).u64(BigInt(slot)).u8(1).u16(x.assetIndex).u8(1).done(),
+  });
+  // Without a traded asset the flag only has to come down: catching up a nearly current asset
+  // with no positions (cheap cranks) recomputes it from that asset, which is never loss-stale.
+  if (!v) {
+    const idle = vaults.find(x => {
+      const a = decodeAsset(market, x.assetIndex);
+      const lag = BigInt(slot) - a.slotLast;
+      return x.canonical && x.status === 1 && a.oiLong === 0n && a.oiShort === 0n && lag > 0n && lag <= 100n;
+    });
+    if (idle) {
+      const lag = BigInt(slot) - decodeAsset(market, idle.assetIndex).slotLast;
+      return Array.from({ length: Number((lag + 9n) / 10n) }, () => crank(idle, idle.lpPortfolio));
+    }
+  }
+  const out: TransactionInstruction[] = [];
+  for (const x of byAsset.values()) {
+    const asset = L.market.slots + x.assetIndex * L.market.slot_len + L.market.engine;
+    const lag = BigInt(slot) - decodeAsset(market, x.assetIndex).slotLast;
+    const n = lag > 0n ? Number((lag + 9n) / 10n) : 0;
+    for (let i = 0; i < n; i++) out.push(crank(x, x.lpPortfolio));
+    for (const p of portfolios) {
+      const d = new Uint8Array(p.account.data);
+      for (let i = 0; i < 16; i++) {
+        const leg = L.portfolio.legs + i * L.portfolio.leg_len;
+        if (d[leg + L.leg.active] !== 1 || u32(d, leg + L.leg.asset_index) !== x.assetIndex) continue;
+        const epoch = d[leg + L.leg.side] === 0 ? L.market.kf_epoch_long : L.market.kf_epoch_short;
+        const stale = u64(d, leg + L.leg.kf_epoch_snap) < u64(market, asset + epoch);
+        if (n > 0 || stale) out.push(crank(x, p.pubkey));
+      }
+    }
+  }
+  return out;
+}
+
+/** The trade (or any instruction gated on the market-wide loss-stale flag, such as a listing; pass
+ *  `v = null` then) with the catch-up cranks it needs, found by simulating: a crank the engine rejects as
+ *  having nothing to do (NonProgress, 0x16) is dropped and the rest simulated again. */
+export async function prepareTrade(conn: Connection, v: Vault | null, payer: PublicKey, trade: TransactionInstruction): Promise<TransactionInstruction[]> {
+  // ~75k CU per crank on an asset with positions; keep room for the trade itself.
+  let cranks = (await catchUpCranks(conn, v, payer)).slice(0, 14);
+  for (let round = 0; round < 12; round++) {
+    const { blockhash } = await conn.getLatestBlockhash();
+    const msg = new TransactionMessage({
+      payerKey: payer,
+      recentBlockhash: blockhash,
+      instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...cranks, trade],
+    }).compileToV0Message();
+    const r = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
+    const err: any = r.value.err;
+    const failed = err?.InstructionError?.[0] - 1;
+    if (err && err.InstructionError?.[1]?.Custom === 22 && failed >= 0 && failed < cranks.length) {
+      cranks = cranks.filter((_, i) => i !== failed);
+      continue;
+    }
+    break;
+  }
+  return [...cranks, trade];
 }
 
 /** The trader takes `sizeQ` (positive = long) against the vault through Percolator's TradeCpi. */

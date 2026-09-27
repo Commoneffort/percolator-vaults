@@ -1,12 +1,15 @@
 """Pairs each recorded scene with its narration and joins them into demo.mp4 with burned-in
 subtitles (plus a separate demo.srt)."""
 import json
+import os
 import subprocess
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 B = HERE / "build"
 ORDER = ["title", "markets", "open", "trade", "liquidity", "leaderboard", "docs", "outro"]
+# SKIP=open,... leaves scenes out (e.g. while the devnet market has no free slot to open one).
+ORDER = [s for s in ORDER if s not in os.environ.get("SKIP", "").split(",")]
 TEXT = {s["scene"]: s["text"] for s in json.loads((HERE / "narration.json").read_text())}
 DUR = json.loads((B / "audio" / "durations.json").read_text())
 

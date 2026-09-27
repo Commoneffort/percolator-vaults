@@ -54,6 +54,11 @@ impl World {
     /// Lists the vault's own asset, paid by `lister`, with `pyth` as its price account.
     pub fn list_asset(&mut self, lister: &User, pyth: Pubkey) -> Result<u64, String> {
         let asset_index = self.env.primary_market_state().1.assets.len() as u16;
+        self.list_asset_at(lister, pyth, asset_index)
+    }
+
+    /// Lists the vault's own asset in slot `asset_index` (a new slot, or a retired one to reuse).
+    pub fn list_asset_at(&mut self, lister: &User, pyth: Pubkey, asset_index: u16) -> Result<u64, String> {
         let args = processor::ListArgs {
             asset_index,
             market_id: self.frontier(),

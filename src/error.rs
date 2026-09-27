@@ -25,6 +25,9 @@ pub enum VaultError {
     StillLive,
     WrongMode,
     NothingToHarvest,
+    /// RetireMarket: the market still has liquidity providers, requests, a position, or has not
+    /// been listed long enough.
+    NotIdle,
 }
 
 impl From<VaultError> for ProgramError {

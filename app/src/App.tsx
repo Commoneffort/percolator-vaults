@@ -56,7 +56,7 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
       setBusy(label);
       try {
         // Percolator instructions can use several hundred thousand compute units.
-        const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }), ...ixs);
+        const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs);
         const sig = await wallet.sendTransaction(tx, connection);
         await connection.confirmTransaction(sig, "confirmed");
         setToast({ ok: true, text: `${label}: confirmed`, sig });
@@ -484,13 +484,11 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
   const trade = async (sign: 1n | -1n) => {
     if (!publicKey || !pf || !p) return;
     const q = BigInt(Math.round(Number(size) * 1e6)) * sign;
-    const cranks = await C.catchUpCranks(connection, v, publicKey);
-    send(`${sign > 0n ? "Long" : "Short"} ${size} ${sym}`, [...cranks, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, q)]);
+    send(`${sign > 0n ? "Long" : "Short"} ${size} ${sym}`, await C.prepareTrade(connection, v, publicKey, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, q)));
   };
   const close = async () => {
     if (!publicKey || !pf || !p || p.position === 0n) return;
-    const cranks = await C.catchUpCranks(connection, v, publicKey);
-    send("Close position", [...cranks, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, -p.position)]);
+    send("Close position", await C.prepareTrade(connection, v, publicKey, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, -p.position)));
   };
 
   return (
@@ -650,9 +648,11 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
     // Listing appends a new asset slot, so read the market right before it.
     const m = await C.fetchMarket(connection);
     const pyth = C.decodePyth(new Uint8Array((await connection.getAccountInfo(C.feedAccount(feed.id)))!.data));
+    // Listing is refused while the market-wide loss-stale flag is up, so it carries the same
+    // catch-up cranks as a trade.
     const listed = await send(`List ${feed.symbol}-PERP`, [
       createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
-      C.listAsset(publicKey, vault, feed.id, m.slots, m.nextMarketId, pyth.e6),
+      ...await C.prepareTrade(connection, null, publicKey, C.listAsset(publicKey, vault, feed.id, m.listSlot, m.nextMarketId, pyth.e6)),
     ]);
     await load();
     if (!listed) return setStep(0);

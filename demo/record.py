@@ -143,7 +143,7 @@ def trade(s):
     pg.wait_for_selector("text=Add margin: confirmed", timeout=60000)
     s.type(pg.locator("label.field:has-text('Size') input"), "0.01")
     s.click(pg.get_by_role("button", name="Long", exact=True))
-    pg.wait_for_selector("text=/Long 0.01 BTC: confirmed|Long 0.01 BTC failed/", timeout=60000)
+    pg.wait_for_selector("text=/Long 0.01 BTC: confirmed|Long 0.01 BTC failed/", timeout=150000)
     pg.wait_for_timeout(2500)
     s.scroll(700, 2500)
     pg.wait_for_timeout(1500)
@@ -155,7 +155,7 @@ def liquidity(s):
     s.click(pg.get_by_role("button", name="Provide liquidity"))
     s.type(pg.locator("label.field:has-text('Deposit USDC') input"), "200")
     s.click(pg.get_by_role("button", name="Request deposit"))
-    pg.wait_for_selector("text=/Deposit request: confirmed|Deposit request failed/", timeout=60000)
+    pg.wait_for_selector("text=/Deposit request: confirmed|Deposit request failed/", timeout=150000)
     pg.wait_for_timeout(2500)
 
 

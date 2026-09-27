@@ -4,7 +4,8 @@
 //!   cargo run --example devnet -- setup-market          # mint, market, fee policies
 //!   cargo run --example devnet -- create-vault          # vault in operate mode + SOL/USD listing
 //!   cargo run --example devnet -- faucet <pubkey> <usdc>
-//!   cargo run --example devnet -- keeper                # cranks, rolls, harvests, renews
+//!   cargo run --example devnet -- keeper                # cranks, rolls, harvests, retires idle markets
+//!   cargo run --example devnet -- accept-governance     # one-time: market authority -> governor PDA
 //!   cargo run --example devnet -- status
 //!
 //! State goes to deploy/devnet.json. The payer/admin keypair is PERCOLATOR_KEYPAIR (default
@@ -89,7 +90,15 @@ fn key(v: &Value, k: &str) -> Pubkey {
 }
 
 fn market_state(rpc: &RpcClient, market: &Pubkey) -> (pstate::WrapperConfigV16, pstate::MarketGroupV16, Vec<u8>) {
-    let data = rpc.get_account_data(market).expect("market account");
+    // Retries through RPC rate limits instead of panicking the keeper.
+    let mut tries = 0;
+    let data = loop {
+        match rpc.get_account_data(market) {
+            Ok(d) => break d,
+            Err(e) if tries < 20 => { tries += 1; eprintln!("market read: {}", e.to_string().lines().next().unwrap_or("")); sleep(Duration::from_millis(1500)); }
+            Err(e) => panic!("market account: {e}"),
+        }
+    };
     let (c, g) = pstate::read_market(&data).expect("decode market");
     (c, g, data)
 }
@@ -296,16 +305,27 @@ fn push_feed_account(feed: &[u8; 32]) -> Pubkey {
 fn crank_vault(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState) -> Result<(), String> {
     let oracle = push_feed_account(&v.oracle_feeds[0]);
     // Each crank advances accrual by at most max_accrual_dt (10) slots, and a crank with nothing
-    // to do fails its transaction, so every transaction carries exactly the cranks it needs, up
-    // to 8 (80 slots): enough to outrun the chain and catch up from a long idle gap.
-    for _ in 0..40 {
-        let now = rpc.get_slot().map_err(|e| e.to_string())?;
+    // to do fails its transaction, so every transaction carries exactly the cranks it needs: up
+    // to 8 (80 slots) on an asset with positions (~125k CU each), up to 30 on an idle one (~45k).
+    // An idle asset gets at most 3 transactions per keeper pass, so a long backlog on one never
+    // starves assets with positions.
+    for pass in 0..40 {
+        let now = match rpc.get_slot() {
+            Ok(n) => n,
+            Err(_) => { sleep(Duration::from_millis(1500)); continue; }
+        };
         let (_, g, _) = market_state(rpc, market);
-        let last = g.assets[v.asset_index as usize].slot_last;
+        let a = &g.assets[v.asset_index as usize];
+        let last = a.slot_last;
         if last + 2 >= now {
             return Ok(());
         }
-        let k = ((now - last + 9) / 10).min(8) as usize;
+        let busy = a.oi_eff_long_q != 0 || a.oi_eff_short_q != 0;
+        if !busy && pass >= 3 {
+            return Ok(());
+        }
+        let cap = if busy { 8 } else { 30 };
+        let k = ((now - last + 9) / 10).min(cap) as usize;
         let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 1 };
         let ix = prog(ProgIx::PermissionlessCrank { now_slot: now, observations: vec![hint] }, vec![
             AccountMeta::new(payer.pubkey(), true),
@@ -317,10 +337,106 @@ fn crank_vault(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState
             if e.contains("0x16") {
                 return Ok(()); // NonProgress: someone else caught it up meanwhile
             }
+            if e.contains("429") {
+                sleep(Duration::from_millis(1500)); // RPC rate limit: back off, keep catching up
+                continue;
+            }
             return Err(e);
         }
     }
     Ok(())
+}
+
+/// Percolator's market-wide loss-stale flag stays up while any stored position on the asset an
+/// instruction last touched holds K/F snapshots from before that asset's last price move, and
+/// every price move marks all of them stale. Insurance withdrawals (harvesting, retiring) are
+/// refused while it is up, so after bringing an asset current the keeper cranks each portfolio
+/// with a stale leg on it, at the same slot, which settles the leg without moving the price.
+fn settle_stale_legs(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState) -> Result<usize, String> {
+    use solana_client::{rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig}, rpc_filter::{Memcmp, RpcFilterType}};
+    use std::mem::{offset_of, size_of};
+    let (_, g, _) = market_state(rpc, market);
+    let asset = &g.assets[v.asset_index as usize];
+    let cfg = RpcProgramAccountsConfig {
+        filters: Some(vec![
+            RpcFilterType::DataSize(perc::PORTFOLIO_ACCOUNT_LEN as u64),
+            RpcFilterType::Memcmp(Memcmp::new_raw_bytes(perc::PORTFOLIO_MARKET_OFF, market.to_bytes().to_vec())),
+        ]),
+        account_config: RpcAccountInfoConfig { encoding: Some(solana_account_decoder::UiAccountEncoding::Base64), ..Default::default() },
+        ..Default::default()
+    };
+    let portfolios = rpc.get_program_accounts_with_config(&perc::PERCOLATOR_PROGRAM_ID, cfg).map_err(|e| e.to_string())?;
+    let legs = 16 + offset_of!(percolator::PortfolioAccountV16Account, legs);
+    let leg_len = size_of::<percolator::PortfolioLegV16Account>();
+    let rd_u64 = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    let mut stale = Vec::new();
+    for (key, acct) in portfolios {
+        let d = &acct.data;
+        for i in 0..percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let l = legs + i * leg_len;
+            if d.len() < l + leg_len
+                || d[l + offset_of!(percolator::PortfolioLegV16Account, active)] != 1
+                || u32::from_le_bytes(d[l + 1..l + 5].try_into().unwrap()) != v.asset_index as u32
+            {
+                continue;
+            }
+            let snap = rd_u64(d, l + offset_of!(percolator::PortfolioLegV16Account, kf_epoch_snap));
+            let epoch = if d[l + offset_of!(percolator::PortfolioLegV16Account, side)] == 0 { asset.kf_epoch_long } else { asset.kf_epoch_short };
+            if snap < epoch {
+                stale.push(key);
+            }
+        }
+    }
+    let oracle = push_feed_account(&v.oracle_feeds[0]);
+    let now = rpc.get_slot().map_err(|e| e.to_string())?;
+    let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 1 };
+    let n = stale.len();
+    for chunk in stale.chunks(8) {
+        let ixs = chunk.iter().map(|pf| prog(ProgIx::PermissionlessCrank { now_slot: now, observations: vec![hint.clone()] }, vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*pf, false),
+            AccountMeta::new_readonly(oracle, false),
+        ])).collect();
+        if let Err(e) = send(rpc, payer, ixs, &[]) {
+            if !e.contains("0x16") {
+                return Err(e); // NonProgress just means someone settled a leg meanwhile
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// Retires an operate-mode market nobody provides liquidity to, once the program allows it
+/// (no shares, no requests, listed `RETIRE_IDLE_EPOCHS` epochs ago), so its slot can be reused.
+/// Only possible once the program's governor PDA is the market's authority.
+fn maybe_retire(rpc: &RpcClient, payer: &Keypair, k: &VaultKeys, v: &VaultState, now: u64) -> Option<Result<String, String>> {
+    let idle_since = v.listed_slot.saturating_add(v.epoch_len_slots.saturating_mul(percolator_vault::processor::RETIRE_IDLE_EPOCHS));
+    if v.mode != state::MODE_OPERATE || v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0 || now < idle_since {
+        return None;
+    }
+    let (cfg, _, data) = market_state(rpc, &k.market);
+    if cfg.marketauth != state::governor_address(&percolator_vault::id(), &k.market).0.to_bytes() {
+        return None;
+    }
+    let supply = rpc.get_token_supply(&k.share_mint).ok()?.amount.parse::<u64>().ok()?;
+    if supply != 0 {
+        return None;
+    }
+    let asset_epoch = pstate::read_asset_control_sequences(&data, v.asset_index as usize).ok()?.authority_epoch;
+    let market_epoch = pstate::read_asset_control_sequences(&data, 0).ok()?.authority_epoch;
+    Some(send(rpc, payer, vec![client::retire_market(k, asset_epoch, market_epoch)], &[]))
+}
+
+/// One-time: makes the program's governor PDA the market authority (the payer must hold it now).
+fn accept_governance(rpc: &RpcClient, admin: &Keypair, market: &Pubkey) {
+    let (_, _, data) = market_state(rpc, market);
+    let epoch = pstate::read_asset_control_sequences(&data, 0).unwrap().authority_epoch;
+    let ix = client::accept_governance(&percolator_vault::id(), &admin.pubkey(), market, epoch);
+    match send(rpc, admin, vec![ix], &[]) {
+        Ok(s) => println!("governor {} is now the market authority ({s})", state::governor_address(&percolator_vault::id(), market).0),
+        Err(e) => eprintln!("accept governance: {e}"),
+    }
 }
 
 fn crank(rpc: &RpcClient, payer: &Keypair, m: &Value, v: &VaultState) -> Result<(), String> {
@@ -368,17 +484,38 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                 continue;
             }
             let now = rpc.get_slot().unwrap_or(0);
-            // Accrual only matters while positions are open; idle markets are left alone so the
-            // keeper stays well inside RPC rate limits.
-            let busy = market_state(rpc, &k.market).1.assets.get(v.asset_index as usize)
-                .map(|a| a.oi_eff_long_q != 0 || a.oi_eff_short_q != 0)
-                .unwrap_or(false);
-            if busy {
+            // Assets with positions are kept current every pass. Idle assets are kept within 40
+            // slots: the first trade on an asset must bring it current in its own transaction, and
+            // one that fell thousands of slots behind could never be traded again.
+            // Only canonical markets are kept current while idle (old creator vaults are not).
+            let lag = market_state(rpc, &k.market).1.assets.get(v.asset_index as usize)
+                .map(|a| if a.oi_eff_long_q != 0 || a.oi_eff_short_q != 0 { u64::MAX }
+                    else if v.vault_kind == state::KIND_CANONICAL { now.saturating_sub(a.slot_last) } else { 0 })
+                .unwrap_or(0);
+            if lag > 40 {
                 if let Err(e) = crank_vault(rpc, payer, &k.market, &v) {
                     eprintln!("{} crank: {}", k.vault, e.lines().next().unwrap_or(""));
+                } else if lag == u64::MAX && tick % 5 == 0 {
+                    match settle_stale_legs(rpc, payer, &k.market, &v) {
+                        Ok(0) => {}
+                        Ok(n) => println!("{} settled {n} stale position(s)", k.vault),
+                        Err(e) => eprintln!("{} settle: {}", k.vault, e.lines().next().unwrap_or("")),
+                    }
                 }
             }
-            let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots;
+            if tick % 15 == 0 {
+                match maybe_retire(rpc, payer, &k, &v, now) {
+                    Some(Ok(s)) => {
+                        println!("{} retired idle market on asset {} ({s})", k.vault, { v.asset_index });
+                        continue;
+                    }
+                    Some(Err(e)) => eprintln!("{} retire: {}", k.vault, e.lines().next().unwrap_or("")),
+                    None => {}
+                }
+            }
+            // A roll fails while the vault still holds a position, so an overdue epoch is only
+            // retried every 10th pass to stay inside RPC rate limits.
+            let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots && tick % 10 == 0;
             if tick % 15 != 0 && !epoch_over {
                 continue;
             }
@@ -527,7 +664,8 @@ fn main() {
             println!("{}", faucet(&rpc, &admin, &to, usdc * USDC));
         }
         Some("keeper") => keeper(&rpc, &admin),
+        Some("accept-governance") => accept_governance(&rpc, &admin, &key(&load(), "market")),
         Some("status") => status(&rpc),
-        _ => eprintln!("usage: devnet setup-market | create-vault | faucet <pubkey> <usdc> | keeper | status"),
+        _ => eprintln!("usage: devnet setup-market | create-vault | faucet <pubkey> <usdc> | keeper | accept-governance | status"),
     }
 }

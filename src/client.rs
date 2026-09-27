@@ -319,3 +319,39 @@ pub fn claim_opener_fees(k: &VaultKeys, opener: &Pubkey, dest: &Pubkey) -> Instr
         data: vec![processor::TAG_CLAIM_OPENER_FEES],
     }
 }
+
+/// Hands the market's `marketauth` to the program's governor PDA (signed by the current one).
+pub fn accept_governance(program: &Pubkey, current: &Pubkey, market: &Pubkey, authority_epoch: u64) -> Instruction {
+    Instruction {
+        program_id: *program,
+        accounts: vec![
+            AccountMeta::new_readonly(*current, true),
+            ro(state::governor_address(program, market).0),
+            w(*market),
+            ro(perc::PERCOLATOR_PROGRAM_ID),
+        ],
+        data: with_u64(processor::TAG_ACCEPT_GOVERNANCE, authority_epoch),
+    }
+}
+
+/// Retires an idle vault's market (no depositors, no requests, no position, listed long enough).
+pub fn retire_market(k: &VaultKeys, asset_authority_epoch: u64, market_authority_epoch: u64) -> Instruction {
+    let mut data = with_u64(processor::TAG_RETIRE_MARKET, asset_authority_epoch);
+    data.extend_from_slice(&market_authority_epoch.to_le_bytes());
+    Instruction {
+        program_id: k.program,
+        accounts: vec![
+            w(k.vault),
+            w(k.market),
+            ro(state::governor_address(&k.program, &k.market).0),
+            ro(k.share_mint),
+            ro(k.portfolio),
+            w(k.buffer),
+            w(k.percolator_vault),
+            ro(k.percolator_vault_authority),
+            ro(spl_token::ID),
+            ro(perc::PERCOLATOR_PROGRAM_ID),
+        ],
+        data,
+    }
+}
