@@ -23,6 +23,8 @@ export const PERC_VAULT = new PublicKey(M.percolator_vault);
 export const PERC_VAULT_AUTH = new PublicKey(M.percolator_vault_authority);
 export const PUSH_ORACLE = new PublicKey("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
 export const USDC = 1_000_000;
+/** Epoch length of every canonical vault on devnet (the program's CANON_EPOCH_LEN_SLOTS). */
+export const CANON_EPOCH_LEN_SLOTS = 1_500;
 export const UNIT = 1_000_000n; // Percolator POS_SCALE: 1 unit = 1 whole token
 export const SHARE_DECIMALS = 9;
 export const VAULT_LEN = L.vault_len;
@@ -188,6 +190,21 @@ export const marketHeader = (d: Uint8Array) => {
   }
   return { nextMarketId: u64(d, L.market_header.next_market_id), slots, listSlot };
 };
+
+let slotSecs = 0.4;
+/** Seconds per slot, as measured by `measureSlotSeconds` (0.4 until then). */
+export const slotSeconds = () => slotSecs;
+/** Measures the cluster's recent slot time; epochs and approvals are counted in slots. */
+export async function measureSlotSeconds(conn: Connection) {
+  try {
+    const samples = await conn.getRecentPerformanceSamples(5);
+    const slots = samples.reduce((a, s) => a + s.numSlots, 0);
+    if (slots > 0) slotSecs = samples.reduce((a, s) => a + s.samplePeriodSecs, 0) / slots;
+  } catch {
+    // keep the previous estimate
+  }
+  return slotSecs;
+}
 
 /** Pyth price (e6 atoms per whole token) and publish time from a sponsored price account. */
 export function decodePyth(d: Uint8Array) {

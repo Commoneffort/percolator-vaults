@@ -6,7 +6,6 @@ import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-t
 import * as C from "./chain";
 import Docs from "./Docs";
 
-const SLOT_SECONDS = 0.4;
 const num = (x: bigint, scale: number) => Number(x) / scale;
 const fmt = (x: number, dp = 2) => x.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 const usd = (atoms: bigint, dp = 2) => `$${fmt(num(atoms, C.USDC), dp)}`;
@@ -83,6 +82,8 @@ export default function App() {
   const refresh = useCallback(() => setTick(t => t + 1), []);
   const [send, busy, toast, clearToast] = useSend(refresh);
   const page = route[0] ?? "";
+  const { connection } = useConnection();
+  useEffect(() => { C.measureSlotSeconds(connection).then(refresh); }, [connection, refresh]);
 
   return (
     <div className="page">
@@ -193,7 +194,7 @@ function MarketCard({ c, go }: { c: Card; go: (to: string) => void }) {
       <div className="mc-row"><span>Liquidity</span><b>{usd(c.nav, 0)}</b></div>
       <div className="mc-row"><span>Open interest</span><b>{units(c.asset.oiLong)} {sym}</b></div>
       <div className="mc-row"><span>Fees</span><b>{usd(c.v.feesHarvested + c.asset.insurance)}</b></div>
-      <div className="mc-row"><span>Epoch</span><b>{String(c.v.epoch)} · {Math.round(Number(c.v.epochLen) * SLOT_SECONDS / 60)} min</b></div>
+      <div className="mc-row"><span>Epoch</span><b>{String(c.v.epoch)} · {Math.round(Number(c.v.epochLen) * C.slotSeconds() / 60)} min</b></div>
     </button>
   );
 }
@@ -370,7 +371,7 @@ function EpochStat({ state }: { state: C.State }) {
   return (
     <Stat
       label={`Epoch ${v.epoch}`}
-      value={left > 0n ? `${Math.max(1, Math.ceil(Number(left) * SLOT_SECONDS / 60))} min left` : settling ? "Settling" : "Rolling"}
+      value={left > 0n ? `${Math.max(1, Math.ceil(Number(left) * C.slotSeconds() / 60))} min left` : settling ? "Settling" : "Rolling"}
       sub={`${usd(v.pendingDeposit)} in · ${shares(v.pendingWithdraw)} shares out`}
     />
   );
@@ -691,7 +692,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <h3>The rules every market gets</h3>
         <div className="row"><span>Vault position limit</span><b>3× its NAV</b></div>
         <div className="row"><span>Largest single fill</span><b>0.75× its NAV</b></div>
-        <div className="row"><span>Epoch</span><b>about 10 minutes</b></div>
+        <div className="row"><span>Epoch</span><b>about {Math.round(C.CANON_EPOCH_LEN_SLOTS * C.slotSeconds() / 60)} minutes</b></div>
         <div className="row"><span>Insurance kept for traders</span><b>$100</b></div>
         <div className="row"><span>Price</span><b>Pyth, ≤ 5 min old</b></div>
         <div className="row"><span>Leverage, fee</span><b>10×, 0.05%</b></div>

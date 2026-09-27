@@ -1,4 +1,5 @@
 import M from "./devnet.json";
+import { CANON_EPOCH_LEN_SLOTS, slotSeconds } from "./chain";
 
 const ex = (k: string) => `https://explorer.solana.com/address/${k}?cluster=devnet`;
 const A = ({ k }: { k: string }) => <a className="mono" href={ex(k)} target="_blank" rel="noreferrer">{k}</a>;
@@ -13,6 +14,7 @@ const TOC = [
   ["pricing", "Share pricing"],
   ["fees", "Fees and yield"],
   ["risks", "Risks"],
+  ["roadmap", "Roadmap: front-running"],
   ["security", "Security model"],
   ["instructions", "Instruction reference"],
   ["keeper", "Keepers"],
@@ -37,7 +39,7 @@ function Diagram() {
       <g className="d-box accent"><rect x="330" y="200" width="240" height="84" rx="10" /><text x="450" y="232">Vault program</text><text x="450" y="252" className="d-sub">matcher + pool + market owner</text><text x="450" y="268" className="d-sub">no admin instruction</text></g>
       <g className="d-box"><rect x="20" y="210" width="170" height="64" rx="10" /><text x="105" y="238">Liquidity providers</text><text x="105" y="258" className="d-sub">deposit, share 90% of fees</text></g>
       <g className="d-box"><rect x="710" y="210" width="170" height="64" rx="10" /><text x="795" y="238">Market opener</text><text x="795" y="258" className="d-sub">earns 10% of fees</text></g>
-      <g className="d-box"><rect x="330" y="340" width="240" height="64" rx="10" /><text x="450" y="368">Keeper (anyone)</text><text x="450" y="388" className="d-sub">cranks, rolls, harvests</text></g>
+      <g className="d-box"><rect x="330" y="340" width="240" height="64" rx="10" /><text x="450" y="368">Keeper (anyone)</text><text x="450" y="388" className="d-sub">cranks, rolls, harvests, retires</text></g>
       <path className="d-line" d="M190,72 L330,72" markerEnd="url(#arr)" /><text x="260" y="62" className="d-label">TradeCpi</text>
       <path className="d-line" d="M710,72 L570,72" markerEnd="url(#arr)" /><text x="640" y="62" className="d-label">price</text>
       <path className="d-line" d="M430,114 L430,200" markerEnd="url(#arr)" /><text x="424" y="160" className="d-label end">asks for a fill</text>
@@ -109,6 +111,7 @@ export default function Docs() {
           <li><b>Trade.</b> Takers trade through Percolator's <code>TradeCpi</code> with the vault as counterparty.</li>
           <li><b>Harvest.</b> <code>HarvestFees</code> (anyone) moves insurance above the floor into the buffer; 10% is set aside for the opener.</li>
           <li><b>Stay live.</b> After an epoch ends with requests waiting, the vault only takes position-reducing fills. If a taker holds a position so the vault can't go flat, <code>Unwind</code> (anyone, one epoch later) makes the vault close its own position through Percolator's unilateral <code>RebalanceReduce</code>.</li>
+          <li><b>Retire.</b> Once a market has had no liquidity providers for three epochs and holds no position, <code>RetireMarket</code> (anyone) pays its leftover insurance to the opener and has Percolator retire the asset. The next market opened reuses the slot, and the same feed can be opened again later.</li>
           <li><b>Wind down.</b> If the market is resolved, <code>SettleResolved</code> closes the portfolio through Percolator's resolved path; queued deposits are refunded, and shares redeem pro rata with <code>RedeemTerminal</code>.</li>
         </ol>
 
@@ -118,12 +121,12 @@ export default function Docs() {
           <tbody>
             <tr><td>Vault position limit</td><td>3× the vault's NAV in notional, at the current price</td></tr>
             <tr><td>Largest single fill</td><td>0.75× the vault's NAV</td></tr>
-            <tr><td>Epoch</td><td>1,500 slots (about 10 minutes) on devnet</td></tr>
+            <tr><td>Epoch</td><td>{CANON_EPOCH_LEN_SLOTS.toLocaleString()} slots (about {Math.round(CANON_EPOCH_LEN_SLOTS * slotSeconds() / 60)} minutes at the current slot time) on devnet</td></tr>
             <tr><td>Insurance floor</td><td>100 USDC kept in insurance for traders; only fees above it are harvested</td></tr>
             <tr><td>Price</td><td>Pyth, at most 300 seconds old; Percolator falls back to a smoothed mark when stale</td></tr>
             <tr><td>Leverage and fee</td><td>10× (10% initial margin) and a 0.05% base fee per side, set by the market</td></tr>
             <tr><td>Opener's share</td><td>10% of harvested fees, forever, with no other powers</td></tr>
-            <tr><td>Matcher approval</td><td>renewed for about a day at every roll; anyone can renew it with <code>RefreshMatcher</code></td></tr>
+            <tr><td>Matcher approval</td><td>216,000 slots (about {Math.round(216_000 * slotSeconds() / 3600)} hours), renewed at every roll; anyone can renew it with <code>RefreshMatcher</code></td></tr>
           </tbody>
         </table>
         <p>Because limits are multiples of NAV, an empty vault quotes nothing and every deposit makes the market deeper. Percolator's own margin checks apply on top.</p>
@@ -151,11 +154,23 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
         <h2 id="risks">Risks</h2>
         <ul>
           <li><b>Directional.</b> If traders win overall, depositors lose. Caps bound the vault's exposure to 3× its NAV.</li>
-          <li><b>Oracle latency.</b> Traders who see prices before Pyth can pick off the vault. Percolator's per-slot price cap and the staleness bound limit this; they do not remove it.</li>
-          <li><b>Market authority.</b> The Percolator market's own admin can shut an asset down (with an exit window) or resolve the market. The vault then winds down and pays out.</li>
+          <li><b>Front-running (open).</b> Every fill happens immediately, at the market's mark, which follows Pyth. A trader who sees the real price first, for example on a centralized exchange, can trade against the vault at a stale mark. Percolator's per-slot price cap and the 300-second staleness bound do not stop this; during a fast move the capped mark lags even further. The fix is designed but not built yet: see <a href="#/docs" onClick={e => { e.preventDefault(); document.getElementById("roadmap")?.scrollIntoView({ behavior: "smooth" }); }}>Roadmap</a>.</li>
+          <li><b>Market authority.</b> On devnet, Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
           <li><b>Smart contracts.</b> Unaudited code. The program is upgradeable on devnet; a mainnet deployment must burn that authority.</li>
           <li><b>Keepers.</b> Everything is permissionless, but someone has to send the transactions. If nobody does, epochs don't roll and prices don't update.</li>
+          <li><b>Percolator fixes.</b> Devnet runs our Percolator integration branch, which includes fixes not yet merged upstream, among them the one that makes permissionless listing work while traders hold open positions (<a href="https://github.com/aeyakovenko/percolator-prog/pull/447" target="_blank" rel="noreferrer">percolator-prog #447</a>).</li>
         </ul>
+
+        <h2 id="roadmap">Roadmap: front-running</h2>
+        <p>The fix is two-step fills, built as a small router program next to the vault. It is designed, not built:</p>
+        <ol>
+          <li>A trader queues a request (size, limit price). The request records the time it was made.</li>
+          <li>After a short delay, anyone executes it at the first Pyth price published after the request. The executor must supply that exact signed price, so who executes it, and when, does not change the fill. Seeing a price before Pyth is then worth nothing.</li>
+          <li>A queued request cannot be cancelled inside its window (otherwise a trader could cancel whenever the price moved against them); it only lapses if nobody executes it in time, and then nothing moves.</li>
+          <li>Percolator only accepts a trade signed by the trading account's owner, so each trader's account is owned by an address derived from their wallet, which only the router can sign for. Withdrawals from it can only go back to that wallet.</li>
+          <li>The vault's matcher refuses fills that do not come through the router.</li>
+        </ol>
+        <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is burned before mainnet. Keepers cannot censor a trader, because anyone, including the trader, can execute a request.</p>
 
         <h2 id="security">Security model</h2>
         <table className="doc-table">
@@ -163,15 +178,16 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <tbody>
             <tr><td>Opener</td><td>Pick the feed; claim 10% of harvested fees</td><td>Choose any parameter; open a second market for a feed; move funds; pause</td></tr>
             <tr><td>Depositors</td><td>Queue deposits and withdrawals, claim, redeem after wind-down</td><td>Affect other depositors' prices</td></tr>
-            <tr><td>Anyone</td><td>Roll, harvest, convert, renew, unwind, settle, sweep</td><td>Choose amounts or destinations: value only moves into the vault's own accounts</td></tr>
+            <tr><td>Anyone</td><td>Roll, harvest, convert, renew, unwind, settle, sweep, retire an idle market</td><td>Choose amounts or destinations: value only moves into the vault's own accounts, or to the opener when a market is retired</td></tr>
             <tr><td>Takers</td><td>Trade within the caps</td><td>Call the matcher directly, route fills through another LP, or lock withdrawals</td></tr>
+            <tr><td>Governor (program address)</td><td>Retire an idle, empty market through <code>RetireMarket</code></td><td>Anything else: the program has no other instruction that uses Percolator's market authority</td></tr>
           </tbody>
         </table>
-        <p>The program is tested against the production Percolator binary in LiteSVM, with 38 tests:</p>
+        <p>The program is tested against the production Percolator binary in LiteSVM, with 39 tests:</p>
         <ul>
           <li><b>Property tests</b>: withdrawals never exceed NAV, deposit-then-withdraw never profits, incumbents are never diluted, fills never break the caps.</li>
           <li><b>Layout tests</b>: every account offset and every Percolator instruction encoding is checked against Percolator's own types and decoder.</li>
-          <li><b>Flows</b>: open, deposit, trade, roll, withdraw; fee harvest and the opener's share; gains and losses reaching depositors exactly; maintenance fees; market resolution with everyone paid out; one vault per feed; caps scaling with NAV.</li>
+          <li><b>Flows</b>: open, deposit, trade, roll, withdraw; fee harvest and the opener's share; gains and losses reaching depositors exactly; maintenance fees; market resolution with everyone paid out; one vault per feed; caps scaling with NAV; retiring an idle market and reopening its feed in the freed slot.</li>
           <li><b>Attacks</b>: forged matcher calls, a foreign LP routing fills through the vault, inventory caps, rolling while not flat, reduce-only enforcement, matcher expiry and renewal, early, doubled, stolen and forged claims, fake buffers, donations, the inflation attack, bad parameters, double listing, sweeps, and a trader holding a position to lock withdrawals.</li>
         </ul>
 
@@ -192,6 +208,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>28</td><td>Unwind</td><td>anyone</td><td>Liveness backstop: the vault closes its own position</td></tr>
             <tr><td>23 / 24</td><td>SettleResolved / RedeemTerminal</td><td>anyone / holder</td><td>Wind-down after market resolution</td></tr>
             <tr><td>25</td><td>Sweep</td><td>anyone</td><td>Moves stray vault-owned collateral into the buffer</td></tr>
+            <tr><td>31</td><td>RetireMarket</td><td>anyone</td><td>Frees the slot of an idle market (no shares, no requests, no position, listed 3+ epochs ago); leftover insurance goes to the opener</td></tr>
+            <tr><td>30</td><td>AcceptGovernance</td><td>market authority</td><td>One-time: hands Percolator's market authority to the program's governor address</td></tr>
           </tbody>
         </table>
 
@@ -199,9 +217,10 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
         <p>
           Nothing needs a trusted operator, but someone has to send maintenance transactions. The reference keeper
           (<code>cargo run --example devnet --features devnet -- keeper</code>) discovers every vault of the program and, for each:
-          cranks its asset while positions are open (each crank advances accrual by at most 10 slots), harvests fees above the
-          floor, converts released profit, rolls the epoch when it ends, and calls <code>Unwind</code> if an epoch is overdue by a
-          full epoch. Anyone can run another one.
+          keeps its asset's price accrual current (each crank advances it by at most 10 slots; idle markets are kept within 40
+          slots so their first trade can catch up), settles positions left out of date by a price move, harvests fees above the
+          floor, converts released profit, rolls the epoch when it ends, calls <code>Unwind</code> if an epoch is overdue by a
+          full epoch, and retires idle markets. Anyone can run another one.
         </p>
 
         <h2 id="integrate">Integrating</h2>
@@ -215,6 +234,12 @@ data:     tag 10 | taker portfolio id, position epoch | LP portfolio id, positio
           builders in <code>app/src/chain.ts</code> and the Rust builders in <code>src/client.rs</code> cover every instruction.
           Each wallet's trading portfolio for an asset lives at <code>createWithSeed(wallet, "pv1-asset-&lt;index&gt;", Percolator)</code>.
         </p>
+        <p>
+          Percolator refuses new risk while the asset a transaction touches is behind the market clock, or while any position on it
+          has not been settled since the last price move. The app therefore puts permissionless cranks in front of each trade:
+          enough to bring the asset current, one per out-of-date position, and it drops any the chain reports as having nothing to
+          do (<code>prepareTrade</code> in <code>chain.ts</code>).
+        </p>
 
         <h2 id="addresses">Devnet addresses</h2>
         <table className="doc-table">
@@ -225,12 +250,13 @@ data:     tag 10 | taker portfolio id, position epoch | LP portfolio id, positio
             <tr><td>Test USDC</td><td><A k={M.collateral_mint} /></td></tr>
           </tbody>
         </table>
-        <p className="muted small">The Percolator program was deployed from the exact build the vault is tested against (engine 6de466b, program fac4cd66 on the integration branch).</p>
+        <p className="muted small">The Percolator program was deployed from the exact build the vault is tested against (engine 6de466b, program 27d758ed on the integration branch). The market's authority is the vault program's governor address.</p>
 
         <h2 id="mainnet">Path to mainnet</h2>
         <ol>
           <li>Build against the final, audited Percolator program ID (a compile-time constant; the devnet build already swaps it).</li>
-          <li>Either create a market with permissionless listing enabled, or list into an existing one whose admin enables it.</li>
+          <li>Create a market with permissionless listing enabled and hand its market authority to the governor with <code>AcceptGovernance</code>, or list into an existing market (whose authority then keeps its powers).</li>
+          <li>Build the front-running fix (two-step fills, see Roadmap).</li>
           <li>Audit the vault program, then burn its upgrade authority (or put it behind a public timelock).</li>
           <li>Set mainnet template values (for example one-hour epochs) and a real collateral with its freeze authority revoked.</li>
           <li>Run redundant keepers and a Pyth price pusher.</li>
