@@ -51,6 +51,7 @@ const dv = (d: Uint8Array) => new DataView(d.buffer, d.byteOffset, d.byteLength)
 const u64 = (d: Uint8Array, o: number) => dv(d).getBigUint64(o, true);
 const u32 = (d: Uint8Array, o: number) => dv(d).getUint32(o, true);
 const u16 = (d: Uint8Array, o: number) => dv(d).getUint16(o, true);
+const i64 = (d: Uint8Array, o: number) => dv(d).getBigInt64(o, true);
 const u128 = (d: Uint8Array, o: number) => u64(d, o) + (u64(d, o + 8) << 64n);
 const i128 = (d: Uint8Array, o: number) => {
   const v = u128(d, o);
@@ -214,8 +215,9 @@ export function decodePyth(d: Uint8Array) {
   const price = dv(d).getBigInt64(off, true);
   const expo = dv(d).getInt32(off + 16, true);
   const publish = Number(dv(d).getBigInt64(off + 20, true));
+  const prev = Number(dv(d).getBigInt64(off + 28, true));
   const e6 = expo <= -6 ? price / 10n ** BigInt(-6 - expo) : price * 10n ** BigInt(expo + 6);
-  return { e6, publish };
+  return { e6, publish, prev };
 }
 
 export type Ticket = { epoch: bigint; deposit: bigint; withdraw: bigint };
@@ -250,8 +252,6 @@ export const matcherDelegate = (portfolio: PublicKey, vault: PublicKey) =>
   )[0];
 export const ata = (owner: PublicKey, mint: PublicKey) => getAssociatedTokenAddressSync(mint, owner);
 /** Each wallet has one trading portfolio per market, at a deterministic address. */
-export const portfolioSeed = (asset: number) => `pv1-asset-${asset}`;
-export const portfolioAddress = (owner: PublicKey, asset: number) => PublicKey.createWithSeed(owner, portfolioSeed(asset), PERCOLATOR);
 export const PORTFOLIO_LEN = L.portfolio.len;
 
 // ---- instruction data ----
@@ -372,32 +372,6 @@ export function depth(s: State): { long: bigint; short: bigint } {
 }
 
 // ---- Percolator (trader side) ----
-export const initPortfolio = (owner: PublicKey, portfolio: PublicKey) =>
-  new TransactionInstruction({ programId: PERCOLATOR, keys: [ro(owner, true), rw(MARKET), rw(portfolio)], data: new W().u8(1).done() });
-
-export const percDeposit = (owner: PublicKey, portfolio: PublicKey, p: Portfolio, amount: bigint) =>
-  new TransactionInstruction({
-    programId: PERCOLATOR,
-    keys: [ro(owner, true), rw(MARKET), rw(portfolio), rw(ata(owner, MINT)), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID)],
-    data: new W().u8(3).u64(p.id).u64(p.sequence).i128(amount).done(),
-  });
-
-export const percWithdraw = (owner: PublicKey, portfolio: PublicKey, p: Portfolio, amount: bigint) =>
-  new TransactionInstruction({
-    programId: PERCOLATOR,
-    keys: [ro(owner, true), rw(MARKET), rw(portfolio), rw(ata(owner, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID)],
-    data: new W().u8(4).u64(p.id).u64(p.sequence).i128(amount).done(),
-  });
-
-
-/** Candidate cranks that bring the market current before a trade. The engine's market-wide
- *  loss-stale flag is recomputed from the asset an instruction touches: that asset is stale while
- *  it lags the market clock, or while any stored position on it holds K/F snapshots from before the
- *  last price move (each price move marks every position on the asset stale). So each asset with
- *  open interest is brought to `slot` (one crank advances at most 10 slots), and every portfolio
- *  with a leg on it is cranked at that slot to settle the leg. Whether a catch-up crank moves the
- *  price is only known on chain, so the list can include cranks with nothing to do; `prepareTrade`
- *  drops those by simulation. The traded asset comes first. */
 export async function catchUpCranks(conn: Connection, v: Vault | null, payer: PublicKey): Promise<TransactionInstruction[]> {
   const [m, slot, vaults, portfolios] = await Promise.all([
     conn.getAccountInfo(MARKET, "confirmed"),
@@ -415,10 +389,12 @@ export async function catchUpCranks(conn: Connection, v: Vault | null, payer: Pu
     const a = decodeAsset(market, x.assetIndex);
     if (a.oiLong !== 0n || a.oiShort !== 0n) byAsset.set(x.assetIndex, x);
   }
+  // Vault assets are in authority-mark mode: a crank reads no oracle account (the mark only moves
+  // through the router), it just accrues toward the mark and settles positions.
   const crank = (x: Vault, portfolio: PublicKey) => new TransactionInstruction({
     programId: PERCOLATOR,
-    keys: [rw(payer, true), rw(MARKET), rw(portfolio), ro(x.oracle)],
-    data: new W().u8(5).u64(BigInt(slot)).u8(1).u16(x.assetIndex).u8(1).done(),
+    keys: [rw(payer, true), rw(MARKET), rw(portfolio)],
+    data: new W().u8(5).u64(BigInt(slot)).u8(1).u16(x.assetIndex).u8(0).done(),
   });
   // Without a traded asset the flag only has to come down: catching up a nearly current asset
   // with no positions (cheap cranks) recomputes it from that asset, which is never loss-stale.
@@ -479,20 +455,6 @@ export async function prepareTrade(conn: Connection, v: Vault | null, payer: Pub
 }
 
 /** The trader takes `sizeQ` (positive = long) against the vault through Percolator's TradeCpi. */
-export const tradeAgainstVault = (v: Vault, owner: PublicKey, portfolio: PublicKey, taker: Portfolio, lp: Portfolio, asset: Asset, sizeQ: bigint) =>
-  new TransactionInstruction({
-    programId: PERCOLATOR,
-    keys: [rw(owner, true), rw(MARKET), rw(portfolio), rw(v.lpPortfolio), ro(VAULT_PROGRAM), rw(v.key), ro(v.delegate)],
-    data: new W()
-      .u8(10)
-      .u64(taker.id).u64(taker.positionEpoch)
-      .u64(lp.id).u64(lp.positionEpoch).u64(lp.sequence)
-      .u16(v.assetIndex).u64(asset.marketId)
-      .i128(sizeQ).u64(100n).u64(0n).u16(0) // accept at most 1% in trading fees
-      .done(),
-  });
-
-// ---- reads ----
 export async function listVaults(conn: Connection): Promise<Vault[]> {
   const accs = await conn.getProgramAccounts(VAULT_PROGRAM, { commitment: "confirmed", filters: [{ dataSize: VAULT_LEN }] });
   return accs
@@ -505,12 +467,21 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
   const va = await conn.getAccountInfo(vaultKey, "confirmed");
   if (!va) throw new Error("vault not found");
   const v = decodeVault(vaultKey, new Uint8Array(va.data));
-  const pf = user ? await portfolioAddress(user, v.assetIndex) : undefined;
-  const keys = [MARKET, v.lpPortfolio, v.buffer, v.shareMint, v.oracle];
-  if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!);
+  // Traders trade through the router: their portfolio belongs to the router's address for them.
+  const pf = user ? routerPortfolio(user) : undefined;
+  const keys = [MARKET, v.lpPortfolio, v.buffer, v.shareMint, v.oracle, bookAddress(v.key)];
+  if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!, traderAddress(user));
   const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo(keys, "confirmed"), conn.getSlot("confirmed")]);
   const data = (i: number) => (accs[i] ? new Uint8Array(accs[i]!.data) : undefined);
   const tokenAmount = (d?: Uint8Array) => (d ? u64(d, 64) : 0n);
+  const book = data(5) ? decodeBook(data(5)!) : undefined;
+  const trader = user && data(10) ? decodeTrader(data(10)!) : undefined;
+  let pending: RouterRequest | undefined;
+  if (trader?.hasPending && trader.pendingVault.equals(v.key)) {
+    const k = requestAddress(v.key, trader.pendingId);
+    const ra = await conn.getAccountInfo(k, "confirmed");
+    if (ra) pending = decodeRequest(k, new Uint8Array(ra.data));
+  }
   return {
     slot: BigInt(slot),
     vault: v,
@@ -519,11 +490,14 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     buffer: tokenAmount(data(2)),
     shareSupply: data(3) ? u64(data(3)!, 36) : 0n,
     pyth: data(4) ? decodePyth(data(4)!) : undefined,
-    ticket: user && data(5) ? decodeTicket(data(5)!) : undefined,
-    userCollateral: user ? tokenAmount(data(6)) : 0n,
-    userShares: user ? tokenAmount(data(7)) : 0n,
+    book,
+    ticket: user && data(6) ? decodeTicket(data(6)!) : undefined,
+    userCollateral: user ? tokenAmount(data(7)) : 0n,
+    userShares: user ? tokenAmount(data(8)) : 0n,
     portfolioKey: pf,
-    portfolio: user && data(8) ? decodePortfolio(data(8)!, v.assetIndex) : undefined,
+    portfolio: user && data(9) ? decodePortfolio(data(9)!, v.assetIndex) : undefined,
+    trader,
+    pending,
   };
 }
 export type State = Awaited<ReturnType<typeof fetchVault>>;
@@ -535,3 +509,93 @@ export async function fetchMarket(conn: Connection) {
   const d = new Uint8Array((await conn.getAccountInfo(MARKET, "confirmed"))!.data);
   return { data: d, ...marketHeader(d) };
 }
+
+// ---- router: the only way to trade. A request fills at the first Pyth price published at or
+// after its target time (landing time + a fixed delay), so nobody can trade at a price they know.
+
+const R = L.router;
+export const ROUTER = new PublicKey(R.program);
+export const ROUTER_DELAY_SECS = R.delay_secs;
+export const ROUTER_GRACE_SECS = R.grace_secs;
+export const ROUTER_BOND_LAMPORTS = R.bond_lamports;
+const rpda = (...seeds: (Uint8Array | Buffer)[]) => PublicKey.findProgramAddressSync(seeds, ROUTER)[0];
+const u64le = (v: bigint) => new W().u64(v).done();
+export const routerAuthority = () => rpda(Buffer.from("authority"));
+export const traderAddress = (wallet: PublicKey) => rpda(Buffer.from("trader"), MARKET.toBuffer(), wallet.toBuffer());
+export const routerPortfolio = (wallet: PublicKey) => rpda(Buffer.from("portfolio"), MARKET.toBuffer(), wallet.toBuffer());
+export const routerCollateral = (wallet: PublicKey) => rpda(Buffer.from("collateral"), MARKET.toBuffer(), wallet.toBuffer());
+export const bookAddress = (vault: PublicKey) => rpda(Buffer.from("book"), vault.toBuffer());
+export const requestAddress = (vault: PublicKey, id: bigint) => rpda(Buffer.from("request"), vault.toBuffer(), u64le(id));
+
+export type Book = { vault: PublicKey; len: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[] };
+export function decodeBook(d: Uint8Array): Book {
+  const b = R.book;
+  const len = d[b.len];
+  const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, b.pending_target + 8 * i)) }));
+  return { vault: key(d, b.vault), len, markPublish: Number(i64(d, b.mark_publish_time)), markPrev: Number(i64(d, b.mark_prev_publish_time)), markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending };
+}
+export type RouterRequest = { key: PublicKey; vault: PublicKey; wallet: PublicKey; id: bigint; size: bigint; target: number };
+export const decodeRequest = (k: PublicKey, d: Uint8Array): RouterRequest => ({
+  key: k, vault: key(d, R.request.vault), wallet: key(d, R.request.wallet), id: u64(d, R.request.id), size: i128(d, R.request.size), target: Number(i64(d, R.request.target_time)),
+});
+export type Trader = { wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; pendingVault: PublicKey; pendingId: bigint };
+export const decodeTrader = (d: Uint8Array): Trader => ({
+  wallet: key(d, R.trader.wallet), portfolio: key(d, R.trader.portfolio), collateral: key(d, R.trader.collateral),
+  hasPending: d[R.trader.has_pending] === 1, pendingVault: key(d, R.trader.pending_vault), pendingId: u64(d, R.trader.pending_id),
+});
+
+/** An asset's next oracle observation sequence and its authority epoch (Percolator checks both). */
+export function controlSequences(market: Uint8Array, asset: number) {
+  const base = L.market.slots + asset * L.market.slot_len + L.market.control_sequences;
+  return { nextObservation: u64(market, base + L.market.oracle_observation) + 1n, authorityEpoch: u64(market, base + L.market.authority_epoch) };
+}
+
+export const openTradingAccount = (wallet: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(wallet, true), rw(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(routerCollateral(wallet)), rw(MARKET), ro(MINT), ro(PERCOLATOR), ro(SystemProgram.programId), ro(TOKEN_PROGRAM_ID)],
+  data: new W().u8(0).done(),
+});
+export const routerDeposit = (wallet: PublicKey, amount: bigint) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [ro(wallet, true), ro(traderAddress(wallet)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
+  data: new W().u8(1).u64(amount).done(),
+});
+export const routerWithdraw = (wallet: PublicKey, amount: bigint) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [ro(wallet, true), ro(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(routerCollateral(wallet)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
+  data: new W().u8(2).u64(amount).done(),
+});
+export const openBook = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), ro(vault), rw(bookAddress(vault)), ro(SystemProgram.programId)],
+  data: new W().u8(3).done(),
+});
+/** Queues a trade; `id` is the book's next id. It cannot be cancelled. */
+export const requestTrade = (wallet: PublicKey, vault: PublicKey, id: bigint, size: bigint) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
+  data: new W().u8(4).i128(size).done(),
+});
+/** Moves a vault's mark to a verified Pyth update (a PriceUpdateV2 account). */
+export const advanceMark = (v: Vault, pyth: PublicKey, market: Uint8Array) => {
+  const s = controlSequences(market, v.assetIndex);
+  return new TransactionInstruction({
+    programId: ROUTER,
+    keys: [ro(routerAuthority()), ro(v.key), rw(bookAddress(v.key)), rw(MARKET), ro(pyth), ro(VAULT_PROGRAM), ro(PERCOLATOR)],
+    data: new W().u8(5).u64(s.nextObservation).u64(s.authorityEpoch).done(),
+  });
+};
+/** Fills a request whose target the mark is at. Anyone can; the executor earns the bond. */
+export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [
+    rw(executor, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(v.key)), rw(v.key), rw(MARKET),
+    rw(routerPortfolio(r.wallet)), rw(v.lpPortfolio), ro(v.delegate), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
+  ],
+  data: new W().u8(6).done(),
+});
+export const expireRequest = (caller: PublicKey, r: RouterRequest) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [ro(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault))],
+  data: new W().u8(7).done(),
+});

@@ -1,7 +1,9 @@
 // Seeds clearly labelled demo activity on devnet: one liquidity provider that opens markets and
 // deposits, and three traders. Every wallet here is listed in api/_config.ts SEED_WALLETS, so the
-// site tags its activity as seeded. Run: npx tsx scripts/seed.ts <phase>   (phase: setup | trade)
-import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
+// site tags its activity as seeded. Trades are queued through the router; a running executor
+// (scripts/executor.ts) fills them.
+// Run: npx tsx scripts/seed.ts <phase>   (phase: setup | trade)
+import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruction } from "@solana/spl-token";
 import * as fs from "fs";
 import * as C from "../src/chain";
@@ -49,8 +51,7 @@ async function fund(kp: Keypair, usdc: number, sol: number) {
 async function openMarket(sym: string) {
   const f = C.FEEDS.find(x => x.symbol === sym)!;
   const vault = C.canonicalVaultAddress(f.id);
-  const acct = await conn.getAccountInfo(vault);
-  if (!acct) {
+  if (!(await conn.getAccountInfo(vault))) {
     const m = await C.fetchMarket(conn);
     await send(`open ${sym}: create vault`, LP, [C.initVault(LP.publicKey, f.id, m.nextMarketId).ix]);
   }
@@ -60,6 +61,7 @@ async function openMarket(sym: string) {
     const pyth = C.decodePyth(new Uint8Array((await conn.getAccountInfo(C.feedAccount(f.id)))!.data));
     await send(`open ${sym}: list`, LP, [C.listAsset(LP.publicKey, vault, f.id, m.listSlot, m.nextMarketId, pyth.e6)]);
   }
+  if (!(await conn.getAccountInfo(C.bookAddress(vault)))) await send(`open ${sym}: router book`, LP, [C.openBook(LP.publicKey, vault)]);
   return vault;
 }
 
@@ -77,52 +79,45 @@ async function setup() {
   console.log("wallets:", [LP, ...TRADERS].map(k => k.publicKey.toBase58()).join(" "));
 }
 
-async function portfolio(kp: Keypair, s: C.State) {
-  const pf = await C.portfolioAddress(kp.publicKey, s.vault.assetIndex);
-  if (!(await conn.getAccountInfo(pf))) {
-    await send(`${kp.publicKey.toBase58().slice(0, 6)} account for asset ${s.vault.assetIndex}`, kp, [
-      SystemProgram.createAccountWithSeed({ fromPubkey: kp.publicKey, basePubkey: kp.publicKey, seed: C.portfolioSeed(s.vault.assetIndex), newAccountPubkey: pf, lamports: await conn.getMinimumBalanceForRentExemption(C.PORTFOLIO_LEN), space: C.PORTFOLIO_LEN, programId: C.PERCOLATOR }),
-      C.initPortfolio(kp.publicKey, pf),
-    ]);
-  }
-  return pf;
+/** Opens the trader's router account (once) and tops up its margin. */
+async function account(kp: Keypair, margin: number) {
+  const ixs: TransactionInstruction[] = [];
+  if (!(await conn.getAccountInfo(C.traderAddress(kp.publicKey)))) ixs.push(C.openTradingAccount(kp.publicKey));
+  if (margin > 0) ixs.push(C.routerDeposit(kp.publicKey, BigInt(margin * C.USDC)));
+  if (ixs.length) await send(`${kp.publicKey.toBase58().slice(0, 6)} account + ${margin} margin`, kp, ixs);
 }
 
-async function trade(kp: Keypair, sym: string, size: number, margin: number) {
-  const vault = C.canonicalVaultAddress(C.FEEDS.find(x => x.symbol === sym)!.id);
-  let s = await C.fetchVault(conn, vault, kp.publicKey);
-  const pf = await portfolio(kp, s);
-  s = await C.fetchVault(conn, vault, kp.publicKey);
-  if (margin > 0) {
-    await send(`${kp.publicKey.toBase58().slice(0, 6)} margin ${margin} on ${sym}`, kp, [C.percDeposit(kp.publicKey, pf, s.portfolio!, BigInt(margin * C.USDC))]);
-    s = await C.fetchVault(conn, vault, kp.publicKey);
-  }
-  const q = BigInt(Math.round(size * 1e6));
-  const ixs = await C.prepareTrade(conn, s.vault, kp.publicKey, C.tradeAgainstVault(s.vault, kp.publicKey, pf, s.portfolio!, s.lp, s.asset, q));
-  await send(`${kp.publicKey.toBase58().slice(0, 6)} ${size > 0 ? "long" : "short"} ${Math.abs(size)} ${sym}`, kp, ixs);
-}
-
-async function closeAll(kp: Keypair, sym: string) {
+/** Queues a trade and waits for an executor to fill it (or for it to expire). */
+async function trade(kp: Keypair, sym: string, size: number) {
   const vault = C.canonicalVaultAddress(C.FEEDS.find(x => x.symbol === sym)!.id);
   const s = await C.fetchVault(conn, vault, kp.publicKey);
-  if (!s.portfolio || s.portfolio.position === 0n) return;
-  const ixs = await C.prepareTrade(conn, s.vault, kp.publicKey, C.tradeAgainstVault(s.vault, kp.publicKey, s.portfolioKey!, s.portfolio, s.lp, s.asset, -s.portfolio.position));
-  await send(`${kp.publicKey.toBase58().slice(0, 6)} close ${sym}`, kp, ixs);
+  if (!s.book) { console.log(`skip ${sym}: no router book`); return; }
+  const q = BigInt(Math.round(size * 1e6));
+  const label = `${kp.publicKey.toBase58().slice(0, 6)} ${size > 0 ? "long" : "short"} ${Math.abs(size)} ${sym}`;
+  if (!(await send(`queue ${label}`, kp, [C.requestTrade(kp.publicKey, vault, s.book.nextId, q)]))) return;
+  for (let i = 0; i < 60; i++) {
+    await sleep(2000);
+    const t = await conn.getAccountInfo(C.traderAddress(kp.publicKey));
+    if (t && !C.decodeTrader(new Uint8Array(t.data)).hasPending) {
+      const pos = (await C.fetchVault(conn, vault, kp.publicKey)).portfolio?.position ?? 0n;
+      console.log(`done ${label} -> position ${Number(pos) / 1e6}`);
+      return;
+    }
+  }
+  console.log(`still queued: ${label} (is an executor running?)`);
 }
 
 async function trades() {
   const [a, b, c] = TRADERS;
-  await trade(a, "SOL", 12, 600);
-  await trade(b, "SOL", -8, 500);
-  await trade(a, "BTC", 0.02, 400);
-  await trade(c, "ETH", 0.6, 500);
-  await trade(b, "ETH", -0.4, 400);
-  await trade(c, "BTC", -0.015, 300);
-  await sleep(45_000);
-  await closeAll(b, "SOL");
-  await trade(a, "SOL", 4, 0);
-  await closeAll(c, "ETH");
-  await trade(c, "SOL", -5, 300);
+  await account(a, 1_000);
+  await account(b, 900);
+  await account(c, 800);
+  await trade(a, "SOL", 12);
+  await trade(b, "SOL", -8);
+  await trade(a, "BTC", 0.02);
+  await trade(c, "ETH", 0.6);
+  await trade(b, "ETH", -0.4);
+  await trade(c, "BTC", -0.015);
 }
 
 (async () => {
@@ -131,11 +126,3 @@ async function trades() {
   else if (phase === "trade") await trades();
   else console.log("usage: seed.ts setup | trade");
 })();
-
-export async function retry() {
-  const [a, b, c] = TRADERS;
-  await trade(b, "SOL", -8, 0);
-  await trade(b, "ETH", -0.4, 0);
-  await trade(c, "BTC", -0.015, 300);
-}
-if (process.argv[2] === "retry") retry();

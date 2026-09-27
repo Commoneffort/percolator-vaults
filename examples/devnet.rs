@@ -301,9 +301,9 @@ fn push_feed_account(feed: &[u8; 32]) -> Pubkey {
 }
 
 /// Cranks a vault's asset until its accrual clock is current (each crank moves at most
-/// `max_accrual_dt_slots`), reading its Pyth account, with the LP portfolio as the target.
+/// `max_accrual_dt_slots`), with the LP portfolio as the target. Vault assets are in
+/// authority-mark mode, so a crank reads no oracle: only the router moves the mark.
 fn crank_vault(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState) -> Result<(), String> {
-    let oracle = push_feed_account(&v.oracle_feeds[0]);
     // Each crank advances accrual by at most max_accrual_dt (10) slots, and a crank with nothing
     // to do fails its transaction, so every transaction carries exactly the cranks it needs: up
     // to 8 (80 slots) on an asset with positions (~125k CU each), up to 30 on an idle one (~45k).
@@ -326,12 +326,11 @@ fn crank_vault(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &VaultState
         }
         let cap = if busy { 8 } else { 30 };
         let k = ((now - last + 9) / 10).min(cap) as usize;
-        let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 1 };
+        let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 0 };
         let ix = prog(ProgIx::PermissionlessCrank { now_slot: now, observations: vec![hint] }, vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(*market, false),
             AccountMeta::new(v.lp_portfolio, false),
-            AccountMeta::new_readonly(oracle, false),
         ]);
         if let Err(e) = send(rpc, payer, vec![ix; k], &[]) {
             if e.contains("0x16") {
@@ -387,16 +386,14 @@ fn settle_stale_legs(rpc: &RpcClient, payer: &Keypair, market: &Pubkey, v: &Vaul
             }
         }
     }
-    let oracle = push_feed_account(&v.oracle_feeds[0]);
     let now = rpc.get_slot().map_err(|e| e.to_string())?;
-    let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 1 };
+    let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 0 };
     let n = stale.len();
     for chunk in stale.chunks(8) {
         let ixs = chunk.iter().map(|pf| prog(ProgIx::PermissionlessCrank { now_slot: now, observations: vec![hint.clone()] }, vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(*market, false),
             AccountMeta::new(*pf, false),
-            AccountMeta::new_readonly(oracle, false),
         ])).collect();
         if let Err(e) = send(rpc, payer, ixs, &[]) {
             if !e.contains("0x16") {

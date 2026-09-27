@@ -463,57 +463,70 @@ function describe(tx: any, v: C.Vault): string {
 
 // ---------------------------------------------------------------- trade
 
+function PendingTrade({ r, sym, chainNow }: { r: C.RouterRequest; sym: string; chainNow: number }) {
+  const left = r.target - chainNow;
+  return (
+    <div className="callout small">
+      <b>{r.size > 0n ? "Long" : "Short"} {units(r.size < 0n ? -r.size : r.size)} {sym} queued.</b>{" "}
+      It fills at the first Pyth price published at or after {new Date(r.target * 1000).toLocaleTimeString()}
+      {left > 0 ? ` (in ${left}s)` : ""}. Nobody can know that price yet, including you, so nobody can trade
+      ahead of it. It cannot be cancelled; if no executor fills it within {C.ROUTER_GRACE_SECS}s it expires and
+      nothing is traded.
+    </div>
+  );
+}
+
 function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
   const { publicKey } = useWallet();
-  const { connection } = useConnection();
   const [size, setSize] = useState("1");
   const [margin, setMargin] = useState("100");
-  const v = state.vault, p = state.portfolio, pf = state.portfolioKey, sym = v.feed?.symbol ?? "";
+  const v = state.vault, p = state.portfolio, sym = v.feed?.symbol ?? "";
   const notional = Number(size || 0) * num(state.asset.price, 1e6);
   const usdcAtoms = BigInt(Math.floor(Number(margin || 0) * C.USDC));
+  const pendingHere = state.pending;
+  const pendingElsewhere = !!state.trader?.hasPending && !pendingHere;
+  const locked = !!state.trader?.hasPending;
+  const chainNow = Math.floor(Date.now() / 1000);
 
-  const create = async () => {
-    if (!publicKey || !pf) return;
-    await send("Create trading account", [
-      SystemProgram.createAccountWithSeed({
-        fromPubkey: publicKey, basePubkey: publicKey, seed: C.portfolioSeed(v.assetIndex), newAccountPubkey: pf,
-        lamports: await connection.getMinimumBalanceForRentExemption(C.PORTFOLIO_LEN), space: C.PORTFOLIO_LEN, programId: C.PERCOLATOR,
-      }),
-      C.initPortfolio(publicKey, pf),
-    ]);
+  const create = () => {
+    if (!publicKey) return;
+    send("Create trading account", [C.openTradingAccount(publicKey)]);
   };
-  const trade = async (sign: 1n | -1n) => {
-    if (!publicKey || !pf || !p) return;
-    const q = BigInt(Math.round(Number(size) * 1e6)) * sign;
-    send(`${sign > 0n ? "Long" : "Short"} ${size} ${sym}`, await C.prepareTrade(connection, v, publicKey, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, q)));
+  const request = (q: bigint, label: string) => {
+    if (!publicKey || !state.book) return;
+    send(label, [C.requestTrade(publicKey, v.key, state.book.nextId, q)]);
   };
-  const close = async () => {
-    if (!publicKey || !pf || !p || p.position === 0n) return;
-    send("Close position", await C.prepareTrade(connection, v, publicKey, C.tradeAgainstVault(v, publicKey, pf, p, state.lp, state.asset, -p.position)));
-  };
+  const trade = (sign: 1n | -1n) => request(BigInt(Math.round(Number(size) * 1e6)) * sign, `Queue ${sign > 0n ? "long" : "short"} ${size} ${sym}`);
+  const close = () => p && p.position !== 0n && request(-p.position, "Queue close");
 
   return (
     <>
       <section className="card">
-        <h3>Your {sym} account</h3>
-        {!publicKey ? <p className="muted">Connect a wallet to trade.</p> : !p ? (
+        <h3>Your trading account</h3>
+        {!publicKey ? <p className="muted">Connect a wallet to trade.</p> : !state.trader ? (
           <>
-            <p className="muted small">Trading needs a Percolator account for this market (about 0.067 devnet SOL of rent, yours to reclaim).</p>
+            <p className="muted small">
+              Trading goes through the router, so your Percolator account is held by a program address derived from your
+              wallet: only the router can trade it, and withdrawals can only go back to this wallet. One account covers
+              every market (about 0.07 devnet SOL of rent).
+            </p>
             <button className="btn primary wide" disabled={!!busy} onClick={create}>Create trading account</button>
             <Faucet />
           </>
         ) : (
           <>
-            <div className="row"><span>Margin</span><b>{usd(p.capital)}</b></div>
-            <div className="row"><span>Position</span><b className={p.position > 0n ? "up" : p.position < 0n ? "down" : ""}>{units(p.position)} {sym}</b></div>
-            <div className="row"><span>Position value</span><b>${fmt(Math.abs(num(p.position, 1e6)) * num(state.asset.price, 1e6))}</b></div>
+            <div className="row"><span>Margin</span><b>{usd(p?.capital ?? 0n)}</b></div>
+            <div className="row"><span>{sym} position</span><b className={(p?.position ?? 0n) > 0n ? "up" : (p?.position ?? 0n) < 0n ? "down" : ""}>{units(p?.position ?? 0n)} {sym}</b></div>
+            <div className="row"><span>Position value</span><b>${fmt(Math.abs(num(p?.position ?? 0n, 1e6)) * num(state.asset.price, 1e6))}</b></div>
             <div className="row"><span>Wallet test USDC</span><b>{usd(state.userCollateral)}</b></div>
             <label className="field"><span>USDC</span><input value={margin} onChange={e => setMargin(e.target.value)} inputMode="decimal" /></label>
             <div className="btns">
               <button className="btn" disabled={!!busy || usdcAtoms <= 0n || usdcAtoms > state.userCollateral}
-                onClick={() => send("Add margin", [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.percDeposit(publicKey, pf!, p, usdcAtoms)])}>Add margin</button>
-              <button className="btn" disabled={!!busy || p.position !== 0n || usdcAtoms <= 0n || usdcAtoms > p.capital} onClick={() => send("Withdraw margin", [C.percWithdraw(publicKey, pf!, p, usdcAtoms)])}>Withdraw</button>
+                onClick={() => send("Add margin", [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.routerDeposit(publicKey, usdcAtoms)])}>Add margin</button>
+              <button className="btn" disabled={!!busy || locked || usdcAtoms <= 0n || usdcAtoms > (p?.capital ?? 0n)}
+                onClick={() => send("Withdraw margin", [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.routerWithdraw(publicKey, usdcAtoms)])}>Withdraw</button>
             </div>
+            {locked && <p className="muted small">Withdrawals are paused while a trade is queued.</p>}
             <Faucet />
           </>
         )}
@@ -523,11 +536,17 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
         <label className="field"><span>Size ({sym})</span><input value={size} onChange={e => setSize(e.target.value)} inputMode="decimal" /></label>
         <div className="muted small">Notional ≈ ${fmt(notional)} · margin ≈ ${fmt(notional / 10)} · fee ≈ ${fmt(notional * 0.0005)}</div>
         <div className="btns">
-          <button className="btn long" disabled={!p || !!busy} onClick={() => trade(1n)}>Long</button>
-          <button className="btn short" disabled={!p || !!busy} onClick={() => trade(-1n)}>Short</button>
+          <button className="btn long" disabled={!state.trader || !state.book || locked || !!busy} onClick={() => trade(1n)}>Long</button>
+          <button className="btn short" disabled={!state.trader || !state.book || locked || !!busy} onClick={() => trade(-1n)}>Short</button>
         </div>
-        <button className="btn ghost wide" disabled={!p || p.position === 0n || !!busy} onClick={close}>Close position</button>
-        <p className="muted small">Trades settle at Percolator's mark price. The vault may fill less than you ask when it nears its position limit or is settling an epoch.</p>
+        <button className="btn ghost wide" disabled={!p || p.position === 0n || locked || !!busy} onClick={close}>Close position</button>
+        {pendingHere && <PendingTrade r={pendingHere} sym={sym} chainNow={chainNow} />}
+        {pendingElsewhere && <p className="muted small">You have a trade queued on another market; it has to fill or expire first.</p>}
+        <p className="muted small">
+          Every trade is queued and fills at the first Pyth price published {C.ROUTER_DELAY_SECS} seconds after your
+          request lands, so no one can trade against a price they already know. The vault may fill less than you ask
+          when it nears its position limit or is settling an epoch.
+        </p>
       </section>
     </>
   );
@@ -649,11 +668,10 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
     // Listing appends a new asset slot, so read the market right before it.
     const m = await C.fetchMarket(connection);
     const pyth = C.decodePyth(new Uint8Array((await connection.getAccountInfo(C.feedAccount(feed.id)))!.data));
-    // Listing is refused while the market-wide loss-stale flag is up, so it carries the same
-    // catch-up cranks as a trade.
     const listed = await send(`List ${feed.symbol}-PERP`, [
       createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
-      ...await C.prepareTrade(connection, null, publicKey, C.listAsset(publicKey, vault, feed.id, m.listSlot, m.nextMarketId, pyth.e6)),
+      C.listAsset(publicKey, vault, feed.id, m.listSlot, m.nextMarketId, pyth.e6),
+      C.openBook(publicKey, vault),
     ]);
     await load();
     if (!listed) return setStep(0);

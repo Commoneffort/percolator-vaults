@@ -526,7 +526,7 @@ fn export_layout_for_frontend() {
         "vault": f!(V, o, magic, status, share_decimals, market, creator, seed, collateral_mint, share_mint, buffer, share_escrow,
             lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_inventory_abs,
             epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, vault_kind, position_nav_bps, fill_nav_bps, opener_fees_owed, opener_fees_total, asset_market_id, inventory, epoch, epoch_start_slot,
-            pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested, listed_slot),
+            pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested, listed_slot, armed_size, armed_slot),
         "vault_len": state::VAULT_ACCOUNT_LEN,
         "ticket": f!(Ticket, 0, vault, owner, epoch, deposit_assets, withdraw_shares),
         "ticket_len": size_of::<Ticket>(),
@@ -546,6 +546,19 @@ fn export_layout_for_frontend() {
             "active": offset_of!(percolator::PortfolioLegV16Account, active),
             "kf_epoch_snap": offset_of!(percolator::PortfolioLegV16Account, kf_epoch_snap)
         },
+        "router": {
+            "program": percolator_router::id().to_string(),
+            "book": f!(percolator_router::state::Book, 0, vault, len, mark_publish_time, mark_prev_publish_time, mark_price, next_id, forfeited_bonds, pending_id, pending_target),
+            "book_len": size_of::<percolator_router::state::Book>(),
+            "request": f!(percolator_router::state::Request, 0, vault, wallet, id, size, target_time, created_slot),
+            "request_len": size_of::<percolator_router::state::Request>(),
+            "trader": f!(percolator_router::state::TraderState, 0, market, wallet, portfolio, collateral, has_pending, pending_vault, pending_id),
+            "trader_len": size_of::<percolator_router::state::TraderState>(),
+            "max_pending": percolator_router::state::MAX_PENDING,
+            "delay_secs": percolator_router::DELAY_SECS,
+            "grace_secs": percolator_router::GRACE_SECS,
+            "bond_lamports": percolator_router::BOND_LAMPORTS
+        },
         "market_header": {
             "next_market_id": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, next_market_id),
             "max_market_slots": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, config) + offset_of!(percolator::V16ConfigAccount, max_market_slots),
@@ -560,7 +573,10 @@ fn export_layout_for_frontend() {
             "lifecycle": offset_of!(percolator::AssetStateV16Account, lifecycle),
             "kf_epoch_long": offset_of!(percolator::AssetStateV16Account, kf_epoch_long),
             "kf_epoch_short": offset_of!(percolator::AssetStateV16Account, kf_epoch_short),
-            "ins_budget_long": 515, "ins_budget_short": 531, "ins_spent_long": 547, "ins_spent_short": 563 }
+            "ins_budget_long": 515, "ins_budget_short": 531, "ins_spent_long": 547, "ins_spent_short": 563,
+            "control_sequences": percolator_prog::constants::ASSET_CONTROL_SEQUENCES_OFF,
+            "oracle_observation": offset_of!(percolator_prog::state::AssetControlSequencesV16, oracle_observation),
+            "authority_epoch": offset_of!(percolator_prog::state::AssetControlSequencesV16, authority_epoch) }
     });
     std::fs::create_dir_all("app/src").unwrap();
     std::fs::write("app/src/layout.json", serde_json::to_string_pretty(&layout).unwrap()).unwrap();

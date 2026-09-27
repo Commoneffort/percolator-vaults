@@ -20,6 +20,8 @@ export default {
     "side": 13
   },
   "market": {
+    "authority_epoch": 16,
+    "control_sequences": 424,
     "effective_price": 25,
     "engine": 512,
     "ins_budget_long": 515,
@@ -32,6 +34,7 @@ export default {
     "market_id": 0,
     "oi_long": 289,
     "oi_short": 305,
+    "oracle_observation": 0,
     "slot_last": 41,
     "slot_len": 1813,
     "slots": 1190
@@ -54,6 +57,44 @@ export default {
     "pnl": 164,
     "sequence": 9547
   },
+  "router": {
+    "bond_lamports": 2000000,
+    "book": {
+      "forfeited_bonds": 112,
+      "len": 73,
+      "mark_prev_publish_time": 88,
+      "mark_price": 96,
+      "mark_publish_time": 80,
+      "next_id": 104,
+      "pending_id": 120,
+      "pending_target": 376,
+      "vault": 8
+    },
+    "book_len": 632,
+    "delay_secs": 4,
+    "grace_secs": 30,
+    "max_pending": 32,
+    "program": "DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3",
+    "request": {
+      "created_slot": 104,
+      "id": 72,
+      "size": 80,
+      "target_time": 96,
+      "vault": 8,
+      "wallet": 40
+    },
+    "request_len": 120,
+    "trader": {
+      "collateral": 104,
+      "has_pending": 137,
+      "market": 8,
+      "pending_id": 176,
+      "pending_vault": 144,
+      "portfolio": 72,
+      "wallet": 40
+    },
+    "trader_len": 184
+  },
   "ticket": {
     "deposit_assets": 80,
     "epoch": 72,
@@ -63,6 +104,8 @@ export default {
   },
   "ticket_len": 104,
   "vault": {
+    "armed_size": 696,
+    "armed_slot": 712,
     "asset_index": 352,
     "asset_market_id": 576,
     "buffer": 216,

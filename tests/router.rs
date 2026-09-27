@@ -325,3 +325,19 @@ fn a_market_with_a_queued_request_cannot_be_retired() {
     w.send(vec![ix], &[&kp]).unwrap();
     w.send(vec![retire(&w)], &[]).unwrap();
 }
+
+/// The frontend and executor read an asset's control sequences at
+/// `MARKET_SLOTS_OFF + asset * MARKET_ASSET_SLOT_LEN + ASSET_CONTROL_SEQUENCES_OFF`.
+#[test]
+fn control_sequence_offsets_match_percolator() {
+    let mut w = live();
+    w.taker_trade(0, UNIT as i128).unwrap(); // moves the observation sequence past its initial value
+    let d = w.env.market_data(false);
+    for asset in [0usize, w.asset() as usize] {
+        let seq = percolator_prog::state::read_asset_control_sequences(&d, asset).unwrap();
+        let base = perc::MARKET_SLOTS_OFF + asset * perc::MARKET_ASSET_SLOT_LEN + percolator_prog::constants::ASSET_CONTROL_SEQUENCES_OFF;
+        let rd = |o: usize| u64::from_le_bytes(d[base + o..base + o + 8].try_into().unwrap());
+        assert_eq!(rd(0), seq.oracle_observation);
+        assert_eq!(rd(16), seq.authority_epoch);
+    }
+}
