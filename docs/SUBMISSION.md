@@ -1,6 +1,6 @@
 # Percolator Vaults: submission
 
-**One-liner.** Keyless perpetual markets with liquidity built in: anyone can open the market for a Pyth price feed on Anatoly Yakovenko's Percolator engine, and a vault program owns it, makes markets on it from one shared pool, and pays its fees to depositors and to whoever opened it.
+**One-liner.** Keyless perpetual markets with liquidity built in, that nobody can front-run: anyone can open the market for a Pyth price feed on Anatoly Yakovenko's Percolator engine, a vault program owns it and makes markets on it from one shared pool, and every trade fills at the first Pyth price published four seconds after it was requested, a price nobody could know when they traded.
 
 **Links**
 - Live app (Solana devnet): https://percolator-vaults.vercel.app
@@ -18,46 +18,53 @@ Percolator is a serious perpetual-futures risk engine: cross-margin, bounded pri
 
 Percolator also settles every trade at the market's mark price. A classic spread-quoting market maker earns nothing there. The income is in the trading fees, which go to whoever operates the asset.
 
+And a pool that fills trades immediately at an oracle price gets front-run. Pyth aggregates prices from exchanges and trading firms, so anyone watching those venues, Pyth's own publishers, anyone reading Pyth's off-chain feed before it is posted on Solana (we measured the shared devnet account at 225 seconds old), and validators or searchers who see pending price updates, can all trade against it at a price they already know. Depositors pay for every such trade.
+
 ## Solution
 
 A Solana program that turns "operate a Percolator market" into a pooled, permissionless, keyless product:
 
 - **One market per asset.** A vault's address is derived from (market, Pyth feed). The first person to open SOL-PERP creates *the* SOL market, and a second attempt fails on-chain. Every trader and every liquidity provider meets in one place.
 - **No keys.** The vault's own address signs the listing, so the vault becomes the market's admin, insurance operator and oracle authority. The program has no instruction that uses those powers. Every market runs on one fixed template, so nobody can open a market set up to fail.
+- **No front-running.** Every trade is a request that fills at exactly one price: the first Pyth price published at or after its target time (the moment it landed, plus 4 seconds). A router program, the only way to trade, moves the vault's mark only to verified Pyth prices, forward in time, never past a pending request's price, and fills requests permissionlessly, so neither the executor nor its timing changes the price. Requests cannot be cancelled and margin is locked until they fill, so nobody can back out after seeing the price. The vault's matcher refuses any fill the router did not arm.
 - **Built-in liquidity.** The vault program is also the matcher Percolator calls on every trade. It is the counterparty to all takers, with limits that scale with its value (up to 3× NAV in position, 0.75× per fill), so every deposit deepens the market.
 - **Yield.** Trading fees accumulate in the market's insurance. Anyone can harvest the part above a fixed floor into the vault: 90% goes to depositors, and 10% to whoever opened the market, forever, with no other powers (like Hyperliquid's HIP-3 deployer share).
 - **Fair exits.** Deposits and withdrawals queue and settle together at one price at the end of each epoch, when the vault is flat. Withdrawals are priced conservatively and deposits pay for unharvested fees, so neither side can take value from the other. If a trader holds a position to block exits, anyone can make the vault close its own position one epoch later.
 - **Dead markets clean up after themselves.** A market with no liquidity providers for three epochs and no position can be retired by anyone. Its leftover insurance goes to the opener, and its slot is reused by the next market. The program holds Percolator's market-level authority through a program address it uses for nothing else, so the market has no admin key at all.
-- **Everything is permissionless.** Rolling epochs, harvesting fees, renewing the matcher approval, closing positions, retiring idle markets and winding down after market resolution can all be called by anyone. The reference keeper does it automatically.
+- **Everything is permissionless.** Filling trades, moving marks, rolling epochs, harvesting fees, renewing the matcher approval, closing positions, retiring idle markets and winding down after market resolution can all be called by anyone. The reference keeper and executor do it automatically.
 
 ## What we built
 
-- **On-chain program** (Rust, native Solana, ~3,300 lines including off-chain client builders): vault, matcher, share accounting, market listing, fee harvesting, opener share, liveness backstop, wind-down.
-- **39 tests against Percolator's production binary** in LiteSVM, using Percolator's own test harness:
+- **Two on-chain programs** (Rust, native Solana, ~4,500 lines including off-chain client builders): the vault (matcher, share accounting, market listing, fee harvesting, opener share, liveness backstop, wind-down, retirement) and the router (trading accounts, requests, verified Pyth marks, fills, expiry).
+- **51 tests against Percolator's production binary** in LiteSVM, using Percolator's own test harness, every trade through the router:
+  - front-running attempts: trading on a known price, skipping or reordering Pyth updates, executor timing, direct trades, forged and unverified Pyth accounts, cancelling or withdrawing from a queued trade;
   - property tests for share math;
   - layout and encoding tests checked against Percolator's own types and decoder;
   - end-to-end flows, including retiring an idle market and reopening its feed;
-  - 16 attack scenarios: forged matcher calls, hijacked LP routing, forged or doubled claims, the first-depositor inflation attack, withdrawal lock-up, and more.
-- **Live devnet deployment:** a Percolator build identical to the tested one, the vault program, and live markets on Pyth feeds (SOL, BTC, ETH and more).
+  - 15 attack scenarios: forged matcher calls, hijacked LP routing, forged or doubled claims, the first-depositor inflation attack, withdrawal lock-up, and more.
+- **Live devnet deployment:** a Percolator build identical to the tested one, the vault and router programs, and markets on Pyth feeds (SOL, BTC, ETH). On devnet, a trade sent straight to a vault is refused on chain.
 - **Web app:**
   - markets directory, and a two-click "open a market" flow;
-  - trading, liquidity provision and opener fee claims;
+  - trading through the router (queue a trade, see its target time and fill), liquidity provision and opener fee claims;
   - live depth ("max trade now"), price chart and activity feed;
   - a leaderboard computed from chain data;
   - detailed docs;
   - a devnet burner wallet so anyone can try it without installing a wallet.
 - **Keeper** that discovers every vault and keeps it running: price accrual, settling out-of-date positions, rolls, harvests, retiring idle markets.
+- **Executor** that anyone can run: posts verified Pyth updates from Hermes, moves each vault's mark, fills queued trades at their price and expires late ones.
 - **Percolator fixes found while building it:** a Percolator bug blocked permissionless listing whenever any trader held open PnL; fixed on our integration branch, deployed on devnet, and submitted upstream (percolator-prog #447).
 
 ## Why it matters
 
-Percolator gives Solana an engine for permissionless perps. This gives it a working market structure on top: liquidity that concentrates per asset, markets nobody controls, and a reason for people to supply capital and to open new markets. It is built to go to mainnet against the final Percolator program: the Percolator ID is a compile-time constant, and the remaining steps (audit, burn the upgrade authority, mainnet template values) are documented.
+Percolator gives Solana an engine for permissionless perps. This gives it a working market structure on top: liquidity that concentrates per asset, markets nobody controls, and a reason for people to supply capital and to open new markets. It is built to go to mainnet against the final Percolator program: the Percolator ID is a compile-time constant, and the remaining steps (audit, burn both upgrade authorities, mainnet template values, redundant executors with Hermes access) are documented.
 
 ## Honest limits
 
 - Unaudited, and devnet only today.
 - The vault is the counterparty to all traders: depositors win if traders lose and pay if traders win. Fees are their compensation.
-- Front-running is open today. Fills happen immediately at the mark, which follows Pyth, so a trader who sees the real price first can trade against a stale mark. Percolator's per-slot price cap and our staleness bound do not stop this. The fix is designed and is next: two-step fills through a permissionless router, where a queued request is executed by anyone at the first Pyth price published after it, and cannot be cancelled inside its window. Who executes it, and when, then does not change the fill.
+- Trades take a few seconds: that delay is what makes the fill price one nobody could know in advance. Its protection assumes the chain clock is not more than a few seconds behind real time.
+- A request that cannot fill (for example after a price move larger than its 10% margin buffer) holds the market's mark at its price for at most 30 seconds before it expires, at the cost of its bond.
+- Executors need a Hermes API key to fetch Pyth updates; anyone can run one, and if nobody does, requests expire and nothing trades.
 - Demo activity on devnet is seeded by four wallets we control, and the site labels them "seed".
 
 ## Team

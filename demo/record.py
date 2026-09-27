@@ -143,7 +143,7 @@ def trade(s):
     pg.wait_for_selector("text=Add margin: confirmed", timeout=60000)
     s.type(pg.locator("label.field:has-text('Size') input"), "0.01")
     s.click(pg.get_by_role("button", name="Long", exact=True))
-    pg.wait_for_selector("text=/Long 0.01 BTC: confirmed|Long 0.01 BTC failed/", timeout=150000)
+    pg.wait_for_selector("text=/Queue long 0.01 BTC: confirmed|Queue long 0.01 BTC failed/", timeout=150000)
     pg.wait_for_timeout(2500)
     s.scroll(700, 2500)
     pg.wait_for_timeout(1500)

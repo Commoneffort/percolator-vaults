@@ -126,28 +126,36 @@ fn pyth_price_e6(rpc: &RpcClient) -> (u64, i64) {
 
 fn setup_market(rpc: &RpcClient, admin: &Keypair) {
     let mut m = load();
-    // Collateral: a test USDC we can mint freely.
-    let mint = Keypair::new();
-    let rent = rpc.get_minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN).unwrap();
-    send(rpc, admin, vec![
-        system_instruction::create_account(&admin.pubkey(), &mint.pubkey(), rent, spl_token::state::Mint::LEN as u64, &spl_token::ID),
-        spl_token::instruction::initialize_mint2(&spl_token::ID, &mint.pubkey(), &admin.pubkey(), None, 6).unwrap(),
-    ], &[&mint]).expect("create tUSDC mint");
-    println!("tUSDC mint {}", mint.pubkey());
+    // Collateral: a test USDC we can mint freely. An existing one (whose authority is the app's
+    // faucet) is kept, so a new market does not strand the faucet.
+    let mint_key = if m.get("collateral_mint").and_then(|v| v.as_str()).is_some() {
+        key(&m, "collateral_mint")
+    } else {
+        let mint = Keypair::new();
+        let rent = rpc.get_minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN).unwrap();
+        send(rpc, admin, vec![
+            system_instruction::create_account(&admin.pubkey(), &mint.pubkey(), rent, spl_token::state::Mint::LEN as u64, &spl_token::ID),
+            spl_token::instruction::initialize_mint2(&spl_token::ID, &mint.pubkey(), &admin.pubkey(), None, 6).unwrap(),
+        ], &[&mint]).expect("create tUSDC mint");
+        mint.pubkey()
+    };
+    println!("tUSDC mint {mint_key}");
 
     // Market account and Percolator's canonical collateral vault.
     let market = Keypair::new();
-    let len = pstate::market_account_len_for_capacity(1).unwrap();
+    // InitMarket starts with as many asset slots as max_portfolio_assets (below).
+    let len = pstate::market_account_len_for_capacity(4).unwrap();
     let rent = rpc.get_minimum_balance_for_rent_exemption(len).unwrap();
     let vault_auth = perc::vault_authority(&market.pubkey());
     send(rpc, admin, vec![
         system_instruction::create_account(&admin.pubkey(), &market.pubkey(), rent, len as u64, &perc::PERCOLATOR_PROGRAM_ID),
-        create_ata_idempotent(&admin.pubkey(), &vault_auth, &mint.pubkey()),
+        create_ata_idempotent(&admin.pubkey(), &vault_auth, &mint_key),
     ], &[&market]).expect("create market account");
     println!("market {}", market.pubkey());
 
+    // Each trader has one router account per market, so it can hold a few markets at once.
     let init = ProgIx::InitMarket {
-        max_portfolio_assets: 1,
+        max_portfolio_assets: 4,
         h_min: 0,
         h_max: 6_480_000,
         initial_price: USDC, // asset 0: the USD base unit, pinned at 1.0
@@ -173,7 +181,7 @@ fn setup_market(rpc: &RpcClient, admin: &Keypair) {
     send(rpc, admin, vec![prog(init, vec![
         AccountMeta::new(admin.pubkey(), true),
         AccountMeta::new(market.pubkey(), false),
-        AccountMeta::new_readonly(mint.pubkey(), false),
+        AccountMeta::new_readonly(mint_key, false),
     ])], &[]).expect("InitMarket");
 
     let slot = rpc.get_slot().unwrap();
@@ -202,9 +210,9 @@ fn setup_market(rpc: &RpcClient, admin: &Keypair) {
     m["network"] = json!("devnet");
     m["percolator_program"] = json!(perc::PERCOLATOR_PROGRAM_ID.to_string());
     m["vault_program"] = json!(percolator_vault::id().to_string());
-    m["collateral_mint"] = json!(mint.pubkey().to_string());
+    m["collateral_mint"] = json!(mint_key.to_string());
     m["market"] = json!(market.pubkey().to_string());
-    m["percolator_vault"] = json!(client::associated_token_address(&vault_auth, &mint.pubkey()).to_string());
+    m["percolator_vault"] = json!(client::associated_token_address(&vault_auth, &mint_key).to_string());
     m["percolator_vault_authority"] = json!(vault_auth.to_string());
     m["admin"] = json!(admin.pubkey().to_string());
     save(&m);
@@ -464,10 +472,11 @@ fn all_vaults(rpc: &RpcClient) -> Vec<(VaultKeys, VaultState)> {
         ..Default::default()
     };
     let accs = rpc.get_program_accounts_with_config(&percolator_vault::id(), cfg).unwrap_or_default();
+    let market = load().get("market").and_then(|v| v.as_str()).and_then(|s| Pubkey::from_str(s).ok());
     accs.into_iter()
         .filter_map(|(k, a)| {
             let v: VaultState = bytemuck::pod_read_unaligned(&a.data[state::VAULT_STATE_OFF..]);
-            if v.magic != state::VAULT_MAGIC || v.status != state::STATUS_ACTIVE {
+            if v.magic != state::VAULT_MAGIC || v.status != state::STATUS_ACTIVE || market.is_some_and(|m| m != v.market) {
                 return None;
             }
             let keys = if v.vault_kind == state::KIND_CANONICAL {
