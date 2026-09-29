@@ -272,7 +272,7 @@ function useVault(vaultKey: PublicKey, tick: number) {
     } catch (e: any) { setErr(e.message); }
   }, [connection, vaultKey.toString(), publicKey?.toString()]);
   useEffect(() => { setHistory([]); }, [vaultKey.toString()]);
-  useEffect(() => { load(); const id = setInterval(load, 4000); return () => clearInterval(id); }, [load, tick]);
+  useEffect(() => { load(); const id = setInterval(load, 6000); return () => clearInterval(id); }, [load, tick]);
   return { state, err, history, reload: load };
 }
 
@@ -403,13 +403,15 @@ function Activity({ vault, tick }: { vault: C.Vault; tick: number }) {
     let live = true;
     const load = async () => {
       try {
-        const sigs = (await connection.getSignaturesForAddress(vault.key, { limit: 12 }, "confirmed")).filter(s => !s.err);
-        const fresh = sigs.filter(s => !seen.current.has(s.signature));
-        if (fresh.length) {
-          const txs = await connection.getTransactions(fresh.map(s => s.signature), { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
-          txs.forEach((tx, i) => seen.current.set(fresh[i].signature, describe(tx, vault)));
+        const sigs = (await connection.getSignaturesForAddress(vault.key, { limit: 25 }, "confirmed")).filter(s => !s.err);
+        // A few new transactions per pass, one request each (public RPCs refuse batches).
+        for (const s of sigs.filter(s => !seen.current.has(s.signature)).slice(0, 4)) {
+          const tx = await connection.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+          seen.current.set(s.signature, describe(tx, vault));
         }
-        if (live) setRows(sigs.map(s => ({ sig: s.signature, when: s.blockTime ?? 0, what: seen.current.get(s.signature) ?? "Transaction" })));
+        // Price updates (the executor moving the mark every few seconds) are not activity.
+        const shown = sigs.filter(s => seen.current.has(s.signature) && seen.current.get(s.signature) !== "").slice(0, 12);
+        if (live) setRows(shown.map(s => ({ sig: s.signature, when: s.blockTime ?? 0, what: seen.current.get(s.signature)! })));
       } catch { /* public RPC may rate-limit history; keep the last list */ }
     };
     load();
@@ -455,6 +457,15 @@ function describe(tx: any, v: C.Vault): string {
       const lo = dv.getBigUint64(51, true), hi = dv.getBigInt64(59, true); // size_q follows ids, epochs, sequence, asset and market id
       const size = (hi << 64n) + lo;
       return `${size > 0n ? "Long" : "Short"} ${units(size < 0n ? -size : size)} ${v.feed?.symbol ?? ""} vs vault`;
+    }
+    if (program.equals(C.ROUTER)) {
+      if (data[0] === 4) {
+        const size = new DataView(data.buffer, data.byteOffset).getBigInt64(1, true); // low 64 bits of the i128 size
+        return `${size > 0n ? "Long" : "Short"} ${units(size < 0n ? -size : size)} ${v.feed?.symbol ?? ""} queued`;
+      }
+      if (data[0] === 5) return ""; // mark moved to a new Pyth price: not shown
+      if (data[0] === 6) return "Queued trade filled at its target price";
+      if (data[0] === 7) return "Queued trade expired unfilled";
     }
     if (program.equals(C.PERCOLATOR) && data[0] === 5) return "Keeper crank";
   }

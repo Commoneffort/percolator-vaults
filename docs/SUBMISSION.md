@@ -42,7 +42,7 @@ A Solana program that turns "operate a Percolator market" into a pooled, permiss
   - layout and encoding tests checked against Percolator's own types and decoder;
   - end-to-end flows, including retiring an idle market and reopening its feed;
   - 15 attack scenarios: forged matcher calls, hijacked LP routing, forged or doubled claims, the first-depositor inflation attack, withdrawal lock-up, and more.
-- **Live devnet deployment:** a Percolator build identical to the tested one, the vault and router programs, and markets on Pyth feeds (SOL, BTC, ETH). On devnet, a trade sent straight to a vault is refused on chain.
+- **Live devnet deployment:** a Percolator build identical to the tested one, the vault and router programs, and markets on Pyth feeds (SOL, BTC, ETH open; PYTH, DOGE, HYPE, gold and EUR can be opened by anyone). Trades are queued and filled through the router at their target Pyth price; a trade sent straight to a vault is refused on chain.
 - **Web app:**
   - markets directory, and a two-click "open a market" flow;
   - trading through the router (queue a trade, see its target time and fill), liquidity provision and opener fee claims;
@@ -51,12 +51,12 @@ A Solana program that turns "operate a Percolator market" into a pooled, permiss
   - detailed docs;
   - a devnet burner wallet so anyone can try it without installing a wallet.
 - **Keeper** that discovers every vault and keeps it running: price accrual, settling out-of-date positions, rolls, harvests, retiring idle markets.
-- **Executor** that anyone can run: posts verified Pyth updates from Hermes, moves each vault's mark, fills queued trades at their price and expires late ones.
+- **Executor** that anyone can run on Pyth's free plan: fetches each trade's target-time Pyth update from Hermes (a few requests per trade), posts it, fills the trade at it, keeps marks fresh between trades from Pyth's free sponsored feed accounts, and expires late requests.
 - **Percolator fixes found while building it:** a Percolator bug blocked permissionless listing whenever any trader held open PnL; fixed on our integration branch, deployed on devnet, and submitted upstream (percolator-prog #447).
 
 ## Why it matters
 
-Percolator gives Solana an engine for permissionless perps. This gives it a working market structure on top: liquidity that concentrates per asset, markets nobody controls, and a reason for people to supply capital and to open new markets. It is built to go to mainnet against the final Percolator program: the Percolator ID is a compile-time constant, and the remaining steps (audit, burn both upgrade authorities, mainnet template values, redundant executors with Hermes access) are documented.
+Percolator gives Solana an engine for permissionless perps. This gives it a working market structure on top: liquidity that concentrates per asset, markets nobody controls, and a reason for people to supply capital and to open new markets. It is built to go to mainnet against the final Percolator program: the Percolator ID is a compile-time constant, and the remaining steps (audit, burn both upgrade authorities, mainnet template values, redundant executors with Pyth API access) are documented.
 
 ## Honest limits
 
@@ -64,7 +64,7 @@ Percolator gives Solana an engine for permissionless perps. This gives it a work
 - The vault is the counterparty to all traders: depositors win if traders lose and pay if traders win. Fees are their compensation.
 - Trades take a few seconds: that delay is what makes the fill price one nobody could know in advance. Its protection assumes the chain clock is not more than a few seconds behind real time.
 - A request that cannot fill (for example after a price move larger than its 10% margin buffer) holds the market's mark at its price for at most 30 seconds before it expires, at the cost of its bond.
-- Executors need a Hermes API key to fetch Pyth updates; anyone can run one, and if nobody does, requests expire and nothing trades.
+- Executors need a Pyth API key (the free plan covers the markets offered) to fetch each trade's target-time update; anyone can run one, and if nobody does, requests expire and nothing trades.
 - Demo activity on devnet is seeded by four wallets we control, and the site labels them "seed".
 
 ## Team

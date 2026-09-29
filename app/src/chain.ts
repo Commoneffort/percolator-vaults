@@ -29,15 +29,17 @@ export const UNIT = 1_000_000n; // Percolator POS_SCALE: 1 unit = 1 whole token
 export const SHARE_DECIMALS = 9;
 export const VAULT_LEN = L.vault_len;
 
-/** Pyth feeds whose sponsored devnet accounts are kept fresh, and that fit a 6-decimal price. */
+/** The feeds on Pyth's free plan (the executor fetches their updates from Hermes), which have
+ *  shared devnet accounts and fit a 6-decimal price. */
 export const FEEDS = [
   { symbol: "SOL", name: "Solana", id: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d" },
   { symbol: "BTC", name: "Bitcoin", id: "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43" },
   { symbol: "ETH", name: "Ethereum", id: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace" },
-  { symbol: "JUP", name: "Jupiter", id: "0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996" },
-  { symbol: "WIF", name: "dogwifhat", id: "4ca4beeca86f0d164160323817a4e42b10010a724c2217c6ee41b54cd4cc61fc" },
   { symbol: "PYTH", name: "Pyth Network", id: "0bbf28e9a841a1cc788f6a361b17ca072d0ea3098a1e5df1c3922d06719579ff" },
-  { symbol: "RAY", name: "Raydium", id: "91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a" },
+  { symbol: "DOGE", name: "Dogecoin", id: "dcef50dd0a4cd2dcc17e45df1676dcb336a11a61c69df7a0299b0150c672d25c" },
+  { symbol: "HYPE", name: "Hyperliquid", id: "4279e31cc369bbcc2faf022b382b080e32a8e689ff20fbc530d2a603eb6cd98b" },
+  { symbol: "XAU", name: "Gold", id: "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2" },
+  { symbol: "EUR", name: "Euro", id: "a995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b" },
 ];
 export type Feed = (typeof FEEDS)[number];
 const hexBytes = (h: string) => Uint8Array.from(h.match(/../g)!.map(b => parseInt(b, 16)));
@@ -372,11 +374,11 @@ export function depth(s: State): { long: bigint; short: bigint } {
 }
 
 // ---- Percolator (trader side) ----
-export async function catchUpCranks(conn: Connection, v: Vault | null, payer: PublicKey): Promise<TransactionInstruction[]> {
+export async function catchUpCranks(conn: Connection, v: Vault | null, payer: PublicKey, knownVaults?: Vault[]): Promise<TransactionInstruction[]> {
   const [m, slot, vaults, portfolios] = await Promise.all([
     conn.getAccountInfo(MARKET, "confirmed"),
     conn.getSlot("confirmed"),
-    listVaults(conn),
+    knownVaults ?? listVaults(conn),
     conn.getProgramAccounts(PERCOLATOR, {
       commitment: "confirmed",
       filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }],
@@ -384,7 +386,10 @@ export async function catchUpCranks(conn: Connection, v: Vault | null, payer: Pu
   ]);
   const market = new Uint8Array(m!.data);
   const byAsset = new Map<number, Vault>();
-  for (const x of [...(v ? [v] : []), ...vaults.filter(x => x.canonical && x.status === 1)]) {
+  // The traded asset is always brought current (that is also what moves Percolator's price to a
+  // new mark), and so is every other asset with open positions.
+  if (v) byAsset.set(v.assetIndex, v);
+  for (const x of vaults.filter(x => x.canonical && x.status === 1 && x.market.equals(MARKET))) {
     if (byAsset.has(x.assetIndex)) continue;
     const a = decodeAsset(market, x.assetIndex);
     if (a.oiLong !== 0n || a.oiShort !== 0n) byAsset.set(x.assetIndex, x);
@@ -432,9 +437,9 @@ export async function catchUpCranks(conn: Connection, v: Vault | null, payer: Pu
 /** The trade (or any instruction gated on the market-wide loss-stale flag, such as a listing; pass
  *  `v = null` then) with the catch-up cranks it needs, found by simulating: a crank the engine rejects as
  *  having nothing to do (NonProgress, 0x16) is dropped and the rest simulated again. */
-export async function prepareTrade(conn: Connection, v: Vault | null, payer: PublicKey, trade: TransactionInstruction): Promise<TransactionInstruction[]> {
+export async function prepareTrade(conn: Connection, v: Vault | null, payer: PublicKey, trade: TransactionInstruction, knownVaults?: Vault[]): Promise<TransactionInstruction[]> {
   // ~75k CU per crank on an asset with positions; keep room for the trade itself.
-  let cranks = (await catchUpCranks(conn, v, payer)).slice(0, 14);
+  let cranks = (await catchUpCranks(conn, v, payer, knownVaults)).slice(0, 14);
   for (let round = 0; round < 12; round++) {
     const { blockhash } = await conn.getLatestBlockhash();
     const msg = new TransactionMessage({

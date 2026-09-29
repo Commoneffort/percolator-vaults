@@ -2,13 +2,13 @@
 // deposits, and three traders. Every wallet here is listed in api/_config.ts SEED_WALLETS, so the
 // site tags its activity as seeded. Trades are queued through the router; a running executor
 // (scripts/executor.ts) fills them.
-// Run: npx tsx scripts/seed.ts <phase>   (phase: setup | trade)
+// Run: npx tsx scripts/seed.ts <phase>   (phase: setup | trade | one <trader 1-3> <symbol> <size>)
 import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruction } from "@solana/spl-token";
 import * as fs from "fs";
 import * as C from "../src/chain";
 
-const conn = new Connection(process.env.RPC ?? C.RPC_URL, "confirmed");
+const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true });
 const KEYS = "../keys/seed";
 const deployer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(`${process.env.HOME}/.config/solana/percolator-test/deployer.json`, "utf8"))));
 const faucet = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("../keys/faucet.json", "utf8"))));
@@ -20,12 +20,24 @@ const wallet = (name: string) => {
 const LP = wallet("seed-lp");
 const TRADERS = [wallet("seed-trader-1"), wallet("seed-trader-2"), wallet("seed-trader-3")];
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+process.on("unhandledRejection", e => console.log("rpc", String((e as any)?.message ?? e).split("\n")[0].slice(0, 100)));
+
+/** Waits for a signature by polling (the public RPC rate-limits websockets). */
+async function confirmed(sig: string) {
+  for (let i = 0; i < 60; i++) {
+    await sleep(1500);
+    const st = (await conn.getSignatureStatuses([sig]).catch(() => null))?.value?.[0];
+    if (st?.err) throw new Error(`transaction failed: ${JSON.stringify(st.err)}`);
+    if (st?.confirmationStatus === "confirmed" || st?.confirmationStatus === "finalized") return;
+  }
+  throw new Error("not confirmed within 90 s");
+}
 
 async function send(label: string, kp: Keypair, ixs: TransactionInstruction[], extra: Keypair[] = []) {
   for (let i = 0; i < 3; i++) {
     try {
       const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs), [kp, ...extra]);
-      await conn.confirmTransaction(sig, "confirmed");
+      await confirmed(sig);
       console.log("ok  ", label);
       return true;
     } catch (e: any) {
@@ -96,8 +108,8 @@ async function trade(kp: Keypair, sym: string, size: number) {
   const label = `${kp.publicKey.toBase58().slice(0, 6)} ${size > 0 ? "long" : "short"} ${Math.abs(size)} ${sym}`;
   if (!(await send(`queue ${label}`, kp, [C.requestTrade(kp.publicKey, vault, s.book.nextId, q)]))) return;
   for (let i = 0; i < 60; i++) {
-    await sleep(2000);
-    const t = await conn.getAccountInfo(C.traderAddress(kp.publicKey));
+    await sleep(3000);
+    const t = await conn.getAccountInfo(C.traderAddress(kp.publicKey)).catch(() => null);
     if (t && !C.decodeTrader(new Uint8Array(t.data)).hasPending) {
       const pos = (await C.fetchVault(conn, vault, kp.publicKey)).portfolio?.position ?? 0n;
       console.log(`done ${label} -> position ${Number(pos) / 1e6}`);
@@ -124,5 +136,6 @@ async function trades() {
   const phase = process.argv[2];
   if (phase === "setup") await setup();
   else if (phase === "trade") await trades();
-  else console.log("usage: seed.ts setup | trade");
+  else if (phase === "one") await trade(TRADERS[Number(process.argv[3]) - 1], process.argv[4], Number(process.argv[5]));
+  else console.log("usage: seed.ts setup | trade | one <trader 1-3> <symbol> <size>");
 })();

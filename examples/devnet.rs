@@ -564,7 +564,7 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                 }
             }
         }
-        sleep(Duration::from_secs(3));
+        sleep(Duration::from_secs(15)); // epochs are ~6 minutes; this keeps the keeper inside public RPC limits
     }
 }
 

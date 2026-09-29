@@ -117,7 +117,17 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 Canonical epochs are 1,500 slots, about 6 minutes at devnet's current ~230 ms slots.
 
-All addresses are in `deploy/devnet.json`. Tooling: `cargo run --example devnet --features devnet -- setup-market | create-vault | keeper | accept-governance | retire-idle | status`. The executor (`app/scripts/executor.ts`) moves marks and fills requests; it needs a Hermes API key (`HERMES_URL`, `HERMES_API_KEY`).
+All addresses are in `deploy/devnet.json`. Tooling: `cargo run --example devnet --features devnet -- setup-market | create-vault | keeper | accept-governance | retire-idle | status`.
+
+### Running the executor on Pyth's free plan
+
+The executor (`app/scripts/executor.ts`) moves marks and fills requests. It needs a Pyth API key (Pyth's free plan is enough), read from `HERMES_API_KEY` or `~/.config/solana/percolator-test/hermes-key`; the endpoint is `https://pyth.dourolabs.app/hermes` (override with `HERMES_URL`).
+
+- **Feeds.** The free plan serves SOL, BTC, ETH, PYTH, DOGE, HYPE, XAU and EUR, so those are the markets the app offers (JUP, WIF, RAY, JTO, BONK and TRUMP are refused on the free plan).
+- **Usage.** Keeping marks fresh costs nothing: the executor uses Pyth's own sponsored on-chain feed accounts (updated at least every minute, or on a 0.5% move). Hermes is called only when a trade needs its exact target price: one request per target time, shared by every trade queued for it, plus one batched request every few minutes to refresh the feed accounts of markets not opened yet. That is a few Hermes requests per trade, far below the documented limit of 30 requests per 10 seconds. Pyth does not publish a monthly quota for the free plan; the executor backs off for a minute whenever Hermes answers 429.
+- **RPC.** It fits within the public devnet RPC's limits: one batched account read every 3 seconds, and confirmations by polling rather than websockets.
+
+`RPC=https://api.devnet.solana.com npx tsx scripts/executor.ts` (from `app/`).
 
 ## Layout
 
@@ -127,7 +137,7 @@ router/         the router program (requests, marks, fills) and its client build
 tests/          LiteSVM tests against the production Percolator binary
 examples/       devnet deployment and keeper
 app/            web app (Vite + React + wallet adapter), the devnet faucet API, and scripts (executor, seed)
-pusher/         Pyth price pusher for shared feed accounts (needs a Hermes API key)
+pusher/         standalone Pyth price pusher for shared feed accounts (needs a Pyth API key)
 ```
 
 See [SECURITY.md](SECURITY.md) for the threat model and known limits, the live [docs page](https://percolator-vaults.vercel.app/#/docs) for the full protocol description, [docs/SUBMISSION.md](docs/SUBMISSION.md) for the hackathon write-up and [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) for the demo.

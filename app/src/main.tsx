@@ -13,8 +13,10 @@ import { DevnetBurnerAdapter } from "./burner";
 
 function Root() {
   const wallets = useMemo(() => [new PhantomWalletAdapter(), new SolflareWalletAdapter(), new DevnetBurnerAdapter()], []);
+  // The public devnet RPC rate-limits hard; retrying every 429 multiplies the load, so the pages
+  // keep their last data and try again on their next refresh instead.
   return (
-    <ConnectionProvider endpoint={RPC_URL}>
+    <ConnectionProvider endpoint={RPC_URL} config={{ commitment: "confirmed", disableRetryOnRateLimit: true }}>
       <WalletProvider wallets={wallets} autoConnect>
         <WalletModalProvider>
           <App />

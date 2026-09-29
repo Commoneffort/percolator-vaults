@@ -3,7 +3,8 @@
 // and the volume of its trades against the vaults.
 import { Connection, PublicKey } from "@solana/web3.js";
 import L from "./_layout.js";
-import { FEED_SYMBOLS, MARKET, PERCOLATOR, SEED_WALLETS, VAULT_PROGRAM } from "./_config.js";
+import bs58 from "bs58";
+import { FEED_SYMBOLS, MARKET, PERCOLATOR, ROUTER, SEED_WALLETS, VAULT_PROGRAM } from "./_config.js";
 
 const dv = (d: Uint8Array) => new DataView(d.buffer, d.byteOffset, d.byteLength);
 const u64 = (d: Uint8Array, o: number) => dv(d).getBigUint64(o, true);
@@ -29,11 +30,20 @@ async function flowsFor(conn: Connection, portfolio: PublicKey): Promise<Flow> {
     const tx = txCache.get(s);
     if (!tx) continue;
     const msg = tx.transaction.message;
-    const keys: PublicKey[] = msg.staticAccountKeys ?? msg.accountKeys;
-    for (const ix of msg.compiledInstructions ?? []) {
-      if (!keys[ix.programIdIndex].equals(new PublicKey(PERCOLATOR))) continue;
+    const keys: PublicKey[] = [
+      ...(msg.staticAccountKeys ?? msg.accountKeys),
+      ...(tx.meta?.loadedAddresses?.writable ?? []).map((k: any) => new PublicKey(k)),
+      ...(tx.meta?.loadedAddresses?.readonly ?? []).map((k: any) => new PublicKey(k)),
+    ];
+    // Trades and margin moves reach Percolator from the router (inner instructions), or directly.
+    const ixs: { programIdIndex: number; accounts: number[]; data: Uint8Array }[] = [
+      ...(msg.compiledInstructions ?? []).map((ix: any) => ({ programIdIndex: ix.programIdIndex, accounts: ix.accountKeyIndexes, data: ix.data })),
+      ...(tx.meta?.innerInstructions ?? []).flatMap((inner: any) => inner.instructions.map((ix: any) => ({ programIdIndex: ix.programIdIndex, accounts: ix.accounts, data: bs58.decode(ix.data) }))),
+    ];
+    for (const ix of ixs) {
+      if (!keys[ix.programIdIndex]?.equals(new PublicKey(PERCOLATOR))) continue;
       const data: Uint8Array = ix.data;
-      const acct = (n: number) => keys[ix.accountKeyIndexes[n]];
+      const acct = (n: number) => keys[ix.accounts[n]];
       if (!acct(2)?.equals(portfolio)) continue;
       if (data[0] === 3) f.deposits += u128(data, 17);
       else if (data[0] === 4) f.withdrawals += u128(data, 17);
@@ -51,11 +61,15 @@ async function flowsFor(conn: Connection, portfolio: PublicKey): Promise<Flow> {
 async function build() {
   const conn = new Connection(process.env.RPC_URL ?? "https://api.devnet.solana.com", "confirmed");
   const P = L.portfolio;
-  const [portfolios, vaults, market] = await Promise.all([
+  const [portfolios, vaults, market, traders] = await Promise.all([
     conn.getProgramAccounts(new PublicKey(PERCOLATOR), { filters: [{ dataSize: P.len }, { memcmp: { offset: 16, bytes: MARKET } }] }),
     conn.getProgramAccounts(new PublicKey(VAULT_PROGRAM), { filters: [{ dataSize: L.vault_len }] }),
     conn.getAccountInfo(new PublicKey(MARKET)),
+    conn.getProgramAccounts(new PublicKey(ROUTER), { filters: [{ dataSize: L.router.trader_len }] }),
   ]);
+  // Router trading accounts own the traders' portfolios; rank them by the wallet behind them.
+  const walletOf = new Map<string, string>();
+  for (const t of traders) walletOf.set(t.pubkey.toBase58(), new PublicKey(new Uint8Array(t.account.data).slice(L.router.trader.wallet, L.router.trader.wallet + 32)).toBase58());
   const vaultKeys = new Set(vaults.map(v => v.pubkey.toBase58()));
   const symbols = new Map<number, string>();
   for (const v of vaults) {
@@ -72,8 +86,9 @@ async function build() {
   const byWallet = new Map<string, any>();
   for (const p of portfolios) {
     const d = new Uint8Array(p.account.data);
-    const owner = new PublicKey(d.slice(P.owner, P.owner + 32)).toBase58();
-    if (vaultKeys.has(owner)) continue; // vault LP portfolios are market makers, not traders
+    const portfolioOwner = new PublicKey(d.slice(P.owner, P.owner + 32)).toBase58();
+    if (vaultKeys.has(portfolioOwner)) continue; // vault LP portfolios are market makers, not traders
+    const owner = walletOf.get(portfolioOwner) ?? portfolioOwner;
     const f = await flowsFor(conn, p.pubkey);
     if (f.trades === 0) continue; // only wallets that have traded are ranked
     const equity = u128(d, P.capital) + i128(d, P.pnl);

@@ -180,7 +180,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Directional.</b> If traders win overall, depositors lose. Caps bound the vault's exposure to 3× its NAV.</li>
           <li><b>Chain clock.</b> A request's target comes from the chain clock (or the mark time, if later). The {ROUTER_DELAY_SECS}-second delay assumes the clock does not run more than a few seconds behind real time; Solana's clock normally tracks it within a second or two.</li>
           <li><b>A request that cannot fill.</b> If a request cannot fill (for example after a price move larger than its 10% margin buffer), the mark waits at its price until it expires, at most {ROUTER_GRACE_SECS} seconds, before moving on. The requester loses the bond; liquidations on that market wait that long.</li>
-          <li><b>Executors.</b> Moving marks and filling needs someone to post Pyth updates from Hermes (which needs an API key) and send the transactions. Anyone can; if nobody does, requests expire and nothing trades.</li>
+          <li><b>Executors.</b> Filling needs someone to fetch each target-time Pyth update from Hermes (which needs a Pyth API key; the free plan covers every market listed here) and send the transactions. Keeping marks fresh between trades uses Pyth's free sponsored feed accounts. Anyone with a key can run an executor; if nobody does, requests expire and nothing trades.</li>
           <li><b>Market authority.</b> On devnet, Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
           <li><b>Smart contracts.</b> Unaudited code. The program is upgradeable on devnet; a mainnet deployment must burn that authority.</li>
           <li><b>Keepers.</b> Everything is permissionless, but someone has to send the transactions. If nobody does, epochs don't roll and prices don't update.</li>
@@ -225,7 +225,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <tbody>
             <tr><td>0</td><td>matcher call</td><td>Percolator only</td><td>Sizes the fill the router armed, during its <code>TradeCpi</code></td></tr>
             <tr><td>16</td><td>InitVault</td><td>anyone</td><td>Creates the canonical vault for a feed and its accounts</td></tr>
-            <tr><td>26</td><td>ListAsset</td><td>anyone</td><td>Lists the vault's asset and configures its Pyth feed</td></tr>
+            <tr><td>26</td><td>ListAsset</td><td>anyone</td><td>Lists the vault's asset in authority-mark mode at a fresh, verified Pyth price</td></tr>
             <tr><td>17 / 18</td><td>RequestDeposit / RequestWithdraw</td><td>depositor</td><td>Queues a request for the current epoch</td></tr>
             <tr><td>19</td><td>RollEpoch</td><td>anyone</td><td>Settles the epoch while flat and redeploys capital</td></tr>
             <tr><td>20</td><td>Claim</td><td>depositor</td><td>Collects shares or collateral from a settled epoch</td></tr>
@@ -266,10 +266,11 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           full epoch, and retires idle markets. Anyone can run another one.
         </p>
         <p>
-          The executor (<code>app/scripts/executor.ts</code>) runs the router: it posts Pyth updates from Hermes and moves each
-          vault's mark to them (to the first update at or after the earliest pending target once that exists, otherwise to the
-          latest one every couple of seconds), fills requests whose price the mark has reached, and expires late ones. It needs
-          a Hermes API key. Anyone can run one; the program checks everything, and each fill pays its executor the request's bond.
+          The executor (<code>app/scripts/executor.ts</code>) runs the router. When a queued trade's target time has passed, it
+          fetches the first Pyth update at or after it from Hermes, posts it and moves the vault's mark to it, then fills the
+          trade; between trades it keeps the mark on Pyth's free sponsored feed account. It also expires late requests. It needs
+          a Pyth API key; the free plan covers every market listed here, and it makes only a few Hermes requests per trade.
+          Anyone can run one; the program checks everything, and each fill pays its executor the request's bond.
         </p>
 
         <h2 id="integrate">Integrating</h2>
