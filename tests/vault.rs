@@ -575,6 +575,7 @@ fn export_layout_for_frontend() {
             "stress_bps": percolator_router::STRESS_BPS as u64,
             "liquidation_bps": percolator_router::LIQUIDATION_BPS as u64,
             "reserve_bps": percolator_vault::processor::RESERVE_BPS,
+            "fallback_secs": percolator_vault::reporter::FALLBACK_SECS,
             "im_bps_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_INITIAL_MARGIN_BPS,
             "min_im_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_MIN_NONZERO_IM_REQ,
             "fee_bps_off": perc::WRAPPER_TRADE_FEE_BASE_BPS,

@@ -375,6 +375,24 @@ impl World {
         u64::from_le_bytes(self.env.svm.get_account(&self.share_mint).unwrap().data[36..44].try_into().unwrap())
     }
 
+    /// The test build's reporter key (see `percolator_vault::reporter`).
+    pub fn reporter(&mut self) -> Keypair {
+        let kp = solana_sdk::signer::keypair::keypair_from_seed(&[42; 32]).unwrap();
+        assert_eq!(kp.pubkey(), percolator_vault::reporter::REPORTER);
+        if self.env.svm.get_balance(&kp.pubkey()).unwrap_or(0) == 0 {
+            self.env.svm.airdrop(&kp.pubkey(), 1_000_000_000).unwrap();
+        }
+        kp
+    }
+
+    /// Posts a reported price for the vault's feed, signed by `signer`; returns its account.
+    pub fn post_report(&mut self, signer: &Keypair, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Result<Pubkey, String> {
+        let mut ix = rclient::post_price(&signer.pubkey(), &FEED, price_e6, publish_time, prev_publish_time);
+        ix.accounts[0].pubkey = signer.pubkey();
+        self.send(vec![ix], &[signer])?;
+        Ok(percolator_vault::reporter::report_address(&FEED).0)
+    }
+
     /// Renews the vault's matcher approval (anyone can; keepers do it periodically).
     pub fn refresh_matcher(&mut self) {
         let mut data = vec![percolator_vault::processor::TAG_REFRESH_MATCHER];

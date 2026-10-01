@@ -31,7 +31,7 @@ use bytemuck::Zeroable;
 use percolator_vault::{
     percolator::{self as perc, PERCOLATOR_PROGRAM_ID},
     processor::{TAG_ARM_FILL, TAG_PUSH_MARK},
-    pyth,
+    pyth, reporter,
     state::{self as vstate, MODE_OPERATE, STATUS_ACTIVE},
 };
 use solana_program::{
@@ -83,6 +83,7 @@ pub const TAG_EXPIRE: u8 = 7;
 pub const TAG_REQUEST_CLOSE: u8 = 8;
 pub const TAG_REQUEST_SETTLE: u8 = 9;
 pub const TAG_SETTLE: u8 = 10;
+pub const TAG_POST_PRICE: u8 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -115,6 +116,11 @@ pub enum RouterError {
     CloseOnly,
     /// `RequestClose` when the market is not close-only and the trader is not liquidatable.
     NotCloseOnly,
+    /// `PostPrice` by a key that is not the reporter.
+    NotReporter,
+    /// A reported price where only a Pyth price is accepted: no queued request has waited
+    /// `FALLBACK_SECS` past its target for one.
+    FallbackNotAllowed,
 }
 
 impl From<RouterError> for ProgramError {
@@ -143,6 +149,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_REQUEST_CLOSE => request_close(program_id, accounts),
         TAG_REQUEST_SETTLE => request_settle(program_id, accounts),
         TAG_SETTLE => settle(program_id, accounts, u64_at(0)?),
+        TAG_POST_PRICE => post_price(program_id, accounts, rest),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }
@@ -604,7 +611,55 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0)
 }
 
-/// Moves the vault's mark to a verified Pyth price. The update must be newer than the current
+/// Posts a price for a feed into the router's account for it. Only the reporter can, and the
+/// price is not verifiable on chain (see `percolator_vault::reporter`); `advance` decides when
+/// such a price may move a mark.
+///
+/// Accounts: 0 reporter [s, w], 1 the feed's price account [w], 2 system program.
+/// Data: feed id [32], price (e6, u64), publish time (i64), previous publish time (i64).
+fn post_price(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let reporter_ai = acc(accounts, 0)?;
+    let report_ai = acc(accounts, 1)?;
+    let system = acc(accounts, 2)?;
+    signer(reporter_ai)?;
+    writable(report_ai)?;
+    key_is(system, &system_program::ID)?;
+    if *reporter_ai.key != reporter::REPORTER {
+        return Err(RouterError::NotReporter.into());
+    }
+    if data.len() != 56 {
+        return Err(RouterError::InvalidInstruction.into());
+    }
+    let feed: [u8; 32] = data[..32].try_into().unwrap();
+    let price = u64::from_le_bytes(data[32..40].try_into().unwrap());
+    let publish = i64::from_le_bytes(data[40..48].try_into().unwrap());
+    let prev = i64::from_le_bytes(data[48..56].try_into().unwrap());
+    // A positive price, published after the one before it and not in the future (a few seconds
+    // of clock difference are allowed).
+    if price == 0 || price > i64::MAX as u64 || prev >= publish || publish > Clock::get()?.unix_timestamp.saturating_add(5) {
+        return Err(RouterError::BadOracle.into());
+    }
+    let (key, bump) = reporter::report_address(&feed);
+    key_is(report_ai, &key)?;
+    if report_ai.owner == program_id {
+        let stored = reporter::decode(&report_ai.try_borrow_data()?).map_err(|_| RouterError::BadOracle)?;
+        if publish <= stored.publish_time {
+            return Err(RouterError::WrongUpdate.into());
+        }
+    } else {
+        create_pda(reporter_ai, report_ai, system, program_id, reporter::REPORT_LEN, 0, &[reporter::SEED_REPORT, &feed, &[bump]])?;
+    }
+    let mut d = report_ai.try_borrow_mut_data()?;
+    d[..8].copy_from_slice(&reporter::REPORT_MAGIC.to_le_bytes());
+    d[reporter::REPORT_FEED_OFF..reporter::REPORT_FEED_OFF + 32].copy_from_slice(&feed);
+    d[reporter::REPORT_PRICE_OFF..reporter::REPORT_PRICE_OFF + 8].copy_from_slice(&price.to_le_bytes());
+    d[reporter::REPORT_PUBLISH_OFF..reporter::REPORT_PUBLISH_OFF + 8].copy_from_slice(&publish.to_le_bytes());
+    d[reporter::REPORT_PREV_OFF..reporter::REPORT_PREV_OFF + 8].copy_from_slice(&prev.to_le_bytes());
+    d[reporter::REPORT_BUMP_OFF] = bump;
+    Ok(())
+}
+
+/// Moves the vault's mark to a verified Pyth price (or, where allowed, a reported one). The update must be newer than the current
 /// mark. If a pending request's target is at or before it, it must be the first update at or
 /// after the earliest such target: the mark never skips over the price a request fills at.
 ///
@@ -631,10 +686,26 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
         return Err(RouterError::BadAccount.into());
     }
     key_is(market, &v.market)?;
-    let u = pyth::read(pyth_ai, &v.oracle_feeds[0]).map_err(|_| RouterError::BadOracle)?;
+    let reported = reporter::is_report(pyth_ai);
+    let u = if reported {
+        reporter::read(pyth_ai, &v.oracle_feeds[0])
+    } else {
+        pyth::read(pyth_ai, &v.oracle_feeds[0])
+    }
+    .map_err(|_| RouterError::BadOracle)?;
     let price = u.price_e6().ok_or(RouterError::BadOracle)?;
     if u.publish_time <= b.mark_publish_time {
         return Err(RouterError::WrongUpdate.into());
+    }
+    // A reported price is the reporter's word. Where Pyth exists it only rescues a queued request
+    // that Pyth has not served for `FALLBACK_SECS` after its target, and only as that request's
+    // price. In an X1 build it is the price source and follows the same rules as a Pyth update.
+    if reported && !cfg!(feature = "x1") {
+        let now = Clock::get()?.unix_timestamp;
+        let rescues = b.earliest_target().is_some_and(|t| now >= t.saturating_add(reporter::FALLBACK_SECS) && u.is_first_at_or_after(t));
+        if !rescues {
+            return Err(RouterError::FallbackNotAllowed.into());
+        }
     }
     if let Some(earliest) = b.earliest_target() {
         if earliest <= u.publish_time && !u.is_first_at_or_after(earliest) {

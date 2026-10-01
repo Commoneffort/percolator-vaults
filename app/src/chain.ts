@@ -698,6 +698,16 @@ export const requestTrade = (wallet: PublicKey, vault: PublicKey, id: bigint, si
   keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
   data: new W().u8(4).i128(size).done(),
 });
+/** The router's price account for a feed, written only by the reporter key (`PostPrice`). A
+ *  reported price is not verifiable on chain. On Solana the router accepts it only for a queued
+ *  request that Pyth has not served for `REPORT_FALLBACK_SECS`; in an X1 build it is the source. */
+export const reportAddress = (feedHex: string) => rpda(Buffer.from("report"), Buffer.from(feedHex, "hex"));
+export const REPORT_FALLBACK_SECS = R.fallback_secs;
+export const postPrice = (reporter: PublicKey, feedHex: string, priceE6: bigint, publish: number, prev: number) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(reporter, true), rw(reportAddress(feedHex)), ro(SystemProgram.programId)],
+  data: Buffer.concat([new W().u8(11).done(), Buffer.from(feedHex, "hex"), new W().u64(priceE6).u64(BigInt(publish)).u64(BigInt(prev)).done()]),
+});
 /** Queues the settlement of a vault's epoch at the first Pyth price after its target time. */
 export const requestSettle = (payer: PublicKey, vault: PublicKey, id: bigint) => new TransactionInstruction({
   programId: ROUTER,

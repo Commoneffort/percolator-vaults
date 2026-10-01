@@ -14,6 +14,7 @@ pub mod matcher;
 pub mod percolator;
 pub mod processor;
 pub mod pyth;
+pub mod reporter;
 pub mod state;
 
 use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey};

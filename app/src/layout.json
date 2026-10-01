@@ -84,6 +84,7 @@
     },
     "book_len": 632,
     "delay_secs": 4,
+    "fallback_secs": 20,
     "fee_bps_off": 144,
     "grace_secs": 90,
     "im_bps_off": 558,

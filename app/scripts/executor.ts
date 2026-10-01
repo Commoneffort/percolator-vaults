@@ -15,6 +15,14 @@
 //   4. Every few minutes, refresh the shared feed accounts of feeds not listed yet, so opening a
 //      market (which needs a price at most 300 s old) works. One batched Hermes request.
 //
+// Second price source: an exchange-median price service (JACK_URL). Its prices are unsigned, so
+// they reach the chain through the router's reporter key (keys/reporter-keypair.json), which is
+// trusted for them. With ORACLE=pyth (default) it is only the fallback: used for a request that
+// Hermes has not served 20 s after its target, which is all the router accepts there. With
+// ORACLE=jack (an X1 deployment, where there is no Pyth) it is the source, and the mark is also
+// refreshed from it every 30 s or on a 0.3% move. The service has no history, so the executor
+// records its stream itself to know the first price at or after a target.
+//
 // Hermes needs an API key (Pyth's free plan covers the feeds in chain.ts FEEDS). The key is read
 // from HERMES_API_KEY or ~/.config/solana/percolator-test/hermes-key and never printed.
 // Run: RPC=... npx tsx scripts/executor.ts
@@ -38,6 +46,89 @@ const PRIORITY = 1_000; // micro-lamports per CU: devnet needs little
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a);
 // A rate-limited RPC call must not take the executor down: log it and carry on next pass.
 process.on("unhandledRejection", e => log("rpc", String((e as any)?.message ?? e).split("\n")[0].slice(0, 120)));
+
+// ---- the exchange-median price service, recorded locally ----
+const ORACLE = process.env.ORACLE === "jack" ? "jack" : "pyth";
+const JACK = process.env.JACK_URL ?? "http://jack0.x1.xyz:8090";
+const JACK_SYMBOL: Record<string, string> = { XAU: "GOLD" };
+const reporter = (() => {
+  const p = process.env.REPORTER_KEY ?? "../keys/reporter-keypair.json";
+  return fs.existsSync(p) ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8")))) : null;
+})();
+type Sample = { t: number; price: number }; // t: unix seconds of the freshest quote used
+const samples = new Map<string, Sample[]>();
+let jackSymbols = "";
+
+/** Keeps a ten-minute record of the service's stream for `symbols` (reconnects by itself). */
+async function recordJack(symbols: string[]) {
+  const want = [...new Set(symbols.map(s => JACK_SYMBOL[s] ?? s))].sort().join(",");
+  if (!want || want === jackSymbols) return;
+  jackSymbols = want;
+  for (;;) {
+    if (jackSymbols !== want) return; // the set of markets changed: a newer recorder took over
+    try {
+      const r = await fetch(`${JACK}/v1/stream/prices?symbols=${want.toLowerCase()}`);
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done || jackSymbols !== want) break;
+        buf += dec.decode(value, { stream: true });
+        let i: number;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const line = buf.slice(0, i).split("\n").find(l => l.startsWith("data: "));
+          buf = buf.slice(i + 2);
+          if (!line) continue;
+          for (const x of JSON.parse(line.slice(6)).data ?? []) {
+            if (x.status !== "ok" || !(x.price > 0)) continue; // only prices enough exchanges agree on
+            const list = samples.get(x.symbol) ?? samples.set(x.symbol, []).get(x.symbol)!;
+            const t = Math.floor(new Date(x.updatedAt).getTime() / 1000);
+            if (list.length && t < list[list.length - 1].t) continue;
+            list.push({ t, price: x.price });
+            while (list.length && list[0].t < t - 600) list.shift();
+          }
+        }
+      }
+    } catch (e: any) {
+      log("price service stream:", String(e?.message ?? e).slice(0, 80));
+    }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+}
+
+/** The first recorded price with a timestamp at or after `t`, and the timestamp of the one
+ *  before it (which is before `t`), or null if the record does not cover `t` yet. */
+function jackFirstAtOrAfter(symbol: string, t: number): { price: bigint; publish: number; prev: number } | null {
+  const list = samples.get(JACK_SYMBOL[symbol] ?? symbol) ?? [];
+  const i = list.findIndex(x => x.t >= t);
+  if (i <= 0) return null; // nothing at or after t yet, or no earlier sample to bound it
+  return { price: BigInt(Math.round(list[i].price * 1e6)), publish: list[i].t, prev: list[i - 1].t };
+}
+function jackLatest(symbol: string) {
+  const list = samples.get(JACK_SYMBOL[symbol] ?? symbol) ?? [];
+  return list.length >= 2 ? { price: BigInt(Math.round(list[list.length - 1].price * 1e6)), publish: list[list.length - 1].t, prev: list[list.length - 2].t } : null;
+}
+
+/** Posts a reported price and moves the vault's mark to it, in one transaction. */
+async function advanceReported(v: C.Vault, u: { price: bigint; publish: number; prev: number }, why: string) {
+  if (!reporter) return false;
+  // The previous timestamp must be before the new one, and the account only moves forward.
+  const prev = Math.min(u.prev, u.publish - 1);
+  const market = new Uint8Array((await conn.getAccountInfo(C.MARKET))!.data);
+  const tx = new Transaction().add(...budget(), C.postPrice(reporter.publicKey, v.feed!.id, u.price, u.publish, prev), C.advanceMark(v, C.reportAddress(v.feed!.id), market));
+  try {
+    const sig = await conn.sendTransaction(tx, [payer, reporter]);
+    await confirmed(sig);
+    log("ok", `mark ${v.feed!.symbol} -> reported ${Number(u.price) / 1e6} at ${u.publish} (${why})`);
+    return true;
+  } catch (e: any) {
+    const logs: string[] = e?.logs ?? [];
+    log("fail", `mark ${v.feed!.symbol} -> reported ${u.publish} (${why})`, String(e?.message ?? e).split("\n")[0].slice(0, 100), logs.filter(l => /failed|error/.test(l)).slice(-1)[0] ?? "");
+    return false;
+  }
+}
 
 // ---- Hermes (rate-limited: back off for a minute on 429, as Hermes asks) ----
 let hermesCalls = 0;
@@ -325,9 +416,18 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   const earliest = waiting.length ? Math.min(...waiting) : null;
   // (Wall time decides when to ask Hermes: the chain clock can run a second or two behind it.)
   if (earliest !== null && Math.max(now, Date.now() / 1000) >= earliest + 0.6 && now < earliest + C.ROUTER_GRACE_SECS - 3) {
-    const u = await firstAtOrAfter(v.feed!.id, earliest);
+    const u = ORACLE === "pyth" ? await firstAtOrAfter(v.feed!.id, earliest).catch(() => null) : null;
+    let moved = false;
     if (u && u.publish > b.markPublish) {
       await advancePosted(v, u);
+      moved = true;
+    } else if (ORACLE === "jack" || Date.now() / 1000 >= earliest + C.REPORT_FALLBACK_SECS + 1) {
+      // No Pyth price for this target (Hermes down, out of quota, or no Pyth on this chain):
+      // the recorded exchange-median price at the target, through the reporter key.
+      const j = jackFirstAtOrAfter(v.feed!.symbol, earliest);
+      if (j && j.publish > b.markPublish) moved = await advanceReported(v, j, ORACLE === "jack" ? "target price" : "fallback: no Pyth price for this target");
+    }
+    if (moved) {
       const ba = await conn.getAccountInfo(C.bookAddress(v.key));
       if (ba) b = C.decodeBook(new Uint8Array(ba.data));
     }
@@ -375,7 +475,13 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
 
   // 4. Free: move the mark to Pyth's sponsored feed account when it is newer, never past a
   //    pending target.
-  if (snap.feed && live.length === 0 && !queued) { // not while a trade waits on any market: it comes first
+  if (ORACLE === "jack" && live.length === 0 && !queued) {
+    // No sponsored feed accounts here: refresh the mark from the price service every 30 s or
+    // on a 0.3% move (each refresh is a transaction, so not on every tick).
+    const j = jackLatest(v.feed!.symbol);
+    const moved = j && b.markPrice > 0n ? Math.abs(Number(j.price) / Number(b.markPrice) - 1) : 1;
+    if (j && j.publish > b.markPublish && (j.publish - b.markPublish >= 30 || moved >= 0.003)) await advanceReported(v, j, "refresh");
+  } else if (snap.feed && live.length === 0 && !queued) { // not while a trade waits on any market: it comes first
     const p = C.decodePyth(snap.feed);
     if (p.publish > b.markPublish) await send(`mark ${v.feed!.symbol} -> sponsored ${p.publish}`, [C.advanceMark(v, C.feedAccount(v.feed!.id), snap.market)]);
   }
@@ -412,7 +518,7 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
 }
 
 (async () => {
-  log("executor", payer.publicKey.toBase58(), "router", C.ROUTER.toBase58(), "hermes", HERMES);
+  log("executor", payer.publicKey.toBase58(), "router", C.ROUTER.toBase58(), "prices:", ORACLE === "jack" ? `${JACK} (reported)` : `Pyth via ${HERMES}${reporter ? `, fallback ${JACK} (reported)` : ""}`);
   let lastStats = Date.now();
   let vaults: C.Vault[] = [];
   let vaultsAt = 0;
@@ -427,6 +533,7 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
         vaultList = await C.listVaults(conn);
         vaults = vaultList.filter(v => v.market.equals(C.MARKET) && v.canonical && v.status === 1 && v.feed);
         vaultsAt = Date.now();
+        if (reporter) recordJack(vaults.map(v => v.feed!.symbol)); // runs in the background
       }
       const keys = [SYSVAR_CLOCK_PUBKEY, C.MARKET, ...vaults.flatMap(v => [C.bookAddress(v.key), C.feedAccount(v.feed!.id)])];
       const accs = await conn.getMultipleAccountsInfo(keys);

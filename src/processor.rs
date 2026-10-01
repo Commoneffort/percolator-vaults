@@ -1558,6 +1558,10 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
         return Err(VaultError::BadAccount.into());
     }
     let clock = Clock::get()?;
+    // On X1 there is no Pyth: the listing price is the reporter's (see `reporter.rs`).
+    #[cfg(feature = "x1")]
+    let update = crate::reporter::read(acc(accounts, 9)?, &v.oracle_feeds[0])?;
+    #[cfg(not(feature = "x1"))]
     let update = crate::pyth::read(acc(accounts, 9)?, &v.oracle_feeds[0])?;
     if update.publish_time < clock.unix_timestamp.saturating_sub(v.oracle_max_staleness_secs as i64) {
         return Err(VaultError::BadOracle.into());

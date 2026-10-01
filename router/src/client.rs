@@ -144,6 +144,20 @@ pub fn request_close(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey, id: u64) ->
     }
 }
 
+/// Posts a reported price for `feed` (signed by the reporter).
+pub fn post_price(reporter: &Pubkey, feed: &[u8; 32], price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Instruction {
+    let mut data = vec![TAG_POST_PRICE];
+    data.extend_from_slice(feed);
+    data.extend_from_slice(&price_e6.to_le_bytes());
+    data.extend_from_slice(&publish_time.to_le_bytes());
+    data.extend_from_slice(&prev_publish_time.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![AccountMeta::new(*reporter, true), w(percolator_vault::reporter::report_address(feed).0), ro(system_program::ID)],
+        data,
+    }
+}
+
 /// Queues the settlement of a vault's epoch at the first Pyth price after its target time.
 pub fn request_settle(payer: &Pubkey, vault: &Pubkey, id: u64) -> Instruction {
     Instruction {

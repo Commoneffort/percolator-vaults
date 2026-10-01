@@ -37,7 +37,7 @@ A Solana program that turns "operate a Percolator market" into a pooled, permiss
 ## What we built
 
 - **Two on-chain programs** (Rust, native Solana, ~4,500 lines including off-chain client builders): the vault (matcher, share accounting, market listing, fee harvesting, opener share, liveness backstop, wind-down, retirement) and the router (trading accounts, requests, verified Pyth marks, fills, expiry).
-- **59 tests against Percolator's production binary** in LiteSVM, using Percolator's own test harness, every trade through the router:
+- **60 tests against Percolator's production binary** in LiteSVM, using Percolator's own test harness, every trade through the router:
   - front-running attempts: trading on a known price, skipping or reordering Pyth updates, executor timing, direct trades, forged and unverified Pyth accounts, cancelling or withdrawing from a queued trade;
   - property tests for share math;
   - layout and encoding tests checked against Percolator's own types and decoder;
@@ -66,6 +66,7 @@ Percolator gives Solana an engine for permissionless perps. This gives it a work
 - Trades take a few seconds: that delay is what makes the fill price one nobody could know in advance. Its protection assumes the chain clock is not more than a few seconds behind real time.
 - A request that cannot fill (for example after a price move larger than its 10% margin buffer) holds the market's mark at its price for at most 90 seconds before it expires, at the cost of its bond.
 - Every price move leaves each open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are; the executor does this in front of each fill, so a fill costs more the more positions a market has.
+- A fallback price source is trusted where it is used. If Pyth has not served a queued request 20 seconds after its target, a reporter key may post the price from an exchange-median service instead, so trades survive a Hermes outage. That price is not verifiable on chain. An X1 build, where there is no Pyth, uses this source for everything; it is not deployed yet.
 - No funding rate. Percolator derives funding from the gap between mark and index price, and here both are the same Pyth price (which is what stops front-running), so nothing pays traders to balance longs and shorts; the vault carries the imbalance within its limits, for the fees. A skew fee is not possible at our layer either: in this oracle mode Percolator charges only its fixed base fee.
 - When the vault has to unwind (withdrawals larger than its cash reserve waited a full extra epoch and the vault could not get flat), traders on that market are deleveraged and then closed out at a Pyth price; Percolator allows nothing else until the market is empty.
 - Margin can only be withdrawn from an account with no open position (a Percolator rule).

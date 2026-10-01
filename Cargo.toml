@@ -16,6 +16,8 @@ no-entrypoint = []
 # Which Percolator deployment the vault is allowed to talk to. Exactly one ID is compiled in;
 # the default is the ID used by Percolator's own LiteSVM harness.
 devnet = []
+# Builds for X1, where there is no Pyth: prices come from the reporter (see `reporter.rs`).
+x1 = []
 
 [dependencies]
 solana-program = "1.18"

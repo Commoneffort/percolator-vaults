@@ -187,6 +187,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Smart contracts.</b> Unaudited code. The program is upgradeable on devnet; a mainnet deployment must burn that authority.</li>
           <li><b>Keepers.</b> Everything is permissionless, but someone has to send the transactions. If nobody does, epochs don't roll and prices don't update.</li>
           <li><b>Margin stays in while you hold a position.</b> Percolator pays margin out only from an account with no open position on any market, so a trader closes everything before withdrawing. A queued trade must also leave enough margin for a further 10% price move; a trade that only reduces a position is always accepted.</li>
+          <li><b>Fallback prices are trusted.</b> If Pyth has not served a queued trade 20 seconds after its target, a reporter key may post the price from an exchange-median price service instead, so trades survive an outage of Pyth's API. Nothing on chain can verify that price. Anyone posting the Pyth price within those 20 seconds keeps the fallback out.</li>
           <li><b>No funding rate.</b> Percolator derives funding from the gap between mark and index price. Here both are the same Pyth price, which is what stops front-running, so funding is always zero and nothing pays traders to balance longs and shorts. The vault carries the imbalance, within its position limit, for the fees.</li>
           <li><b>An unwind closes the market out.</b> If withdrawals larger than the vault's cash reserve have waited a full extra epoch and the vault still holds a position, the vault closes it unilaterally. Traders on the other side are scaled down, and the positions left on that market are closed out at the next Pyth price before it reopens. A trader can have a position closed this way without choosing to.</li>
           <li><b>Cost per position.</b> Each price move leaves every open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are. The executor does this in front of each fill, so keeping a market tradable costs more the more positions it has.</li>
@@ -215,7 +216,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>Governor (program address)</td><td>Retire an idle, empty market through <code>RetireMarket</code></td><td>Anything else: the program has no other instruction that uses Percolator's market authority</td></tr>
           </tbody>
         </table>
-        <p>The program is tested against the production Percolator binary in LiteSVM, with 59 tests:</p>
+        <p>The program is tested against the production Percolator binary in LiteSVM, with 60 tests:</p>
         <ul>
           <li><b>Front-running</b>: a trader who knows the price in advance ends flat; the fill is exactly the first Pyth price at or after the target; no later or skipped update can move the mark; nobody can push a newer price over a pending request; the executor's identity and timing do not change the fill; direct trades, forged or unverified Pyth accounts and non-router mark moves are refused.</li>
           <li><b>Requests</b>: no cancelling, no withdrawing while queued, expiry only after the grace period with the bond forfeited, stressed margin check, withdrawals only to the owner's wallet.</li>
@@ -264,6 +265,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>8</td><td>RequestClose</td><td>anyone, for any trader</td><td>Queues a forced close: a close-out on a close-only market, or the liquidation of an account below 12.5%</td></tr>
             <tr><td>9</td><td>RequestSettle</td><td>anyone</td><td>Queues the settlement of a vault's epoch at the first Pyth price after its target</td></tr>
             <tr><td>10</td><td>Settle</td><td>anyone</td><td>Rolls the vault's epoch at that price, with its position open</td></tr>
+            <tr><td>11</td><td>PostPrice</td><td>the reporter key</td><td>Writes a reported (unverified) price for a feed; usable only as described under Risks</td></tr>
           </tbody>
         </table>
 

@@ -367,6 +367,48 @@ fn control_sequence_offsets_match_percolator() {
     }
 }
 
+/// Where Pyth exists, a reported price is only a fallback: it may serve a queued request that
+/// has waited `FALLBACK_SECS` past its target without a Pyth price, as that request's price,
+/// and nothing else.
+#[test]
+fn a_reported_price_only_rescues_a_request_pyth_did_not_serve() {
+    use percolator_vault::reporter::FALLBACK_SECS;
+    let mut w = live();
+    let reporter = w.reporter();
+    // Only the reporter posts, and not a price from the future or one that goes back in time.
+    let mallory = Keypair::new();
+    w.env.svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+    let now = w.clock_ts();
+    expect(w.post_report(&mallory, 1_100_000, now, now - 1).map(|_| 0), router_code(RouterError::NotReporter));
+    expect(w.post_report(&reporter, 1_100_000, now + 60, now).map(|_| 0), router_code(RouterError::BadOracle));
+    let report = w.post_report(&reporter, 1_100_000, now, now - 1).unwrap();
+    expect(w.post_report(&reporter, 1_200_000, now, now - 1).map(|_| 0), router_code(RouterError::WrongUpdate));
+    // With nothing queued it cannot move the mark at all.
+    expect(w.advance_to(report), router_code(RouterError::FallbackNotAllowed));
+
+    // A request is queued. Before the fallback delay the reporter cannot serve it...
+    w.trader(0);
+    let id = w.request(0, 5 * UNIT as i128).unwrap();
+    let target = w.request_target(id);
+    at(&mut w, target + 1);
+    let report = w.post_report(&reporter, 1_020_000, target, target - 1).unwrap();
+    expect(w.advance_to(report), router_code(RouterError::FallbackNotAllowed));
+    // ...and afterwards only with the first price at or after its target, not a later one.
+    at(&mut w, target + FALLBACK_SECS);
+    let late = w.post_report(&reporter, 1_050_000, target + 5, target + 4).unwrap();
+    expect(w.advance_to(late), router_code(RouterError::FallbackNotAllowed));
+    let first = w.post_report(&reporter, 1_020_000, target + 6, target - 1).unwrap();
+    w.advance_to(first).unwrap();
+    assert_eq!({ w.book().mark_price }, 1_020_000);
+    w.price = 1_020_000;
+    w.pyth_time = target + 6;
+    w.converge();
+    w.fill(0, id).unwrap();
+    assert_eq!(position(&w, 0), 5 * UNIT as i128);
+    // Pyth carries on from there.
+    w.taker_trade(0, -5 * UNIT as i128).unwrap();
+}
+
 /// A trader with 5 USDC of margin, long 20 units at 1.00, on a market with 10x margin.
 fn leveraged_long(w: &mut World) {
     let u = w.new_user(100_000_000);

@@ -89,6 +89,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 8 | `RequestClose` | anyone, for any trader | Queues a forced close: a close-out on a close-only market (unilateral reduce at the mark), or the liquidation of an account below 12.5% (closed against the vault if still below at the fill price) |
 | 9 | `RequestSettle` | anyone | Queues the settlement of a vault's epoch at the first Pyth price after its target |
 | 10 | `Settle` | anyone | Rolls the vault's epoch at that price, with its position open |
+| 11 | `PostPrice` | the reporter key | Writes a reported (unverified) price for a feed into the router's account for it |
 
 ## Share pricing
 
@@ -99,7 +100,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 ## Tests
 
-`./test.sh` builds both on-chain programs and runs 59 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `owl/trunk` of `Commoneffort/percolator-prog`) with its SBF binary built. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness; every trade in them goes through the router.
+`./test.sh` builds both on-chain programs and runs 60 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `owl/trunk` of `Commoneffort/percolator-prog`) with its SBF binary built. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness; every trade in them goes through the router.
 
 - **Front-running:** a trader who knows the price in advance ends flat, not ahead; the fill is exactly the first Pyth price at or after the target; a later update, or one that is not the first after the target, cannot move the mark; nobody can push a newer price over a pending request; the executor's identity and timing do not change the fill; a fill waits until Percolator's price has reached the mark; a direct trade against the vault is refused; only the router can move the mark or arm a fill; forged, unverified and wrong-feed Pyth accounts are refused.
 - **Requests:** they cannot be cancelled or withdrawn from, and expire only after the grace period with the bond forfeited; margin must survive a stressed move, except for a trade that only reduces a position; withdrawals only reach the owner's wallet; a market with a queued request cannot be retired.
@@ -135,6 +136,15 @@ The executor (`app/scripts/executor.ts`) moves marks and fills requests. It need
 - **Cranks.** Percolator takes new risk on an asset only when that asset is accrued to the current slot and every position on it is settled, and it settles a trader's positions only once every asset that trader holds is current. The executor puts exactly those cranks in front of each fill (`crankPlan` in `app/src/chain.ts`). How many are needed depends on the slot the transaction lands in, and a crank with nothing to do fails, so it sends two versions of the fill one crank apart: only the one that matches can succeed, and the request fills once. It also finalizes Percolator's side reset when the last position on one side of a market closes, without which that market would refuse new positions. Between trades it keeps every market within about 50 slots of the chain and settles out-of-date positions.
 
 `RPC=https://api.devnet.solana.com npx tsx scripts/executor.ts` (from `app/`).
+
+### Second price source: reported prices
+
+The router can also take prices that a **reporter key** posts on chain (`PostPrice`). The reference executor fills them from an exchange-median price service (`JACK_URL`, default `http://jack0.x1.xyz:8090`: the median of top-of-book mid prices across up to eight exchanges, about four updates a second, no API key). That service does not sign its prices and has no history, so the executor records its stream to know the first price at or after a request's target, and the reporter key (`keys/reporter-keypair.json`, not in the repo) vouches for it. Nothing on chain can check such a price: **whoever holds the reporter key is trusted for it.** It is therefore used narrowly.
+
+- **Solana (default build): fallback only.** `Advance` accepts a reported price only for a queued request whose target passed at least 20 seconds ago without a Pyth price, and only as that request's price (the first at or after its target). Anyone can still post the Pyth price within those 20 seconds, which shuts the fallback out. It exists so a Hermes outage or an exhausted quota does not leave requests to expire.
+- **X1 (`--features x1`): the price source.** X1 has no Pyth. In this build a reported price follows the same rules as a Pyth update (newer than the mark, never past a pending request's price), and a market is listed at the reported price. Run the executor with `ORACLE=jack`; it posts a price when a request needs one and refreshes each mark every 30 seconds or on a 0.3% move, not on every tick, since each post is a transaction. The X1 build compiles but has not been deployed: the program ids and Percolator itself still have to be set up there.
+
+If the service starts signing its prices (ed25519 over symbol, price, timestamp and previous timestamp), the router can verify them on chain and the reporter key is no longer trusted.
 
 ## Layout
 
