@@ -44,6 +44,9 @@ pub const CANON_EPOCH_LEN_SLOTS: u64 = 20;
 pub const CANON_INSURANCE_FLOOR: u64 = 100_000_000; // 100 units of a 6-decimal collateral
 #[cfg(not(feature = "devnet"))]
 pub const CANON_INSURANCE_FLOOR: u64 = 10_000;
+/// Share of the vault's value kept as cash outside Percolator when it redeploys at a roll, so
+/// that ordinary withdrawals can be paid without closing the vault's position first.
+pub const RESERVE_BPS: u64 = 1_000;
 pub const CANON_POSITION_NAV_BPS: u16 = 30_000; // position up to 3x the vault's NAV
 pub const CANON_FILL_NAV_BPS: u16 = 7_500; // each fill up to 0.75x the vault's NAV
 #[cfg(feature = "devnet")]
@@ -118,6 +121,7 @@ pub const TAG_RETIRE_MARKET: u8 = 31;
 pub const TAG_PUSH_MARK: u8 = 32;
 pub const TAG_ARM_FILL: u8 = 33;
 pub const TAG_SYNC_INVENTORY: u8 = 34;
+pub const TAG_REQUIRE_FLAT: u8 = 35;
 
 /// A market with no liquidity providers can be retired this many epochs after it was listed.
 pub const RETIRE_IDLE_EPOCHS: u64 = 3;
@@ -481,6 +485,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             }
             arm_fill(program_id, accounts, i128::from_le_bytes(rest.try_into().unwrap()))
         }
+        TAG_REQUIRE_FLAT => {
+            no_args(rest)?;
+            require_flat(program_id, accounts)
+        }
         TAG_SYNC_INVENTORY => {
             no_args(rest)?;
             sync_inventory(program_id, accounts)
@@ -706,7 +714,8 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         oracle_unit_scale: p.oracle_unit_scale,
         oracle_conf_filter_bps: p.oracle_conf_filter_bps,
         vault_kind: kind,
-        _pad1: [0; 5],
+        needs_flat: 0,
+        _pad1: [0; 4],
         oracle_max_staleness_secs: p.oracle_max_staleness_secs,
         oracle_soft_stale_slots: p.oracle_soft_stale_slots,
         oracle_ewma_halflife_slots: p.oracle_ewma_halflife_slots,
@@ -877,13 +886,21 @@ fn request_withdraw(program_id: &Pubkey, accounts: &[AccountInfo], shares: u64) 
     state::store_vault(vault_ai, &v)
 }
 
-/// Settles the epoch once it is over and the LP portfolio is flat: prices every queued
-/// withdrawal and deposit at one net asset value, then redeploys the free collateral.
+/// Settles the epoch once it is over: prices every queued withdrawal and deposit at one net
+/// asset value, then redeploys the free collateral (keeping `RESERVE_BPS` of it as cash).
+///
+/// With the LP portfolio flat anyone can call it: a flat vault's value does not depend on the
+/// price. With a position open the value does, so only the router can (account 15, its
+/// authority, as signer): it calls this from `Settle`, at the first Pyth price published after a
+/// target time fixed in advance, with Percolator's price at it. The position must be settled at
+/// that price, nothing is withdrawn from Percolator, and the epoch's withdrawals must fit in
+/// the vault's cash; if they do not, the roll fails and `RequireFlat` applies.
 ///
 /// Accounts: 0 cranker [s,w], 1 vault [w], 2 market [w], 3 LP portfolio [w], 4 buffer [w],
 /// 5 Percolator collateral vault [w], 6 Percolator vault authority, 7 share mint [w],
 /// 8 share escrow [w], 9 epoch record [w], 10 matcher delegate, 11 Percolator program,
-/// 12 this program, 13 token program, 14 system program.
+/// 12 this program, 13 token program, 14 system program, 15 (open position only) the router's
+/// authority [s].
 /// Data: the market's current asset-generation frontier (checked by Percolator).
 fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> ProgramResult {
     let cranker = acc(accounts, 0)?;
@@ -934,14 +951,22 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
         &[market.clone(), portfolio.clone(), percolator.clone()],
     )?;
     let view = perc::read_portfolio(portfolio, market.key, &vault_key)?;
-    if !view.flat {
-        return Err(VaultError::NotFlat.into());
+    let open = !view.flat;
+    if open {
+        match accounts.get(15) {
+            Some(router) => router_signed(router)?,
+            None => return Err(VaultError::NotFlat.into()),
+        }
+        if perc::positions(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)?.iter().any(|p| !p.settled) {
+            return Err(VaultError::NotSettled.into());
+        }
     }
 
-    // 2. Pull all capital back into the buffer. Percolator refuses unless the portfolio is flat
-    //    with no loss outstanding; the amount actually received is measured, not assumed.
+    // 2. Flat: pull all capital back into the buffer. Percolator refuses unless the portfolio is
+    //    flat with no loss outstanding; the amount actually received is measured, not assumed.
+    //    Open: the capital stays where it is and is counted at Percolator's figure.
     let buffer_before = token_amount(buffer)?;
-    if view.capital > 0 {
+    if !open && view.capital > 0 {
         invoke_signed(
             &perc::withdraw(
                 &vault_key,
@@ -976,7 +1001,17 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     // 3. Net asset value. Low: collateral actually held, minus what is owed or queued.
     //    High: plus profit the engine has booked but not yet released as capital. Withdrawals
     //    are priced low and deposits high, so neither side can extract value from the other.
-    let nav_low = sub(sub(buffer_after, v.reserved_assets)?, v.pending_deposit_assets)?;
+    //    With the position open, capital still in Percolator counts too, less any loss the
+    //    engine has not taken out of it yet.
+    let cash = sub(sub(buffer_after, v.reserved_assets)?, v.pending_deposit_assets)?;
+    let deployed = if open {
+        let capital = u64::try_from(after.capital).map_err(|_| VaultError::Overflow)?;
+        let loss = u64::try_from((-after.pnl).max(0)).unwrap_or(u64::MAX);
+        capital.saturating_sub(loss)
+    } else {
+        0
+    };
+    let nav_low = add(cash, deployed)?;
     let unrealized = if after.pnl > 0 {
         u64::try_from(after.pnl).unwrap_or(u64::MAX)
     } else {
@@ -1064,9 +1099,17 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     v.reserved_assets = add(add(v.reserved_assets, assets_out)?, refunded)?;
     v.pending_deposit_assets = 0;
     v.pending_withdraw_shares = 0;
+    // Everything owed must be in the buffer. Flat, it always is (all capital was pulled back).
+    // Open, the withdrawals have to fit in the cash: if they do not, this epoch can only settle
+    // flat (`RequireFlat`).
+    if buffer_after < v.reserved_assets {
+        return Err(VaultError::NotFlat.into());
+    }
 
-    // 6. Redeploy everything that is not owed back into the LP portfolio.
-    let deployable = sub(buffer_after, v.reserved_assets)?;
+    // 6. Redeploy what is not owed into the LP portfolio, keeping the cash reserve.
+    let nav_after = add(nav_after_out_low, if refund { 0 } else { d })?;
+    let reserve = (nav_after as u128 * RESERVE_BPS as u128 / 10_000) as u64;
+    let deployable = sub(buffer_after, v.reserved_assets)?.saturating_sub(reserve);
     if deployable > 0 {
         let fresh = perc::read_portfolio(portfolio, market.key, &vault_key)?;
         invoke_signed(
@@ -1092,8 +1135,11 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
             &[signer_seeds],
         )?;
     }
-    v.last_nav = deployable.saturating_add(unrealized);
-    v.inventory = 0; // proven flat above
+    v.last_nav = nav_after.saturating_add(unrealized);
+    if !open {
+        v.inventory = 0; // proven flat above
+    }
+    v.needs_flat = 0;
     v.epoch = add(v.epoch, 1)?;
     v.epoch_start_slot = now;
     state::store_vault(vault_ai, &v)?;
@@ -1672,6 +1718,44 @@ fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Progra
     state::store_vault(vault_ai, &v)
 }
 
+/// Switches the vault to closing-only for the rest of an overdue epoch. Allowed when the epoch is
+/// over and its withdrawals, valued at the vault's current net asset value, exceed the cash the
+/// vault holds outside Percolator: they can then only be paid once the vault's position is
+/// closed and its capital pulled back. Anyone can call it; the flag is cleared by the roll.
+///
+/// Accounts: 0 vault [w], 1 market, 2 LP portfolio, 3 buffer, 4 share mint.
+fn require_flat(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let vault_ai = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let portfolio = acc(accounts, 2)?;
+    let buffer = acc(accounts, 3)?;
+    let share_mint = acc(accounts, 4)?;
+    writable(vault_ai)?;
+    let mut v = state::load_vault(vault_ai, program_id)?;
+    if v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    key_is(market, &v.market)?;
+    key_is(portfolio, &v.lp_portfolio)?;
+    key_is(share_mint, &v.share_mint)?;
+    check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, vault_ai.key)?;
+    if Clock::get()?.slot < v.epoch_start_slot.saturating_add(v.epoch_len_slots) {
+        return Err(VaultError::EpochNotOver.into());
+    }
+    let view = perc::read_portfolio(portfolio, market.key, vault_ai.key)?;
+    let cash = sub(sub(token_amount(buffer)?, v.reserved_assets)?, v.pending_deposit_assets)?;
+    let capital = u64::try_from(view.capital).map_err(|_| VaultError::Overflow)?;
+    let loss = u64::try_from((-view.pnl).max(0)).unwrap_or(u64::MAX);
+    let nav_low = add(cash, capital.saturating_sub(loss))?;
+    let owed = math::assets_for_shares(v.pending_withdraw_shares, nav_low, mint_supply(share_mint)?)?;
+    // The epoch's own deposits are cash too once it settles.
+    if view.flat || owed <= add(cash, v.pending_deposit_assets)? {
+        return Err(VaultError::CanSettleOpen.into());
+    }
+    v.needs_flat = 1;
+    state::store_vault(vault_ai, &v)
+}
+
 /// Sets the vault's tracked position to what its portfolio actually holds. The matcher tracks
 /// the position fill by fill, but Percolator can also change it outside a fill: when a trader
 /// on the other side is liquidated or closed out unilaterally, the vault's position is
@@ -1932,9 +2016,9 @@ fn harvest_fees(
     state::store_vault(vault_ai, &v)
 }
 
-/// Liveness backstop. If an epoch has been over for a further full epoch with requests still
-/// waiting (reduce-only quoting did not bring the vault flat, for example because a taker holds
-/// its position on purpose), anyone can make the vault close its own position through
+/// Liveness backstop. If an epoch has been over for a further full epoch and its withdrawals
+/// still need the vault flat (`RequireFlat`; closing-only quoting did not bring it there, for
+/// example because a taker holds its position on purpose), anyone can make the vault close its own position through
 /// Percolator's unilateral `RebalanceReduce`, at the engine's effective price. A taker holding a
 /// position therefore cannot keep withdrawals locked.
 ///
@@ -1958,8 +2042,8 @@ fn unwind(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let overdue = v
         .epoch_start_slot
         .saturating_add(v.epoch_len_slots.saturating_mul(2));
-    let has_requests = v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0;
-    if now < overdue || !has_requests {
+    // Only when the epoch cannot settle with the position open (`RequireFlat`).
+    if now < overdue || v.needs_flat == 0 {
         return Err(VaultError::EpochNotOver.into());
     }
     let view = perc::read_portfolio(portfolio, market.key, vault_ai.key)?;

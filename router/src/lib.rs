@@ -81,6 +81,8 @@ pub const TAG_ADVANCE: u8 = 5;
 pub const TAG_FILL: u8 = 6;
 pub const TAG_EXPIRE: u8 = 7;
 pub const TAG_REQUEST_CLOSE: u8 = 8;
+pub const TAG_REQUEST_SETTLE: u8 = 9;
+pub const TAG_SETTLE: u8 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -139,6 +141,8 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_FILL => fill(program_id, accounts),
         TAG_EXPIRE => expire(program_id, accounts),
         TAG_REQUEST_CLOSE => request_close(program_id, accounts),
+        TAG_REQUEST_SETTLE => request_settle(program_id, accounts),
+        TAG_SETTLE => settle(program_id, accounts, u64_at(0)?),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }
@@ -489,18 +493,18 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
     if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size)? {
         return Err(RouterError::InsufficientMargin.into());
     }
-    enqueue(program_id, wallet, wallet.key, trader_ai, &mut t, vault_ai, book_ai, &mut b, request_ai, system, size)
+    enqueue(program_id, wallet, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size)
 }
 
 /// Stores a request for `owner`'s trading account (paid for by `payer`) and adds it to the book.
-/// `size` 0 marks a close-out (see `request_close`).
+/// `size` 0 marks a forced close (see `request_close`); without a trader it is an epoch
+/// settlement (see `request_settle`).
 #[allow(clippy::too_many_arguments)]
 fn enqueue<'a>(
     program_id: &Pubkey,
     payer: &AccountInfo<'a>,
     owner: &Pubkey,
-    trader_ai: &AccountInfo<'a>,
-    t: &mut TraderState,
+    trader: Option<(&AccountInfo<'a>, &mut TraderState)>,
     vault_ai: &AccountInfo<'a>,
     book_ai: &AccountInfo<'a>,
     b: &mut Book,
@@ -516,7 +520,18 @@ fn enqueue<'a>(
     create_pda(payer, request_ai, system, program_id, REQUEST_LEN, BOND_LAMPORTS, &[SEED_REQUEST, vault_ai.key.as_ref(), &id.to_le_bytes(), &[rbump]])?;
     store(
         request_ai,
-        &Request { magic: REQUEST_MAGIC, vault: *vault_ai.key, wallet: *owner, id, size, target_time: target, created_slot: clock.slot, bump: rbump, _pad: [0; 7] },
+        &Request {
+            magic: REQUEST_MAGIC,
+            vault: *vault_ai.key,
+            wallet: *owner,
+            id,
+            size,
+            target_time: target,
+            created_slot: clock.slot,
+            bump: rbump,
+            kind: if trader.is_some() { KIND_TRADE } else { KIND_SETTLE },
+            _pad: [0; 6],
+        },
     )?;
     b.next_id = id.checked_add(1).ok_or(RouterError::Overflow)?;
     let (mut ids, mut targets) = (b.pending_id, b.pending_target);
@@ -526,10 +541,13 @@ fn enqueue<'a>(
     b.pending_target = targets;
     b.len += 1;
     store(book_ai, &*b)?;
-    t.has_pending = 1;
-    t.pending_vault = *vault_ai.key;
-    t.pending_id = id;
-    store(trader_ai, &*t)
+    if let Some((trader_ai, t)) = trader {
+        t.has_pending = 1;
+        t.pending_vault = *vault_ai.key;
+        t.pending_id = id;
+        store(trader_ai, &*t)?;
+    }
+    Ok(())
 }
 
 /// Queues the forced close of a trader's position on a vault's market. Anyone may queue it (paying
@@ -583,7 +601,7 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
             return Err(RouterError::NotCloseOnly.into());
         }
     }
-    enqueue(program_id, payer, wallet.key, trader_ai, &mut t, vault_ai, book_ai, &mut b, request_ai, system, 0)
+    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0)
 }
 
 /// Moves the vault's mark to a verified Pyth price. The update must be newer than the current
@@ -678,6 +696,9 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let (ak, abump) = authority_address(program_id);
     key_is(authority, &ak)?;
     let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
+    if r.kind != KIND_TRADE {
+        return Err(RouterError::BadAccount.into());
+    }
     let mut t = load_trader(program_id, trader_ai, &r.wallet)?;
     key_is(wallet, &r.wallet)?;
     let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
@@ -773,6 +794,99 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     close(request_ai, BOND_LAMPORTS, executor, wallet)
 }
 
+/// Queues the settlement of a vault's epoch at a price nobody can choose. A vault that holds a
+/// position is worth more or less depending on the price, so its deposits and withdrawals are
+/// priced at the first Pyth price published at or after this request's target time, exactly
+/// like a trade. Anyone can queue it once the epoch is over and has requests waiting.
+///
+/// Accounts: 0 payer [s, w], 1 vault, 2 book [w], 3 request [w], 4 system program.
+fn request_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let payer = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    let book_ai = acc(accounts, 2)?;
+    let request_ai = acc(accounts, 3)?;
+    let system = acc(accounts, 4)?;
+    signer(payer)?;
+    for w in [payer, book_ai, request_ai] {
+        writable(w)?;
+    }
+    key_is(system, &system_program::ID)?;
+    let v = load_vault(vault_ai)?;
+    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    if b.vault != *vault_ai.key {
+        return Err(RouterError::BadAccount.into());
+    }
+    let over = Clock::get()?.slot >= v.epoch_start_slot.saturating_add(v.epoch_len_slots);
+    if !over || (v.pending_deposit_assets == 0 && v.pending_withdraw_shares == 0) {
+        return Err(RouterError::TooEarly.into());
+    }
+    if b.len as usize >= MAX_PENDING {
+        return Err(RouterError::BookFull.into());
+    }
+    enqueue(program_id, payer, payer.key, None, vault_ai, book_ai, &mut b, request_ai, system, 0)
+}
+
+/// Executes a queued settlement: with the mark at the request's target price and Percolator's
+/// price at the mark, rolls the vault's epoch (the vault accepts a roll with its position open
+/// only from the router). Pays the executor the bond.
+///
+/// Accounts: 0 executor [s, w], 1 request [w], 2 the request's payer [w], 3 book [w],
+/// 4 router authority, then the vault's `RollEpoch` accounts 1..=14 in order: 5 vault [w],
+/// 6 market [w], 7 LP portfolio [w], 8 buffer [w], 9 Percolator collateral vault [w],
+/// 10 Percolator vault authority, 11 share mint [w], 12 share escrow [w], 13 epoch record [w],
+/// 14 matcher delegate, 15 Percolator program, 16 vault program, 17 token program,
+/// 18 system program. Data: the market's asset-generation frontier.
+fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> ProgramResult {
+    let executor = acc(accounts, 0)?;
+    let request_ai = acc(accounts, 1)?;
+    let wallet = acc(accounts, 2)?;
+    let book_ai = acc(accounts, 3)?;
+    let authority = acc(accounts, 4)?;
+    let vault_ai = acc(accounts, 5)?;
+    let market = acc(accounts, 6)?;
+    let vault_program = acc(accounts, 16)?;
+    signer(executor)?;
+    for w in [executor, request_ai, wallet, book_ai] {
+        writable(w)?;
+    }
+    key_is(vault_program, &percolator_vault::id())?;
+    let (ak, abump) = authority_address(program_id);
+    key_is(authority, &ak)?;
+    let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
+    key_is(wallet, &r.wallet)?;
+    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let v = load_vault(vault_ai)?;
+    if r.kind != KIND_SETTLE || r.vault != *vault_ai.key || b.vault != *vault_ai.key {
+        return Err(RouterError::BadAccount.into());
+    }
+    key_is(market, &v.market)?;
+    if !(b.mark_prev_publish_time < r.target_time && r.target_time <= b.mark_publish_time) {
+        return Err(RouterError::NotAtTarget.into());
+    }
+    perc::expect_market(market)?;
+    let (_, effective, _) = perc::asset_price(&market.try_borrow_data()?, v.asset_index)?;
+    if effective != b.mark_price {
+        return Err(RouterError::NotConverged.into());
+    }
+
+    // RollEpoch with the executor as its cranker and the router's authority as account 15.
+    let mut metas = vec![AccountMeta::new(*executor.key, true)];
+    let mut infos = vec![executor.clone()];
+    for ai in accounts.get(5..19).ok_or(ProgramError::NotEnoughAccountKeys)? {
+        metas.push(if ai.is_writable { AccountMeta::new(*ai.key, false) } else { AccountMeta::new_readonly(*ai.key, false) });
+        infos.push(ai.clone());
+    }
+    metas.push(AccountMeta::new_readonly(ak, true));
+    infos.push(authority.clone());
+    let mut data = vec![percolator_vault::processor::TAG_ROLL_EPOCH];
+    data.extend_from_slice(&frontier.to_le_bytes());
+    invoke_signed(&Instruction { program_id: percolator_vault::id(), accounts: metas, data }, &infos, &[&[SEED_AUTHORITY, &[abump]]])?;
+
+    b.remove(r.id)?;
+    store(book_ai, &b)?;
+    close(request_ai, BOND_LAMPORTS, executor, wallet)
+}
+
 /// Removes a request nobody filled within `GRACE_SECS` of its target. Its bond is forfeited
 /// (kept in the book account, which nothing can withdraw); its rent goes back to the trader.
 ///
@@ -784,23 +898,29 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let wallet = acc(accounts, 3)?;
     let book_ai = acc(accounts, 4)?;
     signer(caller)?;
-    for w in [request_ai, trader_ai, wallet, book_ai] {
+    for w in [request_ai, wallet, book_ai] {
         writable(w)?;
     }
     let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
-    let mut t = load_trader(program_id, trader_ai, &r.wallet)?;
     key_is(wallet, &r.wallet)?;
     let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
-    if b.vault != r.vault || t.pending_vault != r.vault || t.pending_id != r.id {
+    if b.vault != r.vault {
         return Err(RouterError::BadAccount.into());
     }
     if Clock::get()?.unix_timestamp <= r.target_time.saturating_add(GRACE_SECS) {
         return Err(RouterError::TooEarly.into());
     }
+    // A settlement request belongs to no trader (account 2 is then ignored).
+    if r.kind == KIND_TRADE {
+        let mut t = load_trader(program_id, trader_ai, &r.wallet)?;
+        if t.pending_vault != r.vault || t.pending_id != r.id {
+            return Err(RouterError::BadAccount.into());
+        }
+        t.has_pending = 0;
+        store(trader_ai, &t)?;
+    }
     b.remove(r.id)?;
     b.forfeited_bonds = b.forfeited_bonds.saturating_add(BOND_LAMPORTS);
     store(book_ai, &b)?;
-    t.has_pending = 0;
-    store(trader_ai, &t)?;
     close(request_ai, BOND_LAMPORTS, book_ai, wallet)
 }

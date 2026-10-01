@@ -34,6 +34,10 @@ pub enum VaultError {
     NotRouter,
     /// A fill that the router did not arm for this slot and size.
     NotArmed,
+    /// A settlement with the vault's position open needs that position settled at the price.
+    NotSettled,
+    /// `RequireFlat`: the epoch's withdrawals fit in the vault's cash, so no flat roll is needed.
+    CanSettleOpen,
 }
 
 impl From<VaultError> for ProgramError {

@@ -155,12 +155,15 @@ fn inventory_cap_limits_fills() {
 fn roll_needs_flat_portfolio_and_reduce_only_gets_there() {
     let (mut w, alice) = funded();
     w.taker_trade(0, TEN_M).unwrap(); // vault short 10 units
-    w.withdraw(&alice, 1_000).unwrap();
+    // A withdrawal of half the vault: more than the cash it keeps outside Percolator.
+    let half = w.tokens(alice.shares) / 2;
+    w.withdraw(&alice, half).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     expect_err(w.roll(), VaultError::NotFlat);
+    w.require_flat().unwrap();
 
-    // Epoch over with a request pending: the vault only reduces. A taker buy would grow the
-    // short, so it fills nothing; a taker sell shrinks it and fills.
+    // Epoch over with withdrawals that need the vault flat: the vault only reduces. A taker buy
+    // would grow the short, so it fills nothing; a taker sell shrinks it and fills.
     w.taker_trade(0, TEN_M).unwrap();
     assert_eq!({ w.vault_state().inventory }, -TEN_M, "no growth in reduce-only");
     w.taker_trade(0, -2 * TEN_M).unwrap();
@@ -402,8 +405,10 @@ fn a_market_is_closed_out_after_an_unwind_and_reopens() {
     w.taker_trade(0, TEN_M).unwrap();
     router_err(w.close_out(0), RouterError::NotCloseOnly);
     w.taker_trade(2, -4_000_000).unwrap(); // a second taker on the other side: the vault is short 6
-    w.withdraw(&alice, 1_000_000).unwrap();
+    let half = w.tokens(alice.shares) / 2;
+    w.withdraw(&alice, half).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.require_flat().unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     let unwind = Instruction {
         program_id: pid(),
@@ -451,6 +456,112 @@ fn a_market_is_closed_out_after_an_unwind_and_reopens() {
     w.taker_trade(0, -2_000_000).unwrap();
 }
 
+/// An epoch settles while the vault holds a position, at a price fixed in advance through the
+/// router, and trading is not interrupted. The deposit buys shares at the vault's value at that
+/// price (its open loss included), so neither the depositor nor the incumbents gain.
+#[test]
+fn an_epoch_settles_with_the_vault_holding_a_position() {
+    let (mut w, alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap(); // the vault is short 10 units
+    let bob = w.new_user(100_000_000);
+    w.deposit(&bob, 20_000_000).unwrap();
+    w.withdraw(&alice, w.tokens(alice.shares) / 50).unwrap(); // 2%: well within the cash reserve
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    // The price rises 5%: the vault's short has lost about 0.5 when the epoch settles.
+    w.move_price(1, INITIAL_PRICE * 105 / 100);
+
+    // Not flat, so the plain roll is refused, but nothing is closing-only: a new long fills.
+    expect_err(w.roll(), VaultError::NotFlat);
+    expect_err(w.require_flat(), VaultError::CanSettleOpen);
+    w.taker_trade(1, 2_000_000).unwrap();
+    let inventory = { w.vault_state().inventory };
+    assert_eq!(inventory, -12_000_000);
+
+    let (nav, supply) = (w.nav(), w.share_supply());
+    assert!(nav < 50_000_000, "the open loss is in the value: {nav}");
+    w.settle_open().unwrap();
+    assert_eq!({ w.vault_state().epoch }, 2);
+    assert_eq!({ w.vault_state().inventory }, inventory, "the position is untouched");
+    assert!(!w.portfolio_view().flat);
+
+    // One price for everyone: the value per share is the same before and after (to rounding).
+    let (nav2, supply2) = (w.nav(), w.share_supply());
+    let (before, after) = (nav as u128 * 1_000_000_000 / supply as u128, nav2 as u128 * 1_000_000_000 / supply2 as u128);
+    assert!(before.abs_diff(after) <= before / 100_000, "share value {before} -> {after}");
+    w.claim(&bob, 1).unwrap();
+    w.claim(&alice, 1).unwrap();
+    let bob_value = w.tokens(bob.shares) as u128 * nav2 as u128 / supply2 as u128;
+    assert!(bob_value <= 20_000_000 && bob_value > 19_990_000, "bob holds what he paid for: {bob_value}");
+    // The reserve stays as cash for the next epoch's withdrawals.
+    let cash = w.tokens(w.buffer) - w.vault_state().reserved_assets;
+    assert!(cash >= nav2 / 11, "cash reserve {cash} of {nav2}");
+    // Trading carries on.
+    w.taker_trade(0, -TEN_M).unwrap();
+}
+
+#[test]
+fn only_the_router_settles_an_open_epoch_and_only_at_its_target_price() {
+    let (mut w, _alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap();
+    let bob = w.new_user(100_000_000);
+    w.deposit(&bob, 20_000_000).unwrap();
+    // No settlement request before the epoch is over.
+    assert!(w.request_settle().is_err());
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    expect_err(w.roll(), VaultError::NotFlat);
+    // A signer that is not the router's authority does not unlock the roll.
+    let mallory = Keypair::new();
+    w.env.svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+    let mut forged = w.roll_ix(&w.payer.pubkey());
+    forged.accounts.push(AccountMeta::new_readonly(mallory.pubkey(), true));
+    expect_err(w.send(vec![forged], &[&mallory]), VaultError::NotRouter);
+    // Queued, but the mark is not at the request's target price yet.
+    let id = w.request_settle().unwrap();
+    let ix = w.settle_ix(id);
+    assert!(w.send(vec![ix], &[]).unwrap_err().contains(&format!("0x{:x}", percolator_router::RouterError::NotAtTarget as u32)));
+    assert_eq!({ w.vault_state().epoch }, 1);
+}
+
+#[test]
+fn withdrawals_beyond_the_cash_reserve_need_the_vault_flat() {
+    let (mut w, alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap();
+    w.withdraw(&alice, w.tokens(alice.shares) / 2).unwrap();
+    // Not before the epoch is over.
+    expect_err(w.require_flat(), VaultError::EpochNotOver);
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    // The open settlement cannot pay half the vault out of a 10% cash reserve.
+    assert!(w.settle_open().unwrap_err().contains(&format!("0x{:x}", VaultError::NotFlat as u32)));
+    assert_eq!({ w.vault_state().epoch }, 1);
+    // The request that could not execute expires like any other (executors check first and do
+    // not queue one that cannot succeed), forfeiting its bond.
+    let id = { w.book().pending_id }[0];
+    let target = w.request_target(id);
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, target + percolator_router::GRACE_SECS + 1);
+    let payer = w.payer.pubkey();
+    let router = percolator_router::id();
+    let expire = Instruction {
+        program_id: router,
+        accounts: vec![
+            AccountMeta::new_readonly(payer, true),
+            AccountMeta::new(percolator_router::state::request_address(&router, &w.vault, id).0, false),
+            AccountMeta::new_readonly(payer, false), // no trader behind a settlement request
+            AccountMeta::new(payer, false),
+            AccountMeta::new(percolator_router::state::book_address(&router, &w.vault).0, false),
+        ],
+        data: vec![percolator_router::TAG_EXPIRE],
+    };
+    w.send(vec![expire], &[]).unwrap();
+    assert_eq!({ w.book().len }, 0);
+    // So the vault goes closing-only, and settles once it is flat.
+    w.taker_trade(1, 1_000_000).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -11_000_000, "still open for business until then");
+    w.require_flat().unwrap();
+    w.taker_trade(1, 1_000_000).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -11_000_000, "closing-only now");
+}
+
 #[allow(unused)]
 fn unused() -> Pubkey {
     system_program::ID
@@ -461,7 +572,8 @@ fn a_taker_holding_a_position_cannot_lock_withdrawals() {
     let (mut w, alice) = funded();
     // Mallory opens a position against the vault and never closes it.
     w.taker_trade(0, TEN_M).unwrap();
-    w.withdraw(&alice, 1_000_000).unwrap();
+    let half = w.tokens(alice.shares) / 2;
+    w.withdraw(&alice, half).unwrap();
     let unwind = |w: &World| Instruction {
         program_id: pid(),
         accounts: vec![
@@ -474,6 +586,7 @@ fn a_taker_holding_a_position_cannot_lock_withdrawals() {
     };
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     expect_err(w.roll(), VaultError::NotFlat);
+    w.require_flat().unwrap();
     // One epoch of reduce-only grace first.
     expect_err(w.send(vec![unwind(&w)], &[]), VaultError::EpochNotOver);
     w.advance(EPOCH_LEN, INITIAL_PRICE);

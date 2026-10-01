@@ -137,8 +137,9 @@ fn e2e_create_deposit_trade_roll_withdraw() {
     println!("roll CU: {cu}");
     let v = w.vault_state();
     assert_eq!({ v.epoch }, 1);
-    assert_eq!(w.portfolio_view().capital, 50_000_000, "deployed into Percolator");
-    assert_eq!(w.tokens(w.buffer), 0);
+    assert_eq!(w.portfolio_view().capital, 45_000_000, "deployed into Percolator");
+    assert_eq!(w.tokens(w.buffer), 5_000_000, "less the 10% kept as cash for withdrawals");
+    assert_eq!({ v.last_nav }, 50_000_000);
     w.claim(&alice, 0).unwrap();
     let alice_shares = w.tokens(alice.shares);
     assert_eq!(alice_shares, 50_000_000 * 1_000, "first deposit mints at 1000 shares per atom");
@@ -170,8 +171,9 @@ fn e2e_create_deposit_trade_roll_withdraw() {
     println!("alice collateral after exit: {alice_back}");
     assert!(alice_back >= 100_000_000 - 1, "alice keeps her principal (minus rounding)");
     assert!(w.tokens(bob.shares) > 0);
-    // Buffer holds exactly what is still owed.
-    assert_eq!(w.tokens(w.buffer), { w.vault_state().reserved_assets });
+    // The buffer holds what is still owed plus the cash reserve (10% of the vault's value).
+    let v = w.vault_state();
+    assert_eq!(w.tokens(w.buffer) - v.reserved_assets, { v.last_nav } / 10);
 }
 
 

@@ -46,12 +46,13 @@ pub fn decode(data: &[u8]) -> Result<Request, VaultError> {
     })
 }
 
-/// True when the vault only accepts fills that shrink its position: the epoch is over and
-/// someone is waiting to deposit or withdraw, so the vault works toward flat to settle them.
+/// True when the vault only accepts fills that shrink its position: the epoch is over and its
+/// withdrawals cannot be paid from the vault's cash (`needs_flat`), so the vault works toward
+/// flat to settle them. Deposits, and withdrawals the cash covers, settle with the position open
+/// and do not interrupt trading.
 pub fn reduce_only(v: &state::VaultState, now_slot: u64) -> bool {
     let epoch_over = now_slot >= v.epoch_start_slot.saturating_add(v.epoch_len_slots);
-    let has_requests = v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0;
-    epoch_over && has_requests
+    epoch_over && v.needs_flat != 0
 }
 
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {

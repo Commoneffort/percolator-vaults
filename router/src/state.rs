@@ -91,8 +91,13 @@ pub struct Request {
     pub target_time: i64,
     pub created_slot: u64,
     pub bump: u8,
-    pub _pad: [u8; 7],
+    /// `KIND_TRADE` (a trade, or a forced close when `size` is 0) or `KIND_SETTLE` (an epoch
+    /// settlement of the vault: `wallet` is then whoever queued it, not a trader).
+    pub kind: u8,
+    pub _pad: [u8; 6],
 }
+pub const KIND_TRADE: u8 = 0;
+pub const KIND_SETTLE: u8 = 1;
 pub const REQUEST_LEN: usize = core::mem::size_of::<Request>();
 
 pub fn load<T: Pod>(ai: &AccountInfo, program_id: &Pubkey, magic: u64) -> Result<T, ProgramError> {

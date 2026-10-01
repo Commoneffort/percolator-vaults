@@ -144,6 +144,52 @@ pub fn request_close(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey, id: u64) ->
     }
 }
 
+/// Queues the settlement of a vault's epoch at the first Pyth price after its target time.
+pub fn request_settle(payer: &Pubkey, vault: &Pubkey, id: u64) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            ro(*vault),
+            w(book_address(&crate::id(), vault).0),
+            w(request_address(&crate::id(), vault, id).0),
+            ro(system_program::ID),
+        ],
+        data: vec![TAG_REQUEST_SETTLE],
+    }
+}
+
+/// Executes a queued settlement (rolls the vault's epoch `epoch` through the router).
+pub fn settle(executor: &Pubkey, k: &VaultKeys, request_payer: &Pubkey, id: u64, epoch: u64, frontier: u64) -> Instruction {
+    let mut data = vec![TAG_SETTLE];
+    data.extend_from_slice(&frontier.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(*executor, true),
+            w(request_address(&crate::id(), &k.vault, id).0),
+            w(*request_payer),
+            w(book_address(&crate::id(), &k.vault).0),
+            ro(authority_address(&crate::id()).0),
+            w(k.vault),
+            w(k.market),
+            w(k.portfolio),
+            w(k.buffer),
+            w(k.percolator_vault),
+            ro(k.percolator_vault_authority),
+            w(k.share_mint),
+            w(k.escrow),
+            w(k.epoch_record(epoch)),
+            ro(k.delegate),
+            ro(PERCOLATOR_PROGRAM_ID),
+            ro(k.program),
+            ro(spl_token::ID),
+            ro(system_program::ID),
+        ],
+        data,
+    }
+}
+
 pub fn advance(k: &VaultKeys, pyth: &Pubkey, observation_sequence: u64, authority_epoch: u64) -> Instruction {
     let mut data = vec![TAG_ADVANCE];
     data.extend_from_slice(&observation_sequence.to_le_bytes());

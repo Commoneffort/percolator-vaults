@@ -318,6 +318,63 @@ impl World {
         self.execute(taker, id)
     }
 
+    /// Switches the vault to closing-only for an overdue epoch whose withdrawals exceed its cash.
+    pub fn require_flat(&mut self) -> Result<u64, String> {
+        let ix = Instruction {
+            program_id: pid(),
+            accounts: vec![
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.env.market, false),
+                AccountMeta::new_readonly(self.portfolio, false),
+                AccountMeta::new_readonly(self.buffer, false),
+                AccountMeta::new_readonly(self.share_mint, false),
+            ],
+            data: vec![percolator_vault::processor::TAG_REQUIRE_FLAT],
+        };
+        self.send(vec![ix], &[])
+    }
+
+    /// Queues the settlement of the epoch through the router; returns the request id.
+    pub fn request_settle(&mut self) -> Result<u64, String> {
+        let id = self.book().next_id;
+        let ix = rclient::request_settle(&self.payer.pubkey(), &self.vault, id);
+        self.send(vec![ix], &[])?;
+        Ok(id)
+    }
+
+    pub fn settle_ix(&self, id: u64) -> Instruction {
+        let payer = self.payer.pubkey();
+        rclient::settle(&payer, self.keys.as_ref().unwrap(), &payer, id, { self.vault_state().epoch }, self.frontier())
+    }
+
+    /// Queues a settlement and executes it: the first Pyth update at its target (at the current
+    /// price), advance, converge (which settles the vault's position at that price), settle.
+    pub fn settle_open(&mut self) -> Result<u64, String> {
+        let id = self.request_settle()?;
+        let target = self.request_target(id);
+        let slot = self.env.current_slot() + 1;
+        self.env.set_clock(slot, target.max(self.clock_ts()));
+        let prev = self.pyth_time;
+        self.pyth_time = target;
+        let u = self.pyth_update(self.price, target, prev);
+        self.advance_to(u)?;
+        self.converge();
+        let ix = self.settle_ix(id);
+        self.send(vec![ix], &[])
+    }
+
+    /// The vault's net asset value as the roll counts it (low: no unreleased profit).
+    pub fn nav(&self) -> u64 {
+        let v = self.vault_state();
+        let lp = self.portfolio_view();
+        let cash = self.tokens(self.buffer) - v.reserved_assets - v.pending_deposit_assets;
+        cash + (lp.capital as u64).saturating_sub((-lp.pnl).max(0) as u64)
+    }
+
+    pub fn share_supply(&self) -> u64 {
+        u64::from_le_bytes(self.env.svm.get_account(&self.share_mint).unwrap().data[36..44].try_into().unwrap())
+    }
+
     /// Renews the vault's matcher approval (anyone can; keepers do it periodically).
     pub fn refresh_matcher(&mut self) {
         let mut data = vec![percolator_vault::processor::TAG_REFRESH_MATCHER];

@@ -78,7 +78,11 @@ pub struct VaultState {
     /// KIND_CANONICAL vaults live at the one address for (market, feed); KIND_LEGACY at
     /// (market, creator, seed).
     pub vault_kind: u8,
-    pub _pad1: [u8; 5],
+    /// Set (by `RequireFlat`) when the epoch is over and its withdrawals exceed the cash the
+    /// vault holds outside Percolator, so they can only be paid once its position is closed.
+    /// While set, the vault only takes fills that shrink its position. Cleared by the roll.
+    pub needs_flat: u8,
+    pub _pad1: [u8; 4],
     pub oracle_max_staleness_secs: u64,
     pub oracle_soft_stale_slots: u64,
     pub oracle_ewma_halflife_slots: u64,
