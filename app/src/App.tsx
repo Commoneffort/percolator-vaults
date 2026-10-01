@@ -445,6 +445,7 @@ function describe(tx: any, v: C.Vault): string {
   const msg = tx.transaction.message;
   const keys: PublicKey[] = (msg.staticAccountKeys ?? msg.accountKeys) as PublicKey[];
   const ixs: any[] = msg.compiledInstructions ?? msg.instructions;
+  let crank = false;
   for (const ix of ixs) {
     const program = keys[ix.programIdIndex];
     const data: Uint8Array = ix.data instanceof Uint8Array ? ix.data : new Uint8Array(ix.data);
@@ -467,9 +468,9 @@ function describe(tx: any, v: C.Vault): string {
       if (data[0] === 6) return "Queued trade filled at its target price";
       if (data[0] === 7) return "Queued trade expired unfilled";
     }
-    if (program.equals(C.PERCOLATOR) && data[0] === 5) return "Keeper crank";
+    if (program.equals(C.PERCOLATOR) && data[0] === 5) crank = true; // a fill carries cranks in front: keep looking
   }
-  return "Transaction";
+  return crank ? "Keeper crank" : "Transaction";
 }
 
 // ---------------------------------------------------------------- trade
@@ -505,6 +506,23 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
   const noLiquidity = v.lastNav === 0n;
   const epochLeft = v.epochStart + v.epochLen > state.slot ? v.epochStart + v.epochLen - state.slot : 0n;
   const minutesLeft = Math.max(1, Math.ceil(Number(epochLeft) * C.slotSeconds() / 60));
+
+  // Say what became of a queued trade once it leaves the queue (the fill is sent by an executor,
+  // not by this page, so there is no confirmation of its own to show).
+  const watched = useRef<{ size: bigint; position: bigint } | null>(null);
+  const [outcome, setOutcome] = useState<string>();
+  useEffect(() => {
+    const position = p?.position ?? 0n;
+    if (pendingHere) { watched.current ??= { size: pendingHere.size, position }; setOutcome(undefined); return; }
+    const w = watched.current;
+    if (!w) return;
+    watched.current = null;
+    const got = position - w.position;
+    const abs = (q: bigint) => units(q < 0n ? -q : q);
+    setOutcome(got === 0n
+      ? `Your queued ${w.size > 0n ? "long" : "short"} of ${abs(w.size)} ${sym} left the queue without trading (it expired, or the vault could not take it).`
+      : `Filled: ${got > 0n ? "bought" : "sold"} ${abs(got)} ${sym}${got !== w.size ? ` of the ${abs(w.size)} requested` : ""}. Your position is now ${units(position)} ${sym}.`);
+  }, [pendingHere?.id, p?.position]);
 
   const create = () => {
     if (!publicKey) return;
@@ -572,6 +590,7 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
           <div className="note">The vault is at its position limit, so it cannot take more {room.long === 0n ? "longs" : "shorts"} right now.</div>
         )}
         {pendingHere && <PendingTrade r={pendingHere} sym={sym} chainNow={chainNow} />}
+        {!pendingHere && outcome && <div className="callout small"><b>{outcome}</b></div>}
         {pendingElsewhere && <p className="muted small">You have a trade queued on another market; it has to fill or expire first.</p>}
         <p className="muted small">
           Every trade is queued and fills at the first Pyth price published {C.ROUTER_DELAY_SECS} seconds after your
