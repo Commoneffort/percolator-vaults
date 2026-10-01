@@ -70,6 +70,10 @@ pub fn quote_price(oracle_e6: u64, taker_buys: bool, spread_bps: u16) -> Result<
 /// fill moves the vault: +1 when the taker sells (the vault buys), -1 when the taker buys.
 /// In reduce-only mode only fills that move the inventory toward zero, without crossing it, are
 /// allowed. Otherwise the resulting inventory is kept within `max_inventory_abs`.
+///
+/// The per-fill cap limits how much new exposure one fill can add. The part of a fill that
+/// brings the inventory back toward zero takes risk off the vault and is not capped, so a
+/// trader can always close a whole position against the vault in one fill.
 pub fn allowed_fill(
     requested_abs: u128,
     max_fill_abs: u128,
@@ -78,19 +82,16 @@ pub fn allowed_fill(
     max_inventory_abs: u128,
     reduce_only: bool,
 ) -> u128 {
-    let want = core::cmp::min(requested_abs, max_fill_abs);
     let inv_abs = inventory.unsigned_abs();
     let reducing = inventory != 0 && (inventory > 0) != (lp_delta_sign > 0);
+    let closes = if reducing { core::cmp::min(requested_abs, inv_abs) } else { 0 };
     if reduce_only {
-        return if reducing { core::cmp::min(want, inv_abs) } else { 0 };
+        return closes;
     }
-    // Room before hitting the cap on the side the fill moves toward.
-    let room = if reducing {
-        inv_abs.saturating_add(max_inventory_abs)
-    } else {
-        max_inventory_abs.saturating_sub(inv_abs)
-    };
-    core::cmp::min(want, room)
+    // What is left after the closing part opens exposure: up to the per-fill cap, and to the
+    // room before the position cap on the side the fill moves toward.
+    let room = if reducing { max_inventory_abs } else { max_inventory_abs.saturating_sub(inv_abs) };
+    closes + core::cmp::min(core::cmp::min(requested_abs - closes, max_fill_abs), room)
 }
 
 /// A size cap (in position units) worth `bps` of `nav` in notional at `price_e6`:
@@ -164,6 +165,12 @@ mod tests {
         assert_eq!(allowed_fill(500, 1_000, 0, 1, 100, true), 0);
         // Per-fill cap.
         assert_eq!(allowed_fill(500, 30, 0, 1, 100, false), 30);
+        // The cap is on new exposure only: closing the vault's whole position is one fill, and
+        // only what crosses zero is capped.
+        assert_eq!(allowed_fill(80, 30, 80, -1, 100, false), 80);
+        assert_eq!(allowed_fill(500, 30, 80, -1, 100, false), 110);
+        assert_eq!(allowed_fill(500, 30, 80, -1, 100, true), 80);
+        assert_eq!(allowed_fill(500, 30, -80, 1, 100, true), 80);
     }
 
     proptest! {

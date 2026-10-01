@@ -375,18 +375,17 @@ export function depth(s: State): { long: bigint; short: bigint } {
     maxFill = maxFill < cap(v.fillNavBps) ? maxFill : cap(v.fillNavBps);
   }
   const inv = v.inventory;
+  const abs = inv < 0n ? -inv : inv;
+  // Closing the vault's position is never capped; only new exposure is (per fill, and in total).
   const room = (lpSign: 1n | -1n) => {
     const reducing = inv !== 0n && (inv > 0n) !== (lpSign > 0n);
-    const abs = inv < 0n ? -inv : inv;
-    const r = reducing ? abs + maxInv : maxInv > abs ? maxInv - abs : 0n;
-    return r < maxFill ? r : maxFill;
+    const open = reducing ? maxInv : maxInv > abs ? maxInv - abs : 0n;
+    return (reducing ? abs : 0n) + (open < maxFill ? open : maxFill);
   };
   const epochOver = s.slot >= v.epochStart + v.epochLen && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
   if (epochOver) {
-    const abs = inv < 0n ? -inv : inv;
-    const f = abs < maxFill ? abs : maxFill;
     // Reduce-only: a taker long is only filled if the vault is long (and vice versa).
-    return { long: inv > 0n ? f : 0n, short: inv < 0n ? f : 0n };
+    return { long: inv > 0n ? abs : 0n, short: inv < 0n ? abs : 0n };
   }
   // A taker long moves the vault short (lpSign -1).
   return { long: room(-1n), short: room(1n) };

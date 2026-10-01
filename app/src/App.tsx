@@ -319,9 +319,9 @@ function MarketInner({ vaultKey, send, busy, tick }: { vaultKey: PublicKey; send
         <Sparkline points={history} />
         <div className="stats">
           <Stat label="Vault liquidity" value={usd(nav)} sub={`${shares(state.shareSupply)} shares`} />
-          <Stat label="Vault position" value={`${units(v.inventory)} ${sym}`} sub={v.positionNavBps
-            ? `limit ±${units(capUnits(nav, v.positionNavBps, state.asset.price))} (3× NAV), ≤${units(capUnits(nav, v.fillNavBps, state.asset.price))} per fill`
-            : `limit ±${units(v.maxInventory)}, ≤${units(v.maxFill)} per fill`} />
+          <Stat label="Vault position" value={v.inventory === 0n ? "flat" : `${v.inventory < 0n ? "short" : "long"} ${units(v.inventory < 0n ? -v.inventory : v.inventory)} ${sym}`} sub={(v.inventory === 0n ? "" : `the other side of traders' net ${v.inventory < 0n ? "long" : "short"} · `) + (v.positionNavBps
+            ? `limit ${units(capUnits(nav, v.positionNavBps, state.asset.price))} (3× NAV), new exposure ≤${units(capUnits(nav, v.fillNavBps, state.asset.price))} per order`
+            : `limit ${units(v.maxInventory)}, new exposure ≤${units(v.maxFill)} per order`)} />
           <Stat label="Open interest" value={`${units(state.asset.oiLong)} ${sym}`} sub="long = short" />
           <Stat label="Fees" value={usd(v.feesHarvested + state.asset.insurance)} sub={`${usd(v.feesHarvested)} harvested · floor ${usd(v.insuranceFloor, 0)}`} />
           <DepthStat state={state} />
@@ -627,7 +627,7 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
         {!noLiquidity && state.trader && want > 0n && ((want > room.long && room.long > 0n && !tooBig(1n)) || (want > room.short && room.short > 0n && !tooBig(-1n))) && (
           <div className="note">
             This vault takes at most {units(room.long)} {sym} long or {units(room.short)} {sym} short per order right now: one order
-            is limited to {v.fillNavBps / 100}% of the vault's liquidity ({usd(v.lastNav)}), and its total position to {v.positionNavBps / 100}%.
+            can add exposure worth {v.fillNavBps / 100}% of the vault's liquidity ({usd(v.lastNav)}) at most, and its total position is limited to {v.positionNavBps / 100}%; an order that closes the vault's position is not limited.
             Your order will be cut to that amount. Prices come from Pyth, so an order does not move the price.
           </div>
         )}
@@ -814,7 +814,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
       <section className="card">
         <h3>The rules every market gets</h3>
         <div className="row"><span>Vault position limit</span><b>3× its NAV</b></div>
-        <div className="row"><span>Largest single fill</span><b>0.75× its NAV</b></div>
+        <div className="row"><span>Most new exposure per order</span><b>0.75× its NAV (closing is not limited)</b></div>
         <div className="row"><span>Epoch</span><b>about {Math.round(C.CANON_EPOCH_LEN_SLOTS * C.slotSeconds() / 60)} minutes</b></div>
         <div className="row"><span>Insurance kept for traders</span><b>$100</b></div>
         <div className="row"><span>Price</span><b>Pyth, ≤ 5 min old</b></div>

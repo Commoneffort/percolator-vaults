@@ -143,7 +143,7 @@ export default function Docs() {
         <table className="doc-table">
           <tbody>
             <tr><td>Vault position limit</td><td>3× the vault's NAV in notional, at the current price</td></tr>
-            <tr><td>Largest single fill</td><td>0.75× the vault's NAV</td></tr>
+            <tr><td>Most new exposure per fill</td><td>0.75× the vault's NAV (the part of a fill that closes the vault's position is not limited)</td></tr>
             <tr><td>Epoch</td><td>{CANON_EPOCH_LEN_SLOTS.toLocaleString()} slots (about {Math.round(CANON_EPOCH_LEN_SLOTS * slotSeconds() / 60)} minutes at the current slot time) on devnet</td></tr>
             <tr><td>Insurance floor</td><td>100 USDC kept in insurance for traders; only fees above it are harvested</td></tr>
             <tr><td>Price</td><td>Verified Pyth prices only, moved forward by the router; listing needs a price at most 300 seconds old</td></tr>
