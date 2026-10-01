@@ -88,6 +88,7 @@ export default {
     "fee_bps_off": 144,
     "grace_secs": 90,
     "im_bps_off": 558,
+    "liquidation_bps": 1250,
     "max_pending": 32,
     "min_im_off": 518,
     "program": "DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3",

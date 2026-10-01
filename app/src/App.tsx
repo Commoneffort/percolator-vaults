@@ -488,6 +488,62 @@ function describe(tx: any, v: C.Vault): string {
 
 // ---------------------------------------------------------------- trade
 
+type Fill = { sig: string; slot: number; vault: string; size: number; price: number };
+
+/** This wallet's fills on a vault, read from the router's fill logs ("fill <id> <size> <price>")
+ *  in the trading account's transaction history and cached in this browser. Only a few new
+ *  transactions are fetched per refresh (the public RPC is rate-limited). */
+function useFills(wallet: PublicKey | null, vault: PublicKey, tick: bigint): Fill[] {
+  const { connection } = useConnection();
+  const key = wallet ? `pv:fills:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}` : "";
+  const [fills, setFills] = useState<Fill[]>([]);
+  useEffect(() => {
+    if (!wallet) { setFills([]); return; }
+    let live = true;
+    (async () => {
+      let cache: { seen: string[]; fills: Fill[] } = { seen: [], fills: [] };
+      try { cache = JSON.parse(localStorage.getItem(key) ?? "") ?? cache; } catch { /* first visit */ }
+      setFills(cache.fills);
+      try {
+        const sigs = await connection.getSignaturesForAddress(C.traderAddress(wallet), { limit: 40 }, "confirmed");
+        const fresh = sigs.filter(x => !x.err && !cache.seen.includes(x.signature)).reverse().slice(0, 5);
+        for (const x of fresh) {
+          const tx = await connection.getTransaction(x.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+          if (!tx) continue;
+          cache.seen.push(x.signature);
+          const line = (tx.meta?.logMessages ?? []).find(l => /^Program log: fill \d+ -?\d+ \d+$/.test(l));
+          if (!line) continue;
+          const [, , , , size, price] = line.split(" ");
+          const keys = [...tx.transaction.message.staticAccountKeys, ...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])].map(k => k.toString());
+          // The vault is the account whose router book is also in the transaction.
+          const v = keys.find(k => keys.includes(C.bookAddress(new PublicKey(k)).toString()));
+          if (v && Number(size) !== 0) cache.fills.push({ sig: x.signature, slot: x.slot, vault: v, size: Number(size) / 1e6, price: Number(price) / 1e6 });
+        }
+        cache.seen = cache.seen.slice(-200);
+        cache.fills = cache.fills.sort((a, b) => a.slot - b.slot).slice(-200);
+        try { localStorage.setItem(key, JSON.stringify(cache)); } catch { /* storage unavailable */ }
+        if (live) setFills(cache.fills);
+      } catch { /* rate-limited: try again on the next refresh */ }
+    })();
+    return () => { live = false; };
+  }, [key, tick]);
+  return useMemo(() => fills.filter(f => f.vault === vault.toBase58()), [fills, vault.toBase58()]);
+}
+
+/** Average entry price of the open position implied by a wallet's fills on one market, or
+ *  undefined when the fills on record do not add up to the position (older fills are missing,
+ *  or it was changed by a liquidation or a close-out). */
+function entryPrice(fills: Fill[], position: number): number | undefined {
+  let pos = 0, avg = 0;
+  for (const f of fills) {
+    const next = pos + f.size;
+    if (pos === 0 || Math.sign(next) !== Math.sign(pos)) avg = f.price;                  // opened, or flipped
+    else if (Math.abs(next) > Math.abs(pos)) avg = (avg * Math.abs(pos) + f.price * Math.abs(f.size)) / Math.abs(next);
+    pos = Math.abs(next) < 1e-9 ? 0 : next;
+  }
+  return position !== 0 && Math.abs(pos - position) < 1e-6 ? avg : undefined;
+}
+
 function PendingTrade({ r, sym, chainNow }: { r: C.RouterRequest; sym: string; chainNow: number }) {
   const left = r.target - chainNow;
   return (
@@ -546,6 +602,21 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
       : `Filled: ${got > 0n ? "bought" : "sold"} ${abs(got)} ${sym}${got !== w.size ? ` of the ${abs(w.size)} requested` : ""}. Your position is now ${units(position)} ${sym}.`);
   }, [pendingHere?.id, p?.position]);
 
+  // Account health across all markets, and what it means for this position.
+  const h = state.health;
+  const ratio = h && h.notional > 0n ? num(h.equity, 1e6) / num(h.notional, 1e6) : undefined;
+  const liqLevel = Number(C.LIQUIDATION_BPS) / 10_000;
+  const posN = num(p?.position ?? 0n, 1e6), priceN = num(state.asset.price, 1e6);
+  // The price at which equity falls to the liquidation level, other positions unchanged.
+  const liqPrice = (() => {
+    if (!h || posN === 0) return undefined;
+    const other = num(h.notional, 1e6) - Math.abs(posN) * priceN;
+    const x = (liqLevel * other - num(h.equity, 1e6) + posN * priceN) / (posN - liqLevel * Math.abs(posN));
+    return x > 0 ? x : undefined;
+  })();
+  const fills = useFills(publicKey, v.key, p?.position ?? 0n);
+  const entry = entryPrice(fills, posN);
+
   const create = () => {
     if (!publicKey) return;
     send("Create trading account", [C.openTradingAccount(publicKey)]);
@@ -584,9 +655,19 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
           </>
         ) : (
           <>
-            <div className="row"><span>Margin</span><b>{usd(p?.capital ?? 0n)}</b></div>
-            <div className="row"><span>{sym} position</span><b className={(p?.position ?? 0n) > 0n ? "up" : (p?.position ?? 0n) < 0n ? "down" : ""}>{units(p?.position ?? 0n)} {sym}</b></div>
-            <div className="row"><span>Position value</span><b>${fmt(Math.abs(num(p?.position ?? 0n, 1e6)) * num(state.asset.price, 1e6))}</b></div>
+            <div className="row"><span>Account equity</span><b>{usd(h?.equity ?? p?.capital ?? 0n)}</b></div>
+            <div className="row"><span>{sym} position</span><b className={posN > 0 ? "up" : posN < 0 ? "down" : ""}>{posN > 0 ? "long " : posN < 0 ? "short " : ""}{units(posN < 0 ? -(p?.position ?? 0n) : p?.position ?? 0n)} {sym}</b></div>
+            {posN !== 0 && (
+              <>
+                <div className="row"><span>Position value</span><b>${fmt(Math.abs(posN) * priceN)}</b></div>
+                <div className="row"><span>Entry price</span><b>{entry ? `$${fmt(entry, priceN < 10 ? 4 : 2)}` : "—"}</b></div>
+                <div className="row"><span>Profit / loss on it</span><b className={entry ? ((priceN - entry) * posN >= 0 ? "up" : "down") : ""}>{entry ? `${(priceN - entry) * posN >= 0 ? "+" : "−"}$${fmt(Math.abs((priceN - entry) * posN))}` : "—"}</b></div>
+                <div className="row"><span>Liquidation price (est.)</span><b>{liqPrice ? `$${fmt(liqPrice, priceN < 10 ? 4 : 2)}` : "—"}</b></div>
+              </>
+            )}
+            {ratio !== undefined && (
+              <div className="row"><span>Margin ratio (all markets)</span><b className={ratio < liqLevel * 1.3 ? "down" : ""}>{fmt(ratio * 100, 1)}% · liquidated below {fmt(liqLevel * 100, 1)}%</b></div>
+            )}
             <div className="row"><span>Wallet test USDC</span><b>{usd(state.userCollateral)}</b></div>
             <label className="field"><span>USDC</span><input value={margin} onChange={e => setMargin(e.target.value)} inputMode="decimal" /></label>
             <div className="btns">

@@ -186,28 +186,60 @@ async function race(label: string, variants: TransactionInstruction[][]) {
   return false;
 }
 
-/** A close-only market (a position on it was force-reduced, typically by the vault's Unwind)
- *  reopens only once every position on it is closed, and the vault cannot take the other side
- *  of a close there. Anyone may queue a close-out for a trader; this queues one per pass and
- *  market, and the fill path executes it at its target Pyth price like any request. */
-async function closeOut(vaults: C.Vault[], market: Uint8Array) {
+/** Forced closes and bookkeeping that nobody else does, while no trade is queued:
+ *   - Close-outs. A close-only market (a position on it was force-reduced: the vault's Unwind, or
+ *     Percolator's own liquidation) reopens only once every position on it is closed, and the
+ *     vault cannot take the other side of a close there.
+ *   - Liquidations. An account below the router's level is closed against the vault, before it
+ *     reaches Percolator's maintenance margin (whose liquidation makes the market close-only).
+ *   - A vault's tracked position is re-read when Percolator changed it outside a fill.
+ *  Anyone may queue a forced close for a trader; this queues one per pass and market, and the
+ *  fill path executes it at its target Pyth price like any request. */
+async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
   const closing = vaults.filter(v => C.closeOnly(market, v.assetIndex));
-  if (!closing.length) return false;
-  const [snap, traders] = await Promise.all([C.marketSnapshot(conn), conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }] })]);
+  if (!closing.length && !full) return false;
+  const [snap, traders, fresh] = await Promise.all([
+    C.marketSnapshot(conn),
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }] }),
+    conn.getMultipleAccountsInfo(vaults.map(v => v.key)),
+  ]);
   const owners = new Map(traders.map(t => { const d = C.decodeTrader(new Uint8Array(t.account.data)); return [d.portfolio.toBase58(), d] as const; }));
-  let sent = false;
-  for (const v of closing) {
-    const holder = snap.portfolios.find(p => owners.get(p.pubkey.toBase58()) && !owners.get(p.pubkey.toBase58())!.hasPending && C.decodePortfolio(p.data, v.assetIndex, snap.market).position !== 0n);
+  for (const [i, v] of vaults.entries()) {
+    const lp = snap.portfolios.find(p => p.pubkey.equals(v.lpPortfolio));
+    if (!lp || !fresh[i]) continue;
+    const held = C.decodePortfolio(lp.data, v.assetIndex, snap.market).position;
+    const tracked = C.decodeVault(v.key, new Uint8Array(fresh[i]!.data)).inventory;
+    if (held !== tracked) await send(`sync ${v.feed?.symbol} vault position ${Number(tracked) / 1e6} -> ${Number(held) / 1e6}`, [C.syncInventory(v)]);
+  }
+  const queue = async (v: C.Vault, wallet: PublicKey, why: string) => {
     const book = await conn.getAccountInfo(C.bookAddress(v.key));
-    if (!holder || !book) continue;
+    if (!book) return false;
+    return send(`queue ${why} ${v.feed?.symbol} for ${wallet.toBase58().slice(0, 6)}`, [C.requestClose(payer.publicKey, wallet, v.key, C.decodeBook(new Uint8Array(book.data)).nextId)], true);
+  };
+  let sent = false;
+  const busy = new Set<string>();
+  for (const v of closing) {
+    const holder = snap.portfolios.find(p => { const o = owners.get(p.pubkey.toBase58()); return o && !o.hasPending && C.decodePortfolio(p.data, v.assetIndex, snap.market).position !== 0n; });
+    if (!holder) continue;
     const t = owners.get(holder.pubkey.toBase58())!;
-    sent = (await send(`queue close-out ${v.feed?.symbol} for ${t.wallet.toBase58().slice(0, 6)}`, [C.requestClose(payer.publicKey, t.wallet, v.key, C.decodeBook(new Uint8Array(book.data)).nextId)], true)) || sent;
+    busy.add(holder.pubkey.toBase58());
+    sent = (await queue(v, t.wallet, "close-out")) || sent;
+  }
+  for (const p of snap.portfolios) {
+    const o = owners.get(p.pubkey.toBase58());
+    if (!o || o.hasPending || busy.has(p.pubkey.toBase58())) continue;
+    const h = C.accountHealth(snap.market, p.data);
+    if (!h.liquidatable) continue;
+    // Close the largest position first; the next pass looks again.
+    const worst = h.positions.reduce((a, b) => (b.notional > a.notional ? b : a));
+    const v = vaults.find(x => x.assetIndex === worst.asset);
+    if (v && !C.closeOnly(snap.market, v.assetIndex)) sent = (await queue(v, o.wallet, `liquidation (equity ${(Number(h.equity) / 1e6).toFixed(2)} on ${(Number(h.notional) / 1e6).toFixed(2)} notional)`)) || sent;
   }
   return sent;
 }
 
 /** Routine upkeep while no trade is queued: finalize parked sides, keep every listed asset within
- *  ~50 slots of the chain (one crank advances all of them by 10), and every tenth pass settle
+ *  ~50 slots of the chain (one crank advances all of them by 10), and every third pass settle
  *  the positions that price moves left out of date, so a fill has little left to do. */
 async function upkeep(vaults: C.Vault[], market: Uint8Array, slot: bigint, pass: number) {
   const assets = vaults.map(v => v.assetIndex);
@@ -216,7 +248,7 @@ async function upkeep(vaults: C.Vault[], market: Uint8Array, slot: bigint, pass:
   const oldest = assets.map(a => C.decodeAsset(market, a).slotLast).reduce((m, t) => (t < m ? t : m), slot);
   const lag = Number(slot - oldest);
   const vehicle = vaults[0].lpPortfolio;
-  if (pass % 10 === 0 && lag <= 60) {
+  if (pass % 3 === 0 && lag <= 60) {
     const plan = C.crankPlan(await C.marketSnapshot(conn), payer.publicKey, vehicle, undefined, undefined, assets);
     if (plan.settle.length) {
       const t = await tune(plan.lagCrank, Math.max(1, Math.ceil((plan.lag + LAND_SLOTS) / 10)), plan.settle.slice(0, 6), []);
@@ -291,7 +323,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // The lag crank count is right for the slot simulated; one more is right from the next
     // 10-slot boundary on. Whichever matches the landing slot fills; the other fails harmlessly.
     const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...tuned.settle, ...tail];
-    await race(`${r.size === 0n ? "close out" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, [version(tuned.k), version(tuned.k + 1)]);
+    await race(`${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, [version(tuned.k), version(tuned.k + 1)]);
     log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result`);
   }
 
@@ -366,7 +398,7 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
       // needs, and one landing in between would make one of those a no-op and fail the fill.
       // The fill catches up whatever the request needs itself.
       const queued = vaults.some((_, i) => accs[2 + 2 * i] && C.decodeBook(new Uint8Array(accs[2 + 2 * i]!.data)).pending.length > 0);
-      if (!queued && vaults.length && (await closeOut(vaults, market).catch(e => { log("error", "close-out", String(e?.message ?? e).slice(0, 140)); return false; }))) continue;
+      if (!queued && vaults.length && (await watch(vaults, market, pass % 3 === 1).catch(e => { log("error", "watch", String(e?.message ?? e).slice(0, 140)); return false; }))) continue;
       if (!queued && vaults.length) await upkeep(vaults, market, slot, pass++).catch(e => log("error", "upkeep", String(e?.message ?? e).slice(0, 140)));
       waiting = queued;
       for (const [i, v] of vaults.entries()) {

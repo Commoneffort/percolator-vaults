@@ -543,11 +543,39 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     portfolio: user && data(9) ? decodePortfolio(data(9)!, v.assetIndex, data(0)!) : undefined,
     margin: user && data(9) ? marginRoom(data(0)!, data(9)!, v.assetIndex) : undefined,
     openPositions: user && data(9) ? openPositions(data(9)!) : 0,
+    health: user && data(9) ? accountHealth(data(0)!, data(9)!) : undefined,
     trader,
     pending,
   };
 }
 export type State = Awaited<ReturnType<typeof fetchVault>>;
+
+/** The router liquidates an account whose equity is below this share (bps) of its notional. */
+export const LIQUIDATION_BPS = BigInt(L.router.liquidation_bps);
+
+/** An account's margin position across all markets: equity (capital + PnL), each position as
+ *  Percolator counts it with its notional at the current price, and whether every position is
+ *  settled at that price (until it is, capital and PnL do not reflect the latest move). */
+export function accountHealth(market: Uint8Array, portfolio: Uint8Array) {
+  const P = L.portfolio;
+  const at = (a: number) => L.market.slots + a * L.market.slot_len + L.market.engine;
+  const positions: { asset: number; size: bigint; price: bigint; notional: bigint }[] = [];
+  let settled = true, notional = 0n;
+  for (let i = 0; i < 16; i++) {
+    const leg = P.legs + i * P.leg_len;
+    if (portfolio[leg + L.leg.active] !== 1) continue;
+    const asset = u32(portfolio, leg + L.leg.asset_index);
+    const size = legPosition(market, portfolio, leg);
+    const price = u64(market, at(asset) + L.market.effective_price);
+    const n = (size < 0n ? -size : size) * price / UNIT;
+    const long = portfolio[leg + L.leg.side] === 0;
+    if (u64(portfolio, leg + L.leg.kf_epoch_snap) < u64(market, at(asset) + (long ? L.market.kf_epoch_long : L.market.kf_epoch_short))) settled = false;
+    notional += n;
+    if (size !== 0n) positions.push({ asset, size, price, notional: n });
+  }
+  const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl);
+  return { equity, notional, settled, positions, liquidatable: settled && notional > 0n && equity * 10_000n < notional * LIQUIDATION_BPS };
+}
 
 /** True while a market is close-only: a position on it was reduced unilaterally (the vault's
  *  Unwind, a liquidation), which deleverages the other side, and Percolator then refuses every
@@ -665,10 +693,18 @@ export const requestTrade = (wallet: PublicKey, vault: PublicKey, id: bigint, si
   keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
   data: new W().u8(4).i128(size).done(),
 });
-/** Queues the close-out of `wallet`'s position on a close-only market (`payer` may be anyone). */
+/** Sets a vault's tracked position to what its portfolio holds (after Percolator changed it
+ *  outside a fill: a liquidation or a close-out on the other side). Anyone can send it. */
+export const syncInventory = (v: Vault) => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [rw(v.key), ro(MARKET), ro(v.lpPortfolio)],
+  data: new W().u8(34).done(),
+});
+/** Queues the forced close of `wallet`'s position on a vault's market (`payer` may be anyone):
+ *  a close-out on a close-only market, or a liquidation of an account below the router's level. */
 export const requestClose = (payer: PublicKey, wallet: PublicKey, vault: PublicKey, id: bigint) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(SystemProgram.programId)],
+  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet))],
   data: new W().u8(8).done(),
 });
 /** Moves a vault's mark to a verified Pyth update (a PriceUpdateV2 account). */
