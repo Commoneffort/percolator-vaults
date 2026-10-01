@@ -564,9 +564,12 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                     Err(e) => eprintln!("{} retire: {}", k.vault, e.lines().next().unwrap_or("")),
                 }
             }
-            // A roll fails while the vault still holds a position, so an overdue epoch is only
-            // retried every 10th pass to stay inside RPC rate limits.
-            let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots && tick % 10 == 0;
+            // Deposits and withdrawals wait on the roll, and until it happens the vault only takes
+            // trades that reduce its position, so a flat vault with requests is rolled on the first
+            // pass after its epoch ends. A roll fails while the vault holds a position, and one
+            // with no requests is not urgent: those are retried every 10th pass.
+            let urgent = (v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0) && v.inventory == 0;
+            let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots && (urgent || tick % 10 == 0);
             if tick % 15 != 0 && !epoch_over {
                 continue;
             }

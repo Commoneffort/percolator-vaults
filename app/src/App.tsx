@@ -501,6 +501,10 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
   // Same rule as the vault's matcher: past the end of an epoch with deposits or withdrawals
   // waiting, the vault only takes trades that shrink its own position, so it can settle them.
   const reduceOnly = state.slot >= v.epochStart + v.epochLen && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
+  const room = C.depth(state);
+  const noLiquidity = v.lastNav === 0n;
+  const epochLeft = v.epochStart + v.epochLen > state.slot ? v.epochStart + v.epochLen - state.slot : 0n;
+  const minutesLeft = Math.max(1, Math.ceil(Number(epochLeft) * C.slotSeconds() / 60));
 
   const create = () => {
     if (!publicKey) return;
@@ -550,15 +554,22 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
         <label className="field"><span>Size ({sym})</span><input value={size} onChange={e => setSize(e.target.value)} inputMode="decimal" /></label>
         <div className="muted small">Notional ≈ ${fmt(notional)} · margin ≈ ${fmt(notional / 10)} · fee ≈ ${fmt(notional * 0.0005)}</div>
         <div className="btns">
-          <button className="btn long" disabled={!state.trader || !state.book || locked || !!busy} onClick={() => trade(1n)}>Long</button>
-          <button className="btn short" disabled={!state.trader || !state.book || locked || !!busy} onClick={() => trade(-1n)}>Short</button>
+          <button className="btn long" disabled={!state.trader || !state.book || locked || !!busy || room.long === 0n} onClick={() => trade(1n)}>Long</button>
+          <button className="btn short" disabled={!state.trader || !state.book || locked || !!busy || room.short === 0n} onClick={() => trade(-1n)}>Short</button>
         </div>
         <button className="btn ghost wide" disabled={!p || p.position === 0n || locked || !!busy} onClick={close}>Close position</button>
-        {reduceOnly && (
+        {noLiquidity ? (
+          <div className="note">
+            This market has no liquidity yet, so it cannot take a trade. Deposits are priced when the epoch ends
+            ({epochLeft > 0n ? `about ${minutesLeft} min from now` : "it is being settled now, usually under a minute"}); trading opens right after.
+          </div>
+        ) : reduceOnly ? (
           <div className="note">
             This vault is settling an epoch: until it rolls (usually under a minute) it only fills trades that reduce
-            its own position{v.inventory === 0n ? ", and it has none, so a trade queued now fills zero" : ` (it is ${v.inventory > 0n ? "long" : "short"}, so only ${v.inventory > 0n ? "longs" : "shorts"} fill)`}.
+            its own position{v.inventory === 0n ? ", and it has none, so nothing can be opened right now" : ` (it is ${v.inventory > 0n ? "long" : "short"}, so only ${v.inventory > 0n ? "longs" : "shorts"} fill)`}.
           </div>
+        ) : (room.long === 0n || room.short === 0n) && (
+          <div className="note">The vault is at its position limit, so it cannot take more {room.long === 0n ? "longs" : "shorts"} right now.</div>
         )}
         {pendingHere && <PendingTrade r={pendingHere} sym={sym} chainNow={chainNow} />}
         {pendingElsewhere && <p className="muted small">You have a trade queued on another market; it has to fill or expire first.</p>}
@@ -600,7 +611,7 @@ function LiquidityPanel({ state, send, busy }: { state: C.State; send: Send; bus
             <div className="row"><span>Value</span><b>${fmt(num(state.userShares, 10 ** C.SHARE_DECIMALS) * price)}</b></div>
             <div className="row"><span>Share price</span><b>${fmt(price, 4)}</b></div>
             <div className="row"><span>Wallet test USDC</span><b>{usd(state.userCollateral)}</b></div>
-            {pending && <div className="note">Queued for epoch {String(t!.epoch)}: {t!.deposit > 0n && `${usd(t!.deposit)} deposit`} {t!.withdraw > 0n && `${shares(t!.withdraw)} shares out`}. It settles at one price when the epoch ends.</div>}
+            {pending && <div className="note">Queued for epoch {String(t!.epoch)}: {t!.deposit > 0n && `${usd(t!.deposit)} deposit`} {t!.withdraw > 0n && `${shares(t!.withdraw)} shares out`}. It settles at one price when the epoch ends{state.slot < v.epochStart + v.epochLen ? ` (about ${Math.max(1, Math.ceil(Number(v.epochStart + v.epochLen - state.slot) * C.slotSeconds() / 60))} min from now)` : v.inventory === 0n ? " (being settled now, usually under a minute)" : " (the vault has to be flat first: it now only takes trades that close its position)"}; then come back here to claim your shares.</div>}
             {claimable && <button className="btn primary wide" disabled={!!busy} onClick={() => send("Claim", claimIxs(publicKey))}>Claim epoch {String(t!.epoch)} result</button>}
             <Faucet />
           </>

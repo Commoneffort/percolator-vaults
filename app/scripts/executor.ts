@@ -308,9 +308,10 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
   for (;;) {
     let waiting = false; // a trade is queued: come back sooner
     try {
-      // The vault list changes rarely; everything else is one batched read per pass (the public
-      // devnet RPC allows about 100 requests per 10 seconds).
-      if (!vaults.length || Date.now() - vaultsAt > 300_000) {
+      // The vault list is re-read every 20 seconds, so a market opened just now is serviced
+      // before its first request can expire; everything else is one batched read per pass (the
+      // public devnet RPC allows about 100 requests per 10 seconds).
+      if (!vaults.length || Date.now() - vaultsAt > 20_000) {
         vaultList = await C.listVaults(conn);
         vaults = vaultList.filter(v => v.market.equals(C.MARKET) && v.canonical && v.status === 1 && v.feed);
         vaultsAt = Date.now();
