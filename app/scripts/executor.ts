@@ -1,7 +1,7 @@
 // Router executor: fills queued trades at their target price and keeps every vault's mark fresh.
 // Anyone can run one (the programs check everything); whoever fills a request earns its bond.
 //
-// For each live vault, every three seconds (every second while a trade is queued):
+// For each live vault, every second and a half (without pause while a trade is queued):
 //   1. Fill every request whose target the mark is at, once Percolator's price has reached it.
 //      Percolator only takes new risk on an asset that is accrued to the current slot with every
 //      position on it settled, so the fill carries those cranks (see `crankPlan` in chain.ts).
@@ -18,7 +18,7 @@
 // Hermes needs an API key (Pyth's free plan covers the feeds in chain.ts FEEDS). The key is read
 // from HERMES_API_KEY or ~/.config/solana/percolator-test/hermes-key and never printed.
 // Run: RPC=... npx tsx scripts/executor.ts
-import { ComputeBudgetProgram, Connection, Keypair, SYSVAR_CLOCK_PUBKEY, Transaction, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import * as fs from "fs";
 import { createRequire } from "module";
 import * as C from "../src/chain";
@@ -28,7 +28,7 @@ const require = createRequire(import.meta.url);
 const { Wallet } = require("@coral-xyz/anchor");
 const { PythSolanaReceiver } = require("@pythnetwork/pyth-solana-receiver");
 
-const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: C.politeFetch() });
+const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: C.politeFetch(110) });
 const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(
   process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/percolator-test/deployer.json`, "utf8"))));
 const HERMES = process.env.HERMES_URL ?? "https://pyth.dourolabs.app/hermes";
@@ -77,12 +77,12 @@ async function firstAtOrAfter(feed: string, t: number): Promise<Update | null> {
 
 // ---- chain ----
 /** Waits for a signature by polling (the public RPC rate-limits the websockets confirmTransaction uses). */
-async function confirmed(sig: string) {
-  for (let i = 0; i < 20; i++) {
-    await new Promise(r => setTimeout(r, 1000));
+async function confirmed(sig: string, processedIsEnough = false) {
+  for (let i = 0; i < 50; i++) {
+    await new Promise(r => setTimeout(r, 400));
     const st = (await conn.getSignatureStatuses([sig]).catch(() => null))?.value?.[0];
     if (st?.err) throw new Error(`transaction failed: ${JSON.stringify(st.err)}`);
-    if (st?.confirmationStatus === "confirmed" || st?.confirmationStatus === "finalized") return;
+    if (st?.confirmationStatus === "confirmed" || st?.confirmationStatus === "finalized" || (processedIsEnough && st?.confirmationStatus === "processed")) return;
   }
   throw new Error("not confirmed within 20 s");
 }
@@ -109,10 +109,12 @@ async function send(label: string, ixs: TransactionInstruction[], wait = false) 
 
 /** Sends the Pyth builder's transactions in order (post, consume, close), confirming each by polling. */
 async function sendBuilt(txs: { tx: any; signers: any[] }[]) {
-  for (const { tx, signers } of txs) {
+  // Each transaction builds on the one before, so they go in order; only the last has to be
+  // confirmed before acting on it, the others just have to have been processed.
+  for (const [i, { tx, signers }] of txs.entries()) {
     tx.sign([payer, ...signers]);
     const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-    await confirmed(sig);
+    await confirmed(sig, i < txs.length - 1);
   }
 }
 
@@ -125,8 +127,10 @@ async function advancePosted(v: C.Vault, u: Update) {
     { instruction: C.advanceMark(v, getAccount("0x" + v.feed!.id), market), signers: [] },
   ]);
   try {
-    await sendBuilt(await builder.buildVersionedTransactions({ computeUnitPriceMicroLamports: PRIORITY }));
-    log("ok", `mark ${v.feed!.symbol} -> Pyth ${u.publish} (target price)`);
+    const txs = await builder.buildVersionedTransactions({ computeUnitPriceMicroLamports: PRIORITY });
+    const t0 = Date.now();
+    await sendBuilt(txs);
+    log("ok", `mark ${v.feed!.symbol} -> Pyth ${u.publish} (target price; ${txs.length} transactions, ${((Date.now() - t0) / 1000).toFixed(1)} s, started ${(t0 / 1000 - u.publish).toFixed(1)} s after the price was published)`);
   } catch (e: any) {
     log("fail", `mark ${v.feed!.symbol} -> ${u.publish}`, String(e?.message ?? e).slice(0, 140));
   }
@@ -140,6 +144,7 @@ async function requestsOf(v: C.Vault, b: C.Book) {
 
 type Snapshot = { book: Uint8Array | null; feed: Uint8Array | null; market: Uint8Array; slot: bigint };
 
+const prepared = new Set<string>(); // requests whose assets were brought current while they waited
 const LAND_SLOTS = 6; // slots between reading the chain and a transaction landing, roughly
 const budget = () => [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY })];
 
@@ -149,8 +154,8 @@ const budget = () => [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_00
 async function tune(lagCrank: TransactionInstruction, k: number, settle: TransactionInstruction[], tail: TransactionInstruction[]) {
   const seen: string[] = [];
   for (let round = 0; round < 10; round++) {
-    const { blockhash } = await conn.getLatestBlockhash();
-    const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: blockhash, instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message();
+    // The simulation replaces the blockhash, so any well-formed one will do.
+    const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message();
     const r = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
     const err: any = r.value.err;
     if (!err) return { k, settle };
@@ -171,8 +176,8 @@ async function race(label: string, variants: TransactionInstruction[][]) {
     const sig = await conn.sendTransaction(new Transaction().add(...budget(), ...ixs), [payer], { skipPreflight: true }).catch(() => null);
     if (sig) sigs.push(sig);
   }
-  for (let i = 0; i < 20 && sigs.length; i++) {
-    await new Promise(r => setTimeout(r, 1000));
+  for (let i = 0; i < 40 && sigs.length; i++) {
+    await new Promise(r => setTimeout(r, 500));
     const st = (await conn.getSignatureStatuses(sigs).catch(() => null))?.value ?? [];
     if (st.some(x => x && !x.err && (x.confirmationStatus === "confirmed" || x.confirmationStatus === "finalized"))) { log("ok", label); return true; }
     if (st.length === sigs.length && st.every(x => x?.err)) { log("fail", label, st.map(x => JSON.stringify(x!.err)).join(" / ")); return false; }
@@ -223,7 +228,7 @@ async function upkeep(vaults: C.Vault[], market: Uint8Array, slot: bigint, pass:
   if (lag > 50) await send(`crank ${assets.length} asset(s) (${lag} slots behind)`, Array(Math.min(10, Math.ceil(lag / 10))).fill(C.crank(payer.publicKey, vehicle, assets)));
 }
 
-async function serviceVault(v: C.Vault, now: number, snap: Snapshot): Promise<boolean> {
+async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boolean): Promise<boolean> {
   if (!snap.book) {
     await send(`open book ${v.feed?.symbol}`, [C.openBook(payer.publicKey, v.key)]);
     return false;
@@ -232,11 +237,22 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot): Promise<bo
   const reqs = await requestsOf(v, b);
   const live = reqs.filter(r => now <= r.target + C.ROUTER_GRACE_SECS);
 
+  // 0. While a request waits for its target time, bring every asset its fill will touch up to
+  //    the chain (once per request), so the fill itself has only a few seconds to catch up.
+  for (const r of live.filter(r => r.target > b.markPublish && now < r.target && !prepared.has(`${v.key}:${r.id}`))) {
+    prepared.add(`${v.key}:${r.id}`);
+    const plan = C.crankPlan(await C.marketSnapshot(conn), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet);
+    if (plan.lag <= 15) continue;
+    const t = await tune(plan.lagCrank, Math.min(10, Math.ceil(plan.lag / 10)), [], []);
+    if (typeof t !== "string" && t.k > 0) await send(`get ready for ${v.feed?.symbol} #${r.id} (${plan.lag} slots behind)`, Array(t.k).fill(plan.lagCrank));
+  }
+
   // 1. Time-critical: once the earliest pending target has passed, post the first Pyth price at
   //    or after it (only while its requests can still fill), then fill at it right away.
   const waiting = live.filter(r => r.target > b.markPublish).map(r => r.target);
   const earliest = waiting.length ? Math.min(...waiting) : null;
-  if (earliest !== null && now >= earliest + 1 && now < earliest + C.ROUTER_GRACE_SECS - 3) {
+  // (Wall time decides when to ask Hermes: the chain clock can run a second or two behind it.)
+  if (earliest !== null && Math.max(now, Date.now() / 1000) >= earliest + 0.6 && now < earliest + C.ROUTER_GRACE_SECS - 3) {
     const u = await firstAtOrAfter(v.feed!.id, earliest);
     if (u && u.publish > b.markPublish) {
       await advancePosted(v, u);
@@ -252,7 +268,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot): Promise<bo
     const what = `${v.feed?.symbol} #${r.id}`;
     const plan = C.crankPlan(await C.marketSnapshot(conn), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet);
     const k = Math.max(1, Math.ceil((plan.lag + LAND_SLOTS) / 10));
-    if (k > 4) {
+    if (k > 6) {
       // Too far behind to catch up inside the fill: advance first, wait, fill next pass.
       const t = await tune(plan.lagCrank, Math.min(k, 10), [], []);
       if (typeof t === "string") log("fail", `catch up for ${what}`, t);
@@ -276,6 +292,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot): Promise<bo
     // 10-slot boundary on. Whichever matches the landing slot fills; the other fails harmlessly.
     const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...tuned.settle, ...tail];
     await race(`${r.size === 0n ? "close out" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, [version(tuned.k), version(tuned.k + 1)]);
+    log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result`);
   }
 
   // 3. Expire requests past their grace period.
@@ -285,7 +302,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot): Promise<bo
 
   // 4. Free: move the mark to Pyth's sponsored feed account when it is newer, never past a
   //    pending target.
-  if (snap.feed && live.length === 0) {
+  if (snap.feed && live.length === 0 && !queued) { // not while a trade waits on any market: it comes first
     const p = C.decodePyth(snap.feed);
     if (p.publish > b.markPublish) await send(`mark ${v.feed!.symbol} -> sponsored ${p.publish}`, [C.advanceMark(v, C.feedAccount(v.feed!.id), snap.market)]);
   }
@@ -354,7 +371,8 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
       waiting = queued;
       for (const [i, v] of vaults.entries()) {
         const snap = { market, slot, book: accs[2 + 2 * i] ? new Uint8Array(accs[2 + 2 * i]!.data) : null, feed: accs[3 + 2 * i] ? new Uint8Array(accs[3 + 2 * i]!.data) : null };
-        busy = (await serviceVault(v, now, snap).catch(e => { log("error", v.feed?.symbol, String(e?.message ?? e).slice(0, 140)); return false; })) || busy;
+        if (queued && !(snap.book && C.decodeBook(snap.book).pending.length)) continue; // trades first
+        busy = (await serviceVault(v, now, snap, queued).catch(e => { log("error", v.feed?.symbol, String(e?.message ?? e).slice(0, 140)); return false; })) || busy;
       }
       // Low priority, in the background, and only while no trade is waiting.
       if (!busy && !refreshing) {
@@ -369,6 +387,6 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
     } catch (e: any) {
       log("error", String(e?.message ?? e).slice(0, 140));
     }
-    await new Promise(r => setTimeout(r, waiting ? 1000 : 3000));
+    await new Promise(r => setTimeout(r, waiting ? 500 : 1500));
   }
 })();

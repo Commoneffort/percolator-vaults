@@ -277,7 +277,9 @@ function useVault(vaultKey: PublicKey, tick: number) {
     } catch (e: any) { setErr(e.message); }
   }, [connection, vaultKey.toString(), publicKey?.toString()]);
   useEffect(() => { setHistory([]); }, [vaultKey.toString()]);
-  useEffect(() => { load(); const id = setInterval(load, 6000); return () => clearInterval(id); }, [load, tick]);
+  // Poll faster while a trade of this wallet is queued, so its fill shows up promptly.
+  const waiting = !!state?.trader?.hasPending;
+  useEffect(() => { load(); const id = setInterval(load, waiting ? 2000 : 6000); return () => clearInterval(id); }, [load, tick, waiting]);
   return { state, err, history, reload: load };
 }
 
@@ -354,6 +356,11 @@ function OpenerPanel({ state, send, busy }: { state: C.State; send: Send; busy?:
         <div>
           <h3>You opened this market</h3>
           <p className="muted small">You earn {C.OPENER_FEE_BPS / 100}% of every fee this market harvests, forever. You have no other powers over it.</p>
+          <p className="muted small">
+            {state.asset.insurance <= v.insuranceFloor
+              ? `Trading fees first fill this market's insurance buffer of ${usd(v.insuranceFloor)} (it covers bad debt): ${usd(state.asset.insurance)} collected so far. Fees beyond that are harvested, and your share starts then.`
+              : `${usd(state.asset.insurance - v.insuranceFloor)} of fees are waiting to be harvested.`}
+          </p>
         </div>
         <div className="opener-num">
           <div className="stat-value">{usd(v.openerFeesOwed)}</div>
@@ -515,7 +522,7 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
   const absHeld = held < 0n ? -held : held;
   const marginMax = (sign: 1n | -1n) => (held === 0n || (held > 0n) === (sign > 0n) ? (cap > absHeld ? cap - absHeld : 0n) : absHeld + cap);
   const want = BigInt(Math.round(Number(size || 0) * 1e6));
-  const tooBig = (sign: 1n | -1n) => !!state.trader && want > marginMax(sign);
+  const tooBig = (sign: 1n | -1n) => { const cap = sign > 0n ? room.long : room.short; return !!state.trader && (want > cap ? cap : want) > marginMax(sign); };
   const noLiquidity = v.lastNav === 0n;
   const epochLeft = v.epochStart + v.epochLen > state.slot ? v.epochStart + v.epochLen - state.slot : 0n;
   const minutesLeft = Math.max(1, Math.ceil(Number(epochLeft) * C.slotSeconds() / 60));
@@ -547,7 +554,13 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
     if (!publicKey || !state.book) return;
     send(label, [C.requestTrade(publicKey, v.key, state.book.nextId, q)]);
   };
-  const trade = (sign: 1n | -1n) => request(BigInt(Math.round(Number(size) * 1e6)) * sign, `Queue ${sign > 0n ? "long" : "short"} ${size} ${sym}`);
+  // An order larger than the vault can take right now is cut to that amount before it is sent
+  // (the vault would fill only that much anyway).
+  const trade = (sign: 1n | -1n) => {
+    const cap = sign > 0n ? room.long : room.short;
+    const q = want > cap ? cap : want;
+    request(q * sign, `Queue ${sign > 0n ? "long" : "short"} ${units(q)} ${sym}`);
+  };
   const close = () => {
     if (!publicKey || !state.book || !p || p.position === 0n) return;
     // A close-only market has no counterparty for a close: the position is closed out instead.
@@ -613,8 +626,9 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
         )}
         {!noLiquidity && state.trader && want > 0n && ((want > room.long && room.long > 0n && !tooBig(1n)) || (want > room.short && room.short > 0n && !tooBig(-1n))) && (
           <div className="note">
-            The vault can take at most {units(room.long)} {sym} long or {units(room.short)} {sym} short right now (its limit grows with
-            its liquidity). A larger order fills up to that amount and the rest is dropped.
+            This vault takes at most {units(room.long)} {sym} long or {units(room.short)} {sym} short per order right now: one order
+            is limited to {v.fillNavBps / 100}% of the vault's liquidity ({usd(v.lastNav)}), and its total position to {v.positionNavBps / 100}%.
+            Your order will be cut to that amount. Prices come from Pyth, so an order does not move the price.
           </div>
         )}
         {noLiquidity ? (
