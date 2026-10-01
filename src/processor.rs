@@ -117,6 +117,7 @@ pub const TAG_ACCEPT_GOVERNANCE: u8 = 30;
 pub const TAG_RETIRE_MARKET: u8 = 31;
 pub const TAG_PUSH_MARK: u8 = 32;
 pub const TAG_ARM_FILL: u8 = 33;
+pub const TAG_SYNC_INVENTORY: u8 = 34;
 
 /// A market with no liquidity providers can be retired this many epochs after it was listed.
 pub const RETIRE_IDLE_EPOCHS: u64 = 3;
@@ -479,6 +480,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 return Err(VaultError::InvalidInstruction.into());
             }
             arm_fill(program_id, accounts, i128::from_le_bytes(rest.try_into().unwrap()))
+        }
+        TAG_SYNC_INVENTORY => {
+            no_args(rest)?;
+            sync_inventory(program_id, accounts)
         }
         TAG_RETIRE_MARKET => {
             if rest.len() != 16 {
@@ -1664,6 +1669,30 @@ fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Progra
     }
     v.armed_size = size;
     v.armed_slot = Clock::get()?.slot;
+    state::store_vault(vault_ai, &v)
+}
+
+/// Sets the vault's tracked position to what its portfolio actually holds. The matcher tracks
+/// the position fill by fill, but Percolator can also change it outside a fill: when a trader
+/// on the other side is liquidated or closed out unilaterally, the vault's position is
+/// deleveraged with it. Anyone can call this; it only copies Percolator's own figure.
+///
+/// Accounts: 0 vault [w], 1 market, 2 LP portfolio.
+fn sync_inventory(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let vault_ai = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let portfolio = acc(accounts, 2)?;
+    writable(vault_ai)?;
+    let mut v = state::load_vault(vault_ai, program_id)?;
+    key_is(market, &v.market)?;
+    key_is(portfolio, &v.lp_portfolio)?;
+    perc::expect_market(market)?;
+    perc::read_portfolio(portfolio, market.key, vault_ai.key)?;
+    let held = perc::positions(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)?
+        .iter()
+        .find(|p| p.asset == v.asset_index)
+        .map_or(0, |p| p.size);
+    v.inventory = held;
     state::store_vault(vault_ai, &v)
 }
 

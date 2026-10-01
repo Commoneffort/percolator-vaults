@@ -366,3 +366,95 @@ fn control_sequence_offsets_match_percolator() {
         assert_eq!(rd(16), seq.authority_epoch);
     }
 }
+
+/// A trader with 5 USDC of margin, long 20 units at 1.00, on a market with 10x margin.
+fn leveraged_long(w: &mut World) {
+    let u = w.new_user(100_000_000);
+    let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
+    let mint = w.env.mint;
+    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
+    w.traders.insert(7, (u, t));
+    w.taker_trade(7, 20 * UNIT as i128).unwrap();
+}
+
+fn asset_state(w: &World) -> percolator::AssetStateV16 {
+    w.env.primary_market_state().1.assets[w.asset() as usize]
+}
+
+fn position(w: &World, taker: usize) -> i128 {
+    let m = w.env.svm.get_account(&w.env.market).unwrap().data;
+    let d = w.env.svm.get_account(&w.taker_portfolio(taker)).unwrap().data;
+    perc::positions(&m, &d).unwrap().iter().map(|p| p.size).sum()
+}
+
+#[test]
+fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    // Healthy (25% of notional), then 16.7% at 0.90: a forced close is refused.
+    expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
+    w.move_price(20, 900_000);
+    expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
+    // At 0.85 the account holds 2 USDC against 17 of notional: 11.8%, below the router's 12.5%
+    // and still above Percolator's own 10% maintenance margin.
+    w.move_price(20, 850_000);
+    assert_eq!(position(&w, 7), 20 * UNIT as i128, "Percolator has not liquidated it");
+    // Anyone queues the liquidation; it closes the position against the vault at the next price.
+    w.close_out(7).unwrap();
+    assert_eq!(position(&w, 7), 0);
+    assert!(w.portfolio_view().flat, "the vault's side closed with it");
+    assert_eq!({ w.vault_state().inventory }, 0);
+    // Nothing was deleveraged, so the market stays open, and the trader keeps what was left.
+    let a = asset_state(&w);
+    assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
+    assert!(equity(&w, 7) > 1_900_000 && equity(&w, 7) <= 2_000_000, "equity {}", equity(&w, 7));
+    w.taker_trade(1, UNIT as i128).unwrap();
+}
+
+#[test]
+fn a_liquidation_does_nothing_if_the_trader_recovered_by_its_fill_price() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    w.move_price(20, 850_000);
+    let t = w.trader(7);
+    let id = w.book().next_id;
+    let payer = w.payer.pubkey();
+    w.send(vec![rclient::request_close(&payer, &t, &w.vault, id)], &[]).unwrap();
+    // The first Pyth price after the target is back at 0.90: the account is above the level.
+    w.price = 900_000;
+    w.execute(7, id).unwrap();
+    assert_eq!(position(&w, 7), 20 * UNIT as i128);
+    assert_eq!(w.book().len, 0, "the request is gone either way");
+}
+
+/// If nobody liquidates through the router in time, Percolator's own liquidation is the backstop:
+/// it reduces the position unilaterally, which deleverages the vault's side with it. The vault's
+/// tracked position is then re-read from Percolator, and the market is closed out and reopens.
+#[test]
+fn percolators_own_liquidation_is_the_backstop() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    w.move_price(20, 760_000); // 0.2 USDC left against 15.2 of notional: far below 10%
+    for _ in 0..3 {
+        w.tick(1);
+        w.settle(); // any crank on the account lets Percolator liquidate it
+    }
+    assert!(position(&w, 7) < 20 * UNIT as i128, "Percolator reduced the position");
+    assert_ne!(asset_state(&w).a_short, percolator::ADL_ONE, "and deleveraged the vault's side");
+    assert_eq!({ w.vault_state().inventory }, -20 * UNIT as i128, "which the matcher did not see");
+    let sync = Instruction {
+        program_id: pid(),
+        accounts: vec![AccountMeta::new(w.vault, false), AccountMeta::new_readonly(w.env.market, false), AccountMeta::new_readonly(w.portfolio, false)],
+        data: vec![percolator_vault::processor::TAG_SYNC_INVENTORY],
+    };
+    w.send(vec![sync], &[]).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -position(&w, 7));
+    // Close-only now: close the trader out, settle, reset, and the market trades again.
+    w.close_out(7).unwrap();
+    w.settle();
+    w.finalize_resets();
+    let a = asset_state(&w);
+    assert_eq!((a.oi_eff_long_q, a.a_long, a.a_short), (0, percolator::ADL_ONE, percolator::ADL_ONE));
+    w.refresh_matcher(); // the approval lapsed while the price walked down
+    w.taker_trade(1, UNIT as i128).unwrap();
+}

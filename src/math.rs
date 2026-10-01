@@ -210,7 +210,10 @@ mod tests {
         ) {
             let sign: i8 = if buy { 1 } else { -1 };
             let f = allowed_fill(req, maxf, inv, sign, cap, ro);
-            prop_assert!(f <= req && f <= maxf);
+            // The per-fill cap applies to what a fill opens, not to what it closes.
+            let reducing = inv != 0 && (inv > 0) != (sign > 0);
+            let closes = if reducing { req.min(inv.unsigned_abs()) } else { 0 };
+            prop_assert!(f <= req && f <= closes + maxf);
             let new = inv + sign as i128 * f as i128;
             if ro {
                 prop_assert!(new.unsigned_abs() <= inv.unsigned_abs());

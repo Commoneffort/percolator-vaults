@@ -318,6 +318,25 @@ impl World {
         self.execute(taker, id)
     }
 
+    /// Renews the vault's matcher approval (anyone can; keepers do it periodically).
+    pub fn refresh_matcher(&mut self) {
+        let mut data = vec![percolator_vault::processor::TAG_REFRESH_MATCHER];
+        data.extend_from_slice(&self.frontier().to_le_bytes());
+        let ix = Instruction {
+            program_id: pid(),
+            accounts: vec![
+                AccountMeta::new_readonly(self.vault, false),
+                AccountMeta::new_readonly(self.env.market, false),
+                AccountMeta::new(self.portfolio, false),
+                AccountMeta::new_readonly(pid(), false),
+                AccountMeta::new_readonly(self.delegate, false),
+                AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
+            ],
+            data,
+        };
+        self.send(vec![ix], &[]).expect("refresh matcher");
+    }
+
     /// Finalizes Percolator's side resets on the vault's asset (as executors do); a side that is
     /// not ready is left alone.
     pub fn finalize_resets(&mut self) {

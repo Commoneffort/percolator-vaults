@@ -138,6 +138,7 @@ pub fn request_close(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey, id: u64) ->
             w(request_address(&crate::id(), vault, id).0),
             ro(t.market),
             ro(system_program::ID),
+            ro(t.portfolio),
         ],
         data: vec![TAG_REQUEST_CLOSE],
     }

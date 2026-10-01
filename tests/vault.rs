@@ -308,6 +308,13 @@ fn market_offsets_match_engine() {
     assert_eq!(perc::LEG_ASSET_INDEX, offset_of!(L, asset_index));
     assert_eq!(perc::LEG_BASIS_POS_Q, offset_of!(L, basis_pos_q));
     assert_eq!(perc::LEG_SIDE, offset_of!(L, side));
+    assert_eq!(perc::LEG_A_BASIS, offset_of!(L, a_basis));
+    assert_eq!(perc::LEG_KF_EPOCH_SNAP, offset_of!(L, kf_epoch_snap));
+    assert_eq!(perc::LEG_EPOCH_SNAP, offset_of!(L, epoch_snap));
+    assert_eq!(perc::ASSET_KF_EPOCH_LONG, offset_of!(A, kf_epoch_long));
+    assert_eq!(perc::ASSET_KF_EPOCH_SHORT, offset_of!(A, kf_epoch_short));
+    assert_eq!(perc::ASSET_EPOCH_LONG, offset_of!(A, epoch_long));
+    assert_eq!(perc::ASSET_EPOCH_SHORT, offset_of!(A, epoch_short));
     // The vault reads the router book's pending count and trusts the router's authority address.
     assert_eq!(percolator_vault::ROUTER_BOOK_LEN_OFF, offset_of!(percolator_router::state::Book, len));
     assert_eq!(percolator_vault::ROUTER_PROGRAM_ID, percolator_router::id());

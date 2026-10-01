@@ -26,6 +26,7 @@
 pub mod client;
 pub mod state;
 
+use solana_program::msg;
 use bytemuck::Zeroable;
 use percolator_vault::{
     percolator::{self as perc, PERCOLATOR_PROGRAM_ID},
@@ -62,6 +63,13 @@ pub const GRACE_SECS: i64 = 90;
 pub const BOND_LAMPORTS: u64 = 2_000_000;
 /// Extra price move (bps) the margin check at request time must survive, on every position.
 pub const STRESS_BPS: u128 = 1_000;
+/// A trader whose equity is below this share (bps) of the notional of their positions can be
+/// liquidated through the router: anyone queues it, and at the first Pyth price after its target
+/// the position is closed against the vault if the account is still below this level. It sits
+/// above Percolator's own maintenance margin on purpose. Percolator liquidates by reducing the
+/// position unilaterally, which deleverages the other side and makes the market close-only
+/// until every position on it is closed; closing against the vault first avoids that.
+pub const LIQUIDATION_BPS: u128 = 1_250;
 const POS_SCALE: u128 = 1_000_000;
 
 pub const TAG_OPEN_ACCOUNT: u8 = 0;
@@ -103,7 +111,7 @@ pub enum RouterError {
     /// The market is close-only (a position on it was force-reduced): positions on it can only be
     /// closed, with `RequestClose`, until all are closed and it resets.
     CloseOnly,
-    /// `RequestClose` on a market that is not close-only: use `Request`.
+    /// `RequestClose` when the market is not close-only and the trader is not liquidatable.
     NotCloseOnly,
 }
 
@@ -389,7 +397,8 @@ fn open_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 /// position with prices `STRESS_BPS` higher, and a `STRESS_BPS` loss on all of them.
 fn margin_covers(market: &[u8], portfolio: &[u8], asset: u16, size: i128) -> Result<bool, ProgramError> {
     let (im_bps, min_im, fee_bps) = perc::margin_params(market)?;
-    let (capital, pnl, legs) = perc::portfolio_exposure(portfolio)?;
+    let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
+    let legs: Vec<(u16, i128)> = perc::positions(market, portfolio)?.iter().map(|p| (p.asset, p.size)).collect();
     let notional = |a: u16, q: u128| -> Result<u128, ProgramError> {
         let (_, price, _) = perc::asset_price(market, a)?;
         Ok(q.checked_mul(price as u128).ok_or(RouterError::Overflow)? / POS_SCALE)
@@ -415,6 +424,25 @@ fn margin_covers(market: &[u8], portfolio: &[u8], asset: u16, size: i128) -> Res
         + min_im;
     let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
     Ok(equity >= 0 && equity as u128 >= need)
+}
+
+/// True when the account can be liquidated through the router: every position is settled at the
+/// current price (so capital and PnL reflect it) and equity is below `LIQUIDATION_BPS` of the
+/// positions' notional.
+fn liquidatable(market: &[u8], portfolio: &[u8]) -> Result<bool, ProgramError> {
+    let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
+    let mut notional = 0u128;
+    for p in perc::positions(market, portfolio)? {
+        if !p.settled {
+            return Ok(false);
+        }
+        let (_, price, _) = perc::asset_price(market, p.asset)?;
+        notional = notional
+            .checked_add(p.size.unsigned_abs().checked_mul(price as u128).ok_or(RouterError::Overflow)? / POS_SCALE)
+            .ok_or(RouterError::Overflow)?;
+    }
+    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
+    Ok(notional != 0 && (equity <= 0 || (equity as u128).saturating_mul(10_000) < notional.saturating_mul(LIQUIDATION_BPS)))
 }
 
 /// Queues a trade. It fills at the first Pyth price published at or after its target time, which
@@ -504,15 +532,21 @@ fn enqueue<'a>(
     store(trader_ai, &*t)
 }
 
-/// Queues the close-out of a trader's position on a close-only market. Percolator refuses every
-/// risk-increasing trade on such a market, so the vault cannot take the other side of a close;
-/// the fill instead reduces the position unilaterally (Percolator's `RebalanceReduce`), at the
-/// same price as any request: the first Pyth price published at or after its target time. The
-/// market only reopens once every position on it is closed, so anyone may queue this for any
-/// trader (paying the bond and the request's rent, which goes to the trader when it closes).
+/// Queues the forced close of a trader's position on a vault's market. Anyone may queue it (paying
+/// the bond and the request's rent, which goes to the trader when it closes), in two cases:
+///
+/// - The market is close-only. Percolator refuses every risk-increasing trade on such a market,
+///   so the vault cannot take the other side of a close; the fill reduces the position
+///   unilaterally instead (Percolator's `RebalanceReduce`). The market only reopens once every
+///   position on it is closed.
+/// - The trader is below `LIQUIDATION_BPS` (see `liquidatable`). The fill closes the position
+///   against the vault, if the account is still below that level at the fill price.
+///
+/// Either way it executes at the same price as any request: the first Pyth price published at or
+/// after its target time.
 ///
 /// Accounts: 0 payer [s, w], 1 trader [w], 2 trader wallet, 3 vault, 4 book [w], 5 request [w],
-/// 6 market, 7 system program.
+/// 6 market, 7 system program, 8 trader portfolio.
 fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let payer = acc(accounts, 0)?;
     let trader_ai = acc(accounts, 1)?;
@@ -543,7 +577,11 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     }
     perc::expect_market(market)?;
     if !perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
-        return Err(RouterError::NotCloseOnly.into());
+        let portfolio = acc(accounts, 8)?;
+        key_is(portfolio, &t.portfolio)?;
+        if !liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)? {
+            return Err(RouterError::NotCloseOnly.into());
+        }
     }
     enqueue(program_id, payer, wallet.key, trader_ai, &mut t, vault_ai, book_ai, &mut b, request_ai, system, 0)
 }
@@ -663,18 +701,29 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     let (_, _, fee_bps) = perc::margin_params(&market.try_borrow_data()?)?;
 
+    let held = |p: &AccountInfo, m: &AccountInfo| -> Result<i128, ProgramError> {
+        Ok(perc::positions(&m.try_borrow_data()?, &p.try_borrow_data()?)?.iter().find(|x| x.asset == v.asset_index).map_or(0, |x| x.size))
+    };
+    let before = held(portfolio, market)?;
+    // A forced close (size 0) trades whatever closes the position, or nothing at all.
+    let mut size = r.size;
     if r.size == 0 {
-        // A close-out: reduce the whole position unilaterally at Percolator's price, which is the
-        // mark. Nothing to do if the position is already gone.
-        let held = perc::portfolio_exposure(&portfolio.try_borrow_data()?)?.2.iter().any(|(a, q)| *a == v.asset_index && *q != 0);
-        if held {
+        let close_only = perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)?;
+        if close_only && before != 0 {
+            // Reduce the whole position unilaterally at Percolator's price, which is the mark.
             let view = perc::read_portfolio(portfolio, market.key, trader_ai.key)?;
             invoke_signed(
                 &perc::rebalance_reduce(trader_ai.key, market.key, portfolio.key, view.portfolio_id, view.position_epoch, v.asset_index, u128::MAX >> 1),
                 &[trader_ai.clone(), market.clone(), portfolio.clone(), percolator.clone()],
                 &[trader_seeds!(t)],
             )?;
+        } else if !close_only && before != 0 && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)? {
+            // Still below the liquidation level at the fill price: close against the vault.
+            size = before.checked_neg().ok_or(RouterError::Overflow)?;
         }
+    }
+    if size == 0 {
+        msg!("fill {} {} {}", { r.id }, held(portfolio, market)? - before, effective);
         b.remove(r.id)?;
         store(book_ai, &b)?;
         t.has_pending = 0;
@@ -683,7 +732,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
 
     let mut arm = vec![TAG_ARM_FILL];
-    arm.extend_from_slice(&r.size.to_le_bytes());
+    arm.extend_from_slice(&size.to_le_bytes());
     invoke_signed(
         &Instruction {
             program_id: percolator_vault::id(),
@@ -708,12 +757,14 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             &lp_view,
             v.asset_index,
             market_id,
-            r.size,
+            size,
             fee_bps,
         ),
         &[trader_ai.clone(), market.clone(), portfolio.clone(), lp_portfolio.clone(), vault_program.clone(), vault_ai.clone(), delegate.clone(), percolator.clone()],
         &[trader_seeds!(t)],
     )?;
+    // What actually traded (the vault may fill less than requested) and at what price.
+    msg!("fill {} {} {}", { r.id }, held(portfolio, market)? - before, effective);
 
     b.remove(r.id)?;
     store(book_ai, &b)?;

@@ -138,6 +138,10 @@ pub const ASSET_EFFECTIVE_PRICE: usize = 25;
 pub const ASSET_SLOT_LAST: usize = 41;
 pub const ASSET_A_LONG: usize = 49;
 pub const ASSET_A_SHORT: usize = 65;
+pub const ASSET_KF_EPOCH_LONG: usize = 145;
+pub const ASSET_KF_EPOCH_SHORT: usize = 153;
+pub const ASSET_EPOCH_LONG: usize = 497;
+pub const ASSET_EPOCH_SHORT: usize = 505;
 /// Percolator's deleveraging coefficient of a side nothing has been force-reduced against.
 pub const ADL_ONE: u128 = 1_000_000_000_000_000;
 pub const PORTFOLIO_LEGS_OFF: usize = 356;
@@ -147,6 +151,9 @@ pub const LEG_ACTIVE: usize = 0;
 pub const LEG_ASSET_INDEX: usize = 1;
 pub const LEG_SIDE: usize = 13;
 pub const LEG_BASIS_POS_Q: usize = 14;
+pub const LEG_A_BASIS: usize = 30;
+pub const LEG_KF_EPOCH_SNAP: usize = 78;
+pub const LEG_EPOCH_SNAP: usize = 86;
 
 /// Market-wide margin parameters: initial margin in bps, the minimum nonzero initial margin
 /// requirement (quote atoms) and the base trade fee in bps.
@@ -189,6 +196,54 @@ pub fn portfolio_exposure(d: &[u8]) -> Result<(u128, i128, Vec<(u16, i128)>), Pr
         legs.push((u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?, signed));
     }
     Ok((rd_u128(d, PORTFOLIO_CAPITAL_OFF)?, rd_i128(d, PORTFOLIO_PNL_OFF)?, legs))
+}
+
+/// One position of a portfolio as Percolator counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Position {
+    pub asset: u16,
+    /// Signed size (positive is long): the stored size scaled by how much its side has been
+    /// deleveraged since the leg was opened, and zero once that side was emptied and reset.
+    pub size: i128,
+    /// False while a price move since the leg was last cranked has not been settled into the
+    /// portfolio's capital and PnL yet.
+    pub settled: bool,
+}
+
+/// A portfolio's positions as Percolator counts them (`effective_abs_quantity_for_leg`).
+pub fn positions(market: &[u8], portfolio: &[u8]) -> Result<Vec<Position>, ProgramError> {
+    let mut out = Vec::new();
+    for i in 0..PORTFOLIO_LEG_COUNT {
+        let l = PORTFOLIO_LEGS_OFF + i * PORTFOLIO_LEG_LEN;
+        if *portfolio.get(l + LEG_ACTIVE).ok_or(VaultError::BadPercolatorAccount)? != 1 {
+            continue;
+        }
+        let asset = u32::from_le_bytes(portfolio[l + LEG_ASSET_INDEX..l + LEG_ASSET_INDEX + 4].try_into().unwrap());
+        let asset = u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?;
+        let e = MARKET_SLOTS_OFF + asset as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
+        let long = portfolio[l + LEG_SIDE] == 0;
+        let (a_off, epoch_off, kf_off) = if long {
+            (ASSET_A_LONG, ASSET_EPOCH_LONG, ASSET_KF_EPOCH_LONG)
+        } else {
+            (ASSET_A_SHORT, ASSET_EPOCH_SHORT, ASSET_KF_EPOCH_SHORT)
+        };
+        let basis = rd_i128(portfolio, l + LEG_BASIS_POS_Q)?.unsigned_abs();
+        let a_basis = rd_u128(portfolio, l + LEG_A_BASIS)?;
+        let abs = if rd_u64(portfolio, l + LEG_EPOCH_SNAP)? != rd_u64(market, e + epoch_off)? || a_basis == 0 {
+            0
+        } else {
+            // ceil(basis * a_now / a_basis), as the engine rounds it
+            let num = basis.checked_mul(rd_u128(market, e + a_off)?).ok_or(VaultError::Overflow)?;
+            num.div_ceil(a_basis)
+        };
+        let abs = i128::try_from(abs).map_err(|_| VaultError::Overflow)?;
+        out.push(Position {
+            asset,
+            size: if long { abs } else { -abs },
+            settled: rd_u64(portfolio, l + LEG_KF_EPOCH_SNAP)? >= rd_u64(market, e + kf_off)?,
+        });
+    }
+    Ok(out)
 }
 
 pub fn market_collateral_mint(ai: &AccountInfo) -> Result<Pubkey, ProgramError> {
