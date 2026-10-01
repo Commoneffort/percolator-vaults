@@ -390,6 +390,67 @@ fn sweep_moves_stray_vault_owned_collateral_into_the_buffer() {
     expect_err(w.send(vec![ix2], &[]), VaultError::BadAccount);
 }
 
+/// The unwind deleverages the takers on the other side, and Percolator then takes no new risk on
+/// the asset until every position on it is closed. The router closes them out (anyone can queue
+/// it, at the next Pyth price like any request), after which the market trades again.
+#[test]
+fn a_market_is_closed_out_after_an_unwind_and_reopens() {
+    use percolator_router::RouterError;
+    let router_err = |r: Result<u64, String>, e: RouterError| assert!(r.unwrap_err().contains(&format!("0x{:x}", e as u32)));
+    let (mut w, alice) = funded();
+    // Closing out is only for a close-only market.
+    w.taker_trade(0, TEN_M).unwrap();
+    router_err(w.close_out(0), RouterError::NotCloseOnly);
+    w.taker_trade(2, -4_000_000).unwrap(); // a second taker on the other side: the vault is short 6
+    w.withdraw(&alice, 1_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    let unwind = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new(w.env.market, false),
+            AccountMeta::new(w.portfolio, false),
+            AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
+        ],
+        data: vec![processor::TAG_UNWIND],
+    };
+    w.send(vec![unwind], &[]).unwrap();
+    assert!(w.portfolio_view().flat);
+    w.roll().unwrap();
+    let asset = |w: &World| w.env.primary_market_state().1.assets[w.asset() as usize];
+    // Taker 0's long 10 was deleveraged to the 4 that taker 2 is still short.
+    assert_eq!((asset(&w).oi_eff_long_q, asset(&w).oi_eff_short_q), (4_000_000, 4_000_000));
+    assert_ne!(asset(&w).a_long, percolator::ADL_ONE);
+
+    // New risk is refused at request time (it could never fill), for new and old takers alike.
+    w.trader(1);
+    router_err(w.request(1, 1_000_000), RouterError::CloseOnly);
+    router_err(w.request(0, -1_000_000), RouterError::CloseOnly);
+
+    // Anyone closes a remaining position out, at the first Pyth price after its target. Closing
+    // one side deleverages the other, so here the long's close-out empties the market.
+    let before: Vec<i128> = [0, 2].iter().map(|t| { let d = w.env.svm.get_account(&w.taker_portfolio(*t)).unwrap().data; let (c, p, _) = perc::portfolio_exposure(&d).unwrap(); c as i128 + p }).collect();
+    w.close_out(0).unwrap();
+    assert_eq!((asset(&w).oi_eff_long_q, asset(&w).oi_eff_short_q), (0, 0));
+    for (i, t) in [0, 2].iter().enumerate() {
+        let d = w.env.svm.get_account(&w.taker_portfolio(*t)).unwrap().data;
+        let (c, p, _) = perc::portfolio_exposure(&d).unwrap();
+        assert_eq!(c as i128 + p, before[i], "closed at the mark: no gain or loss at an unchanged price");
+    }
+    // With nothing left open the sides reset (once the emptied positions are settled), and the
+    // market is no longer close-only.
+    router_err(w.close_out(2), RouterError::NotCloseOnly);
+    w.settle();
+    w.finalize_resets();
+    assert_eq!(asset(&w).a_long, percolator::ADL_ONE);
+    assert_eq!(asset(&w).mode_long, percolator::SideModeV16::Normal);
+
+    // The market is open again.
+    w.taker_trade(1, 1_000_000).unwrap();
+    w.taker_trade(0, -2_000_000).unwrap();
+}
+
 #[allow(unused)]
 fn unused() -> Pubkey {
     system_program::ID

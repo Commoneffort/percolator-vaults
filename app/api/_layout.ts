@@ -13,17 +13,23 @@ export default {
     "withdraw_shares": 64
   },
   "leg": {
+    "a_basis": 30,
     "active": 0,
     "asset_index": 1,
     "basis_pos_q": 14,
+    "epoch_snap": 86,
     "kf_epoch_snap": 78,
     "side": 13
   },
   "market": {
+    "a_long": 49,
+    "a_short": 65,
     "authority_epoch": 16,
     "control_sequences": 424,
     "effective_price": 25,
     "engine": 512,
+    "epoch_long": 497,
+    "epoch_short": 505,
     "ins_budget_long": 515,
     "ins_budget_short": 531,
     "ins_spent_long": 547,
@@ -79,8 +85,11 @@ export default {
     },
     "book_len": 632,
     "delay_secs": 4,
+    "fee_bps_off": 144,
     "grace_secs": 90,
+    "im_bps_off": 558,
     "max_pending": 32,
+    "min_im_off": 518,
     "program": "DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3",
     "request": {
       "created_slot": 104,
@@ -91,6 +100,7 @@ export default {
       "wallet": 40
     },
     "request_len": 120,
+    "stress_bps": 1000,
     "trader": {
       "collateral": 104,
       "has_pending": 137,

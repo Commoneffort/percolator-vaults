@@ -44,7 +44,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 3. **Trade through the router.** Takers queue requests; executors move the mark to the verified Pyth price at each request's target and fill it (see above). The vault is the counterparty, within its caps.
 4. **Earn.** Takers' fees land in the asset's insurance. `HarvestFees` (anyone can call it) moves everything above the fixed floor into the vault. The floor stays in place to protect traders. Of what is harvested, 90% belongs to the depositors pro rata and 10% is set aside for whoever opened the market (Hyperliquid HIP-3 style), who claims it with `ClaimOpenerFees` and has no other powers.
 5. **Settle in epochs.** Deposits and withdrawals are queued, then priced together at one net asset value when the epoch rolls and the LP portfolio is flat. Percolator only allows withdrawals from a flat portfolio, and pricing only at flat points removes every stale-price game.
-6. **Keep exits open.** After an epoch ends with requests waiting, the vault only accepts trades that shrink its position. If a trader holds a position on purpose, anyone can call `Unwind` one epoch later, and the vault closes its own position through Percolator's unilateral `RebalanceReduce`.
+6. **Keep exits open.** After an epoch ends with requests waiting, the vault only accepts trades that shrink its position. If a trader holds a position on purpose, anyone can call `Unwind` one epoch later, and the vault closes its own position through Percolator's unilateral `RebalanceReduce`. That deleverages the traders on the other side, and Percolator then takes no new position on the market until every position on it is closed. The vault cannot take the other side of a close there, so the router closes the remaining positions out (`RequestClose`: anyone can queue it for any trader, and it executes at the first Pyth price after its target like any request); the market then resets and reopens.
 7. **Retire dead markets.** When a market has had no liquidity providers for three epochs, holds no position and has no trade queued, anyone can call `RetireMarket`: its leftover insurance (trading fees nobody else owns) goes to the opener, Percolator retires the asset, and its slot is reused by the next market opened. The same feed can be opened again later.
 8. **Wind down.** If the market is resolved, `SettleResolved` (anyone can call it) closes the portfolio through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata.
 
@@ -83,6 +83,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 5 | `Advance` | anyone | Moves a vault's mark to a newer verified Pyth price, never past a pending target |
 | 6 | `Fill` | anyone | Fills a request at the mark once the mark is its target price; pays the executor the bond |
 | 7 | `Expire` | anyone | Removes a request unfilled 90 s after its target; the bond is forfeited |
+| 8 | `RequestClose` | anyone, for any trader | On a close-only market (after an `Unwind` or a liquidation): queues the close-out of a trader's position, filled like a request by reducing it unilaterally at the mark |
 
 ## Share pricing
 
@@ -93,10 +94,10 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 ## Tests
 
-`./test.sh` builds both on-chain programs and runs 51 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `owl/trunk` of `Commoneffort/percolator-prog`) with its SBF binary built. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness; every trade in them goes through the router.
+`./test.sh` builds both on-chain programs and runs 53 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `owl/trunk` of `Commoneffort/percolator-prog`) with its SBF binary built. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness; every trade in them goes through the router.
 
 - **Front-running:** a trader who knows the price in advance ends flat, not ahead; the fill is exactly the first Pyth price at or after the target; a later update, or one that is not the first after the target, cannot move the mark; nobody can push a newer price over a pending request; the executor's identity and timing do not change the fill; a fill waits until Percolator's price has reached the mark; a direct trade against the vault is refused; only the router can move the mark or arm a fill; forged, unverified and wrong-feed Pyth accounts are refused.
-- **Requests:** they cannot be cancelled or withdrawn from, and expire only after the grace period with the bond forfeited; margin must survive a stressed move; withdrawals only reach the owner's wallet; a market with a queued request cannot be retired.
+- **Requests:** they cannot be cancelled or withdrawn from, and expire only after the grace period with the bond forfeited; margin must survive a stressed move, except for a trade that only reduces a position; withdrawals only reach the owner's wallet; a market with a queued request cannot be retired.
 - **Math and property tests:** withdrawals never exceed NAV, deposit-then-withdraw never profits, incumbents are never diluted, fills never break the caps.
 - **Layout tests:** every account offset and every Percolator instruction encoding the programs use is checked against Percolator's own types and decoder.
 - **Flows:** canonical vaults are unique per feed, ignore creator-chosen limits, can be listed by anyone, and scale their caps with NAV. Create → deposit → trade → roll → withdraw. List → trade → harvest fees → exit with profit. Gains and losses reach depositors exactly. Maintenance fees. Market resolution with everyone exiting. Retiring an idle market and reopening its feed in the freed slot.

@@ -147,6 +147,7 @@ const budget = () => [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_00
  *  reports: a crank with nothing to do is dropped, and a trade refused because an asset is still
  *  behind gets one more lag crank. Returns what would succeed now, or why nothing does. */
 async function tune(lagCrank: TransactionInstruction, k: number, settle: TransactionInstruction[], tail: TransactionInstruction[]) {
+  const seen: string[] = [];
   for (let round = 0; round < 10; round++) {
     const { blockhash } = await conn.getLatestBlockhash();
     const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: blockhash, instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message();
@@ -154,12 +155,13 @@ async function tune(lagCrank: TransactionInstruction, k: number, settle: Transac
     const err: any = r.value.err;
     if (!err) return { k, settle };
     const i = (err.InstructionError?.[0] ?? -1) - 2, code = err.InstructionError?.[1]?.Custom;
+    seen.push(`${code ?? JSON.stringify(err.InstructionError?.[1])} at ${i} of ${k}+${settle.length}+${tail.length}`);
     if (code === 22 && i >= 0 && i < k) k--;
     else if (code === 22 && i >= k && i < k + settle.length) settle = settle.filter((_, j) => j !== i - k);
     else if (code === 21 && i >= k && k < 12) k++;
     else return `simulation failed at instruction ${i} of ${k} + ${settle.length} + ${tail.length}: ${JSON.stringify(err)}`;
   }
-  return "simulation kept changing";
+  return `simulation kept changing: ${seen.join("; ")}`;
 }
 
 /** Sends alternative versions of one action at once (no preflight) and waits until one lands. */
@@ -177,6 +179,26 @@ async function race(label: string, variants: TransactionInstruction[][]) {
   }
   log("fail", label, "not confirmed within 20 s");
   return false;
+}
+
+/** A close-only market (a position on it was force-reduced, typically by the vault's Unwind)
+ *  reopens only once every position on it is closed, and the vault cannot take the other side
+ *  of a close there. Anyone may queue a close-out for a trader; this queues one per pass and
+ *  market, and the fill path executes it at its target Pyth price like any request. */
+async function closeOut(vaults: C.Vault[], market: Uint8Array) {
+  const closing = vaults.filter(v => C.closeOnly(market, v.assetIndex));
+  if (!closing.length) return false;
+  const [snap, traders] = await Promise.all([C.marketSnapshot(conn), conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }] })]);
+  const owners = new Map(traders.map(t => { const d = C.decodeTrader(new Uint8Array(t.account.data)); return [d.portfolio.toBase58(), d] as const; }));
+  let sent = false;
+  for (const v of closing) {
+    const holder = snap.portfolios.find(p => owners.get(p.pubkey.toBase58()) && !owners.get(p.pubkey.toBase58())!.hasPending && C.decodePortfolio(p.data, v.assetIndex, snap.market).position !== 0n);
+    const book = await conn.getAccountInfo(C.bookAddress(v.key));
+    if (!holder || !book) continue;
+    const t = owners.get(holder.pubkey.toBase58())!;
+    sent = (await send(`queue close-out ${v.feed?.symbol} for ${t.wallet.toBase58().slice(0, 6)}`, [C.requestClose(payer.publicKey, t.wallet, v.key, C.decodeBook(new Uint8Array(book.data)).nextId)], true)) || sent;
+  }
+  return sent;
 }
 
 /** Routine upkeep while no trade is queued: finalize parked sides, keep every listed asset within
@@ -253,7 +275,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot): Promise<bo
     // The lag crank count is right for the slot simulated; one more is right from the next
     // 10-slot boundary on. Whichever matches the landing slot fills; the other fails harmlessly.
     const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...tuned.settle, ...tail];
-    await race(`fill ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, [version(tuned.k), version(tuned.k + 1)]);
+    await race(`${r.size === 0n ? "close out" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, [version(tuned.k), version(tuned.k + 1)]);
   }
 
   // 3. Expire requests past their grace period.
@@ -327,6 +349,7 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
       // needs, and one landing in between would make one of those a no-op and fail the fill.
       // The fill catches up whatever the request needs itself.
       const queued = vaults.some((_, i) => accs[2 + 2 * i] && C.decodeBook(new Uint8Array(accs[2 + 2 * i]!.data)).pending.length > 0);
+      if (!queued && vaults.length && (await closeOut(vaults, market).catch(e => { log("error", "close-out", String(e?.message ?? e).slice(0, 140)); return false; }))) continue;
       if (!queued && vaults.length) await upkeep(vaults, market, slot, pass++).catch(e => log("error", "upkeep", String(e?.message ?? e).slice(0, 140)));
       waiting = queued;
       for (const [i, v] of vaults.entries()) {

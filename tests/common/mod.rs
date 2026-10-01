@@ -305,6 +305,34 @@ impl World {
     /// (at the current price), advance, converge, fill. Returns the fill's compute units.
     pub fn taker_trade_asset(&mut self, taker: usize, _asset: u16, size_q: i128) -> Result<u64, String> {
         let id = self.request(taker, size_q)?;
+        self.execute(taker, id)
+    }
+
+    /// Queues the close-out of `taker`'s position on a close-only market, paid for by the
+    /// harness payer (anyone may), and executes it.
+    pub fn close_out(&mut self, taker: usize) -> Result<u64, String> {
+        let t = self.trader(taker);
+        let id = self.book().next_id;
+        let ix = rclient::request_close(&self.payer.pubkey(), &t, &self.vault, id);
+        self.send(vec![ix], &[])?;
+        self.execute(taker, id)
+    }
+
+    /// Finalizes Percolator's side resets on the vault's asset (as executors do); a side that is
+    /// not ready is left alone.
+    pub fn finalize_resets(&mut self) {
+        for side in 0..2u8 {
+            let mut data = vec![45u8];
+            data.extend_from_slice(&self.asset().to_le_bytes());
+            data.push(side);
+            let ix = Instruction { program_id: perc::PERCOLATOR_PROGRAM_ID, accounts: vec![AccountMeta::new(self.env.market, false)], data };
+            let _ = self.send(vec![ix], &[]);
+        }
+    }
+
+    /// Brings a queued request to its fill: the first Pyth update at its target (at the current
+    /// price), advance, converge, fill.
+    pub fn execute(&mut self, taker: usize, id: u64) -> Result<u64, String> {
         let target = self.request_target(id);
         let slot = self.env.current_slot() + 1;
         self.env.set_clock(slot, target.max(self.clock_ts()));

@@ -41,7 +41,12 @@ const ERRORS: Record<string, string> = {
   "0x1": "not enough test USDC: use Get test USDC", "0x5608": "vault not active", "0x560a": "claim your previous request first",
   "0x560b": "nothing to claim", "0x560c": "epoch not over", "0x560d": "epoch not settled yet", "0x560e": "vault not flat yet",
   "0x5610": "amount is zero", "0x5611": "unknown asset", "0x15": "market busy: try again in a few seconds",
-  "0x13": "market state stale: try again", "0xe": "not enough margin", "0x12": "asset generation changed: retry",
+  "0x13": "close your open positions first (margin can only be withdrawn from an account with none)", "0xe": "not enough margin", "0x12": "asset generation changed: retry",
+  "0x5705": "you already have a trade queued: it has to fill or expire first",
+  "0x5706": "not enough margin for this size (the order must survive a further 10% price move): add margin or lower the size",
+  "0x5707": "this market's queue is full: try again in a minute",
+  "0x570f": "this market is close-only until its remaining positions are closed",
+  "0x5710": "this market is open: close with a normal trade",
 };
 
 function useSend(onDone: () => void): [Send, string | undefined, Toast | undefined, () => void] {
@@ -467,6 +472,7 @@ function describe(tx: any, v: C.Vault): string {
       if (data[0] === 5) return ""; // mark moved to a new Pyth price: not shown
       if (data[0] === 6) return "Queued trade filled at its target price";
       if (data[0] === 7) return "Queued trade expired unfilled";
+      if (data[0] === 8) return "Close-out queued";
     }
     if (program.equals(C.PERCOLATOR) && data[0] === 5) crank = true; // a fill carries cranks in front: keep looking
   }
@@ -479,7 +485,7 @@ function PendingTrade({ r, sym, chainNow }: { r: C.RouterRequest; sym: string; c
   const left = r.target - chainNow;
   return (
     <div className="callout small">
-      <b>{r.size > 0n ? "Long" : "Short"} {units(r.size < 0n ? -r.size : r.size)} {sym} queued.</b>{" "}
+      <b>{r.size === 0n ? `Close-out of your ${sym} position queued.` : `${r.size > 0n ? "Long" : "Short"} ${units(r.size < 0n ? -r.size : r.size)} ${sym} queued.`}</b>{" "}
       It fills at the first Pyth price published at or after {new Date(r.target * 1000).toLocaleTimeString()}
       {left > 0 ? ` (in ${left}s)` : ""}. Nobody can know that price yet, including you, so nobody can trade
       ahead of it. It cannot be cancelled; if no executor fills it within {C.ROUTER_GRACE_SECS}s it expires and
@@ -503,6 +509,13 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
   // waiting, the vault only takes trades that shrink its own position, so it can settle them.
   const reduceOnly = state.slot >= v.epochStart + v.epochLen && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
   const room = C.depth(state);
+  // The largest order each way that the router's margin check accepts. Shrinking a position is
+  // always accepted; past zero, the new position has to fit the margin.
+  const held = p?.position ?? 0n, cap = state.margin ?? 0n;
+  const absHeld = held < 0n ? -held : held;
+  const marginMax = (sign: 1n | -1n) => (held === 0n || (held > 0n) === (sign > 0n) ? (cap > absHeld ? cap - absHeld : 0n) : absHeld + cap);
+  const want = BigInt(Math.round(Number(size || 0) * 1e6));
+  const tooBig = (sign: 1n | -1n) => !!state.trader && want > marginMax(sign);
   const noLiquidity = v.lastNav === 0n;
   const epochLeft = v.epochStart + v.epochLen > state.slot ? v.epochStart + v.epochLen - state.slot : 0n;
   const minutesLeft = Math.max(1, Math.ceil(Number(epochLeft) * C.slotSeconds() / 60));
@@ -519,7 +532,9 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
     watched.current = null;
     const got = position - w.position;
     const abs = (q: bigint) => units(q < 0n ? -q : q);
-    setOutcome(got === 0n
+    setOutcome(w.size === 0n
+      ? (position === 0n ? `Your ${sym} position was closed out at the Pyth price.` : `The close-out of your ${sym} position left the queue without closing it (it expired).`)
+      : got === 0n
       ? `Your queued ${w.size > 0n ? "long" : "short"} of ${abs(w.size)} ${sym} left the queue without trading (it expired, or the vault could not take it).`
       : `Filled: ${got > 0n ? "bought" : "sold"} ${abs(got)} ${sym}${got !== w.size ? ` of the ${abs(w.size)} requested` : ""}. Your position is now ${units(position)} ${sym}.`);
   }, [pendingHere?.id, p?.position]);
@@ -533,7 +548,12 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
     send(label, [C.requestTrade(publicKey, v.key, state.book.nextId, q)]);
   };
   const trade = (sign: 1n | -1n) => request(BigInt(Math.round(Number(size) * 1e6)) * sign, `Queue ${sign > 0n ? "long" : "short"} ${size} ${sym}`);
-  const close = () => p && p.position !== 0n && request(-p.position, "Queue close");
+  const close = () => {
+    if (!publicKey || !state.book || !p || p.position === 0n) return;
+    // A close-only market has no counterparty for a close: the position is closed out instead.
+    if (state.closeOnly) send("Queue close", [C.requestClose(publicKey, publicKey, v.key, state.book.nextId)]);
+    else request(-p.position, "Queue close");
+  };
 
   return (
     <>
@@ -559,10 +579,11 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
             <div className="btns">
               <button className="btn" disabled={!!busy || usdcAtoms <= 0n || usdcAtoms > state.userCollateral}
                 onClick={() => send("Add margin", [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.routerDeposit(publicKey, usdcAtoms)])}>Add margin</button>
-              <button className="btn" disabled={!!busy || locked || usdcAtoms <= 0n || usdcAtoms > (p?.capital ?? 0n)}
+              <button className="btn" disabled={!!busy || locked || state.openPositions > 0 || usdcAtoms <= 0n || usdcAtoms > (p?.capital ?? 0n)}
                 onClick={() => send("Withdraw margin", [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.routerWithdraw(publicKey, usdcAtoms)])}>Withdraw</button>
             </div>
             {locked && <p className="muted small">Withdrawals are paused while a trade is queued.</p>}
+            {!locked && state.openPositions > 0 && <p className="muted small">Margin can be withdrawn once you have no open position on any market (a Percolator rule): close {state.openPositions > 1 ? "your positions" : "your position"} first. Adding margin always works.</p>}
             <Faucet />
           </>
         )}
@@ -572,10 +593,30 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
         <label className="field"><span>Size ({sym})</span><input value={size} onChange={e => setSize(e.target.value)} inputMode="decimal" /></label>
         <div className="muted small">Notional ≈ ${fmt(notional)} · margin ≈ ${fmt(notional / 10)} · fee ≈ ${fmt(notional * 0.0005)}</div>
         <div className="btns">
-          <button className="btn long" disabled={!state.trader || !state.book || locked || !!busy || room.long === 0n} onClick={() => trade(1n)}>Long</button>
-          <button className="btn short" disabled={!state.trader || !state.book || locked || !!busy || room.short === 0n} onClick={() => trade(-1n)}>Short</button>
+          <button className="btn long" disabled={!state.trader || !state.book || locked || !!busy || want <= 0n || state.closeOnly || room.long === 0n || tooBig(1n)} onClick={() => trade(1n)}>Long</button>
+          <button className="btn short" disabled={!state.trader || !state.book || locked || !!busy || want <= 0n || state.closeOnly || room.short === 0n || tooBig(-1n)} onClick={() => trade(-1n)}>Short</button>
         </div>
         <button className="btn ghost wide" disabled={!p || p.position === 0n || locked || !!busy} onClick={close}>Close position</button>
+        {state.closeOnly && (
+          <div className="note">
+            This market is close-only. The vault had to close its own position to settle an overdue epoch, which scaled the
+            positions on the other side down, and Percolator takes no new position here until the rest are closed. They are
+            closed at the next Pyth price (anyone can queue it; the executor does), then trading reopens, usually within a
+            couple of minutes.
+          </div>
+        )}
+        {!state.closeOnly && state.trader && (tooBig(1n) || tooBig(-1n)) && (
+          <div className="note">
+            Your margin of {usd(p?.capital ?? 0n)} covers at most {units(marginMax(1n))} {sym} long or {units(marginMax(-1n))} {sym} short
+            (10× leverage, less a buffer for a further 10% price move). Add margin or lower the size.
+          </div>
+        )}
+        {!noLiquidity && state.trader && want > 0n && ((want > room.long && room.long > 0n && !tooBig(1n)) || (want > room.short && room.short > 0n && !tooBig(-1n))) && (
+          <div className="note">
+            The vault can take at most {units(room.long)} {sym} long or {units(room.short)} {sym} short right now (its limit grows with
+            its liquidity). A larger order fills up to that amount and the rest is dropped.
+          </div>
+        )}
         {noLiquidity ? (
           <div className="note">
             This market has no liquidity yet, so it cannot take a trade. Deposits are priced when the epoch ends

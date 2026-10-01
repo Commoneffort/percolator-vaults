@@ -98,8 +98,19 @@ async function build() {
       if (d[b + L.leg.active] !== 1) continue;
       const asset = dv(d).getUint32(b + L.leg.asset_index, true);
       const q = i128(d, b + L.leg.basis_pos_q);
-      const abs = Number(q < 0n ? -q : q) / 1e6;
-      positions.push({ symbol: symbols.get(asset) ?? `#${asset}`, size: d[b + L.leg.side] === 0 ? abs : -abs });
+      const long = d[b + L.leg.side] === 0;
+      // The position as Percolator counts it: scaled by any deleveraging of its side since it was
+      // opened, and zero once that side was emptied and reset.
+      const e = L.market.slots + asset * L.market.slot_len + L.market.engine;
+      let size = q < 0n ? -q : q;
+      if (u64(d, b + L.leg.epoch_snap) !== u64(m, e + (long ? L.market.epoch_long : L.market.epoch_short))) size = 0n;
+      else {
+        const now = u128(m, e + (long ? L.market.a_long : L.market.a_short)), then = u128(d, b + L.leg.a_basis);
+        if (then > 0n && now !== then) size = (size * now + then - 1n) / then;
+      }
+      if (size === 0n) continue;
+      const abs = Number(size) / 1e6;
+      positions.push({ symbol: symbols.get(asset) ?? `#${asset}`, size: long ? abs : -abs });
     }
     let volume = 0;
     for (const [asset, q] of f.volumeByAsset) volume += (Number(q) / 1e6) * (Number(priceOf(asset)) / 1e6);

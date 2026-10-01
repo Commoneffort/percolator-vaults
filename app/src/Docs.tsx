@@ -133,7 +133,7 @@ export default function Docs() {
           <li><b>Claim.</b> Each depositor's <code>Claim</code> collects their shares or collateral from the settled epoch, pro rata from the epoch record.</li>
           <li><b>Trade.</b> Takers queue requests with the router; executors fill them at the first Pyth price at or after each request's target, with the vault as counterparty (see How trades fill).</li>
           <li><b>Harvest.</b> <code>HarvestFees</code> (anyone) moves insurance above the floor into the buffer; 10% is set aside for the opener.</li>
-          <li><b>Stay live.</b> After an epoch ends with requests waiting, the vault only takes position-reducing fills. If a taker holds a position so the vault can't go flat, <code>Unwind</code> (anyone, one epoch later) makes the vault close its own position through Percolator's unilateral <code>RebalanceReduce</code>.</li>
+          <li><b>Stay live.</b> After an epoch ends with requests waiting, the vault only takes position-reducing fills. If a taker holds a position so the vault can't go flat, <code>Unwind</code> (anyone, one epoch later) makes the vault close its own position through Percolator's unilateral <code>RebalanceReduce</code>. That scales down the positions on the other side, and Percolator then takes no new position on the market until all of them are closed; the vault cannot take the other side of a close there, so the router closes them out (<code>RequestClose</code>, which anyone can queue for any trader and which executes at the first Pyth price after its target, like any request). The market then resets and reopens.</li>
           <li><b>Retire.</b> Once a market has had no liquidity providers for three epochs and holds no position, <code>RetireMarket</code> (anyone) pays its leftover insurance to the opener and has Percolator retire the asset. The next market opened reuses the slot, and the same feed can be opened again later.</li>
           <li><b>Wind down.</b> If the market is resolved, <code>SettleResolved</code> closes the portfolio through Percolator's resolved path; queued deposits are refunded, and shares redeem pro rata with <code>RedeemTerminal</code>.</li>
         </ol>
@@ -184,6 +184,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Market authority.</b> On devnet, Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
           <li><b>Smart contracts.</b> Unaudited code. The program is upgradeable on devnet; a mainnet deployment must burn that authority.</li>
           <li><b>Keepers.</b> Everything is permissionless, but someone has to send the transactions. If nobody does, epochs don't roll and prices don't update.</li>
+          <li><b>Margin stays in while you hold a position.</b> Percolator pays margin out only from an account with no open position on any market, so a trader closes everything before withdrawing. A queued trade must also leave enough margin for a further 10% price move; a trade that only reduces a position is always accepted.</li>
+          <li><b>An unwind closes the market out.</b> If a deposit or withdrawal has waited a full extra epoch and the vault still holds a position, the vault closes it unilaterally. Traders on the other side are scaled down, and the positions left on that market are closed out at the next Pyth price before it reopens. A trader can have a position closed this way without choosing to.</li>
           <li><b>Cost per position.</b> Each price move leaves every open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are. The executor does this in front of each fill, so keeping a market tradable costs more the more positions it has.</li>
           <li><b>Percolator fixes.</b> Devnet runs our Percolator integration branch, which includes fixes not yet merged upstream, among them the one that makes permissionless listing work while traders hold open positions (<a href="https://github.com/aeyakovenko/percolator-prog/pull/447" target="_blank" rel="noreferrer">percolator-prog #447</a>).</li>
         </ul>
@@ -210,7 +212,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>Governor (program address)</td><td>Retire an idle, empty market through <code>RetireMarket</code></td><td>Anything else: the program has no other instruction that uses Percolator's market authority</td></tr>
           </tbody>
         </table>
-        <p>The program is tested against the production Percolator binary in LiteSVM, with 51 tests:</p>
+        <p>The program is tested against the production Percolator binary in LiteSVM, with 53 tests:</p>
         <ul>
           <li><b>Front-running</b>: a trader who knows the price in advance ends flat; the fill is exactly the first Pyth price at or after the target; no later or skipped update can move the mark; nobody can push a newer price over a pending request; the executor's identity and timing do not change the fill; direct trades, forged or unverified Pyth accounts and non-router mark moves are refused.</li>
           <li><b>Requests</b>: no cancelling, no withdrawing while queued, expiry only after the grace period with the bond forfeited, stressed margin check, withdrawals only to the owner's wallet.</li>
@@ -254,6 +256,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>5</td><td>Advance</td><td>anyone</td><td>Moves a vault's mark to a newer verified Pyth price, never past a pending target</td></tr>
             <tr><td>6</td><td>Fill</td><td>anyone</td><td>Fills a request at its price; pays the executor the bond</td></tr>
             <tr><td>7</td><td>Expire</td><td>anyone</td><td>Removes a request unfilled {ROUTER_GRACE_SECS} s after its target; the bond is forfeited</td></tr>
+            <tr><td>8</td><td>RequestClose</td><td>anyone, for any trader</td><td>On a close-only market: queues the close-out of a trader's position, executed like a request at its target Pyth price</td></tr>
           </tbody>
         </table>
 

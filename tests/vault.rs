@@ -298,12 +298,16 @@ fn market_offsets_match_engine() {
     assert_eq!(perc::WRAPPER_TRADE_FEE_BASE_BPS, c::HEADER_LEN + offset_of!(percolator_prog::state::WrapperConfigV16, trade_fee_base_bps));
     assert_eq!(perc::ASSET_EFFECTIVE_PRICE, offset_of!(A, effective_price));
     assert_eq!(perc::ASSET_SLOT_LAST, offset_of!(A, slot_last));
+    assert_eq!(perc::ASSET_A_LONG, offset_of!(A, a_long));
+    assert_eq!(perc::ASSET_A_SHORT, offset_of!(A, a_short));
+    assert_eq!(perc::ADL_ONE, percolator::ADL_ONE);
     assert_eq!(perc::PORTFOLIO_LEGS_OFF, c::HEADER_LEN + offset_of!(P, legs));
     assert_eq!(perc::PORTFOLIO_LEG_LEN, std::mem::size_of::<L>());
     assert_eq!(perc::PORTFOLIO_LEG_COUNT, percolator::V16_MAX_PORTFOLIO_ASSETS_N);
     assert_eq!(perc::LEG_ACTIVE, offset_of!(L, active));
     assert_eq!(perc::LEG_ASSET_INDEX, offset_of!(L, asset_index));
     assert_eq!(perc::LEG_BASIS_POS_Q, offset_of!(L, basis_pos_q));
+    assert_eq!(perc::LEG_SIDE, offset_of!(L, side));
     // The vault reads the router book's pending count and trusts the router's authority address.
     assert_eq!(percolator_vault::ROUTER_BOOK_LEN_OFF, offset_of!(percolator_router::state::Book, len));
     assert_eq!(percolator_vault::ROUTER_PROGRAM_ID, percolator_router::id());
@@ -544,7 +548,9 @@ fn export_layout_for_frontend() {
             "basis_pos_q": offset_of!(percolator::PortfolioLegV16Account, basis_pos_q),
             "side": offset_of!(percolator::PortfolioLegV16Account, side),
             "active": offset_of!(percolator::PortfolioLegV16Account, active),
-            "kf_epoch_snap": offset_of!(percolator::PortfolioLegV16Account, kf_epoch_snap)
+            "kf_epoch_snap": offset_of!(percolator::PortfolioLegV16Account, kf_epoch_snap),
+            "a_basis": offset_of!(percolator::PortfolioLegV16Account, a_basis),
+            "epoch_snap": offset_of!(percolator::PortfolioLegV16Account, epoch_snap)
         },
         "router": {
             "program": percolator_router::id().to_string(),
@@ -557,6 +563,10 @@ fn export_layout_for_frontend() {
             "max_pending": percolator_router::state::MAX_PENDING,
             "delay_secs": percolator_router::DELAY_SECS,
             "grace_secs": percolator_router::GRACE_SECS,
+            "stress_bps": percolator_router::STRESS_BPS as u64,
+            "im_bps_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_INITIAL_MARGIN_BPS,
+            "min_im_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_MIN_NONZERO_IM_REQ,
+            "fee_bps_off": perc::WRAPPER_TRADE_FEE_BASE_BPS,
             "bond_lamports": percolator_router::BOND_LAMPORTS
         },
         "market_header": {
@@ -574,6 +584,10 @@ fn export_layout_for_frontend() {
             "raw_oracle_target_price": offset_of!(percolator::AssetStateV16Account, raw_oracle_target_price),
             "kf_epoch_long": offset_of!(percolator::AssetStateV16Account, kf_epoch_long),
             "kf_epoch_short": offset_of!(percolator::AssetStateV16Account, kf_epoch_short),
+            "a_long": offset_of!(percolator::AssetStateV16Account, a_long),
+            "a_short": offset_of!(percolator::AssetStateV16Account, a_short),
+            "epoch_long": offset_of!(percolator::AssetStateV16Account, epoch_long),
+            "epoch_short": offset_of!(percolator::AssetStateV16Account, epoch_short),
             "mode_long": offset_of!(percolator::AssetStateV16Account, mode_long),
             "mode_short": offset_of!(percolator::AssetStateV16Account, mode_short),
             "stored_pos_count_long": offset_of!(percolator::AssetStateV16Account, stored_pos_count_long),

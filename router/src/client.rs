@@ -125,6 +125,24 @@ pub fn request(t: &TraderKeys, vault: &Pubkey, id: u64, size: i128) -> Instructi
     }
 }
 
+/// Queues the close-out of `t`'s position on a close-only market; `payer` need not be the trader.
+pub fn request_close(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey, id: u64) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            w(t.trader),
+            ro(t.wallet),
+            ro(*vault),
+            w(book_address(&crate::id(), vault).0),
+            w(request_address(&crate::id(), vault, id).0),
+            ro(t.market),
+            ro(system_program::ID),
+        ],
+        data: vec![TAG_REQUEST_CLOSE],
+    }
+}
+
 pub fn advance(k: &VaultKeys, pyth: &Pubkey, observation_sequence: u64, authority_epoch: u64) -> Instruction {
     let mut data = vec![TAG_ADVANCE];
     data.extend_from_slice(&observation_sequence.to_le_bytes());

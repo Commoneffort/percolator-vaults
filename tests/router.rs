@@ -172,6 +172,31 @@ fn a_request_needs_margin_for_a_stressed_price_move() {
 }
 
 #[test]
+fn a_trade_that_only_shrinks_a_position_is_not_refused_for_margin() {
+    let mut w = live();
+    // A trader with 1.5 USDC of margin: enough for 6 units at 1.00 under the stressed check
+    // (about 0.21 per unit), not for 9.
+    let u = w.new_user(100_000_000);
+    let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
+    let mint = w.env.mint;
+    let open = rclient::open_account(&t, &mint);
+    let dep = rclient::deposit(&t, &u.collateral, &w.env.vault, 1_500_000);
+    w.send(vec![open, dep], &[&u.kp]).unwrap();
+    w.traders.insert(7, (u, t));
+    let size = 6 * UNIT as i128;
+    w.taker_trade(7, size).unwrap();
+    // Growing or flipping the position is refused.
+    expect(w.request(7, size / 2), router_code(RouterError::InsufficientMargin));
+    expect(w.request(7, -(size + 9 * UNIT as i128)), router_code(RouterError::InsufficientMargin));
+    // Reducing and closing are accepted and fill, although the old and the new position
+    // together would not pass the check.
+    w.taker_trade(7, -size / 3).unwrap();
+    w.taker_trade(7, -(size - size / 3)).unwrap();
+    let d = w.env.svm.get_account(&w.taker_portfolio(7)).unwrap().data;
+    assert!(perc::portfolio_exposure(&d).unwrap().2.iter().all(|(_, q)| *q == 0));
+}
+
+#[test]
 fn only_the_router_moves_the_mark_or_arms_a_fill() {
     let mut w = live();
     let attacker = Keypair::new();

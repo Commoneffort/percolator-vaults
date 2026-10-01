@@ -139,13 +139,32 @@ export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
 
 export type Portfolio = { capital: bigint; pnl: bigint; id: bigint; sequence: bigint; positionEpoch: bigint; position: bigint };
 
-export function decodePortfolio(d: Uint8Array, asset: number): Portfolio {
+/** A leg's position as Percolator counts it. The stored size is scaled by how much the side has
+ *  been deleveraged since the leg was opened (after another position on the asset was reduced
+ *  unilaterally), and is zero once the side has been emptied and reset. */
+export function legPosition(market: Uint8Array, d: Uint8Array, base: number): bigint {
+  const q = i128(d, base + L.leg.basis_pos_q);
+  let abs = q < 0n ? -q : q;
+  const long = d[base + L.leg.side] === 0;
+  const a = L.market.slots + u32(d, base + L.leg.asset_index) * L.market.slot_len + L.market.engine;
+  if (u64(d, base + L.leg.epoch_snap) !== u64(market, a + (long ? L.market.epoch_long : L.market.epoch_short))) abs = 0n;
+  else {
+    const now = u128(market, a + (long ? L.market.a_long : L.market.a_short)), then = u128(d, base + L.leg.a_basis);
+    if (then > 0n && now !== then) abs = (abs * now + then - 1n) / then;
+  }
+  return long ? abs : -abs;
+}
+
+/** `market` gives the position as Percolator counts it (see `legPosition`); without it, the
+ *  stored size. */
+export function decodePortfolio(d: Uint8Array, asset: number, market?: Uint8Array): Portfolio {
   const p = L.portfolio;
   const control = u64(d, p.control);
   let position = 0n;
   for (let i = 0; i < 16; i++) {
     const base = p.legs + i * p.leg_len;
     if (d[base + L.leg.active] !== 1 || u32(d, base + L.leg.asset_index) !== asset) continue;
+    if (market) { position = legPosition(market, d, base); continue; }
     const q = i128(d, base + L.leg.basis_pos_q);
     const abs = q < 0n ? -q : q;
     position = d[base + L.leg.side] === 0 ? abs : -abs;
@@ -439,8 +458,11 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
       const leg = L.portfolio.legs + i * L.portfolio.leg_len;
       if (d[leg + L.leg.active] !== 1) continue;
       const asset = u32(d, leg + L.leg.asset_index);
-      const epoch = d[leg + L.leg.side] === 0 ? L.market.kf_epoch_long : L.market.kf_epoch_short;
-      out.push({ asset, stale: u64(d, leg + L.leg.kf_epoch_snap) < u64(s.market, at(asset) + epoch) });
+      const long = d[leg + L.leg.side] === 0;
+      // Out of date after a price move, or left over from a side that was emptied and reset.
+      const stale = u64(d, leg + L.leg.kf_epoch_snap) < u64(s.market, at(asset) + (long ? L.market.kf_epoch_long : L.market.kf_epoch_short))
+        || u64(d, leg + L.leg.epoch_snap) !== u64(s.market, at(asset) + (long ? L.market.epoch_long : L.market.epoch_short));
+      out.push({ asset, stale });
     }
     return out;
   };
@@ -509,7 +531,8 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     slot: BigInt(slot),
     vault: v,
     asset: decodeAsset(data(0)!, v.assetIndex),
-    lp: decodePortfolio(data(1)!, v.assetIndex),
+    lp: decodePortfolio(data(1)!, v.assetIndex, data(0)!),
+    closeOnly: closeOnly(data(0)!, v.assetIndex),
     buffer: tokenAmount(data(2)),
     shareSupply: data(3) ? u64(data(3)!, 36) : 0n,
     pyth: data(4) ? decodePyth(data(4)!) : undefined,
@@ -518,12 +541,55 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     userCollateral: user ? tokenAmount(data(7)) : 0n,
     userShares: user ? tokenAmount(data(8)) : 0n,
     portfolioKey: pf,
-    portfolio: user && data(9) ? decodePortfolio(data(9)!, v.assetIndex) : undefined,
+    portfolio: user && data(9) ? decodePortfolio(data(9)!, v.assetIndex, data(0)!) : undefined,
+    margin: user && data(9) ? marginRoom(data(0)!, data(9)!, v.assetIndex) : undefined,
+    openPositions: user && data(9) ? openPositions(data(9)!) : 0,
     trader,
     pending,
   };
 }
 export type State = Awaited<ReturnType<typeof fetchVault>>;
+
+/** True while a market is close-only: a position on it was reduced unilaterally (the vault's
+ *  Unwind, a liquidation), which deleverages the other side, and Percolator then refuses every
+ *  risk-increasing trade on it until all positions on it are closed and its sides reset. */
+export const closeOnly = (market: Uint8Array, asset: number) => {
+  const a = L.market.slots + asset * L.market.slot_len + L.market.engine;
+  return u128(market, a + L.market.a_long) !== ADL_ONE || u128(market, a + L.market.a_short) !== ADL_ONE;
+};
+const ADL_ONE = 1_000_000_000_000_000n;
+
+/** How many markets a portfolio holds a position on. Percolator only pays margin out of a
+ *  portfolio with none. */
+export function openPositions(portfolio: Uint8Array): number {
+  let n = 0;
+  for (let i = 0; i < 16; i++) if (portfolio[L.portfolio.legs + i * L.portfolio.leg_len + L.leg.active] === 1) n++;
+  return n;
+}
+
+/** The largest position (absolute, in position units) on `asset` that the router's margin check
+ *  at request time accepts for this portfolio: equity must cover initial margin and fees on every
+ *  position after a further `stress_bps` price move, plus that move as a loss (the router's
+ *  `margin_covers`). A trade that only shrinks a position is always accepted. */
+export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: number): bigint {
+  const R = L.router, P = L.portfolio;
+  const price = (a: number) => u64(market, L.market.slots + a * L.market.slot_len + L.market.engine + L.market.effective_price);
+  let other = 0n;
+  for (let i = 0; i < 16; i++) {
+    const leg = P.legs + i * P.leg_len;
+    if (portfolio[leg + L.leg.active] !== 1) continue;
+    const a = u32(portfolio, leg + L.leg.asset_index);
+    const q = legPosition(market, portfolio, leg);
+    if (a !== asset) other += (q < 0n ? -q : q) * price(a) / UNIT;
+  }
+  const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl);
+  const stress = BigInt(R.stress_bps), rate = u64(market, R.im_bps_off) + u64(market, R.fee_bps_off);
+  // need(total) = total * perUnit / 1e8 + minimum
+  const perUnit = (10_000n + stress) * rate + stress * 10_000n;
+  const total = (equity - u128(market, R.min_im_off)) * 100_000_000n / perUnit - other;
+  const p = price(asset);
+  return total > 0n && p > 0n ? total * UNIT * 999n / (p * 1000n) : 0n;
+}
 
 export const navOf = (s: State) =>
   s.lp.capital + (s.lp.pnl > 0n ? s.lp.pnl : 0n) + s.buffer - s.vault.reserved - s.vault.pendingDeposit;
@@ -541,6 +607,7 @@ export const ROUTER = new PublicKey(R.program);
 export const ROUTER_DELAY_SECS = R.delay_secs;
 export const ROUTER_GRACE_SECS = R.grace_secs;
 export const ROUTER_BOND_LAMPORTS = R.bond_lamports;
+export const TRADER_LEN = R.trader_len;
 const rpda = (...seeds: (Uint8Array | Buffer)[]) => PublicKey.findProgramAddressSync(seeds, ROUTER)[0];
 const u64le = (v: bigint) => new W().u64(v).done();
 export const routerAuthority = () => rpda(Buffer.from("authority"));
@@ -598,6 +665,12 @@ export const requestTrade = (wallet: PublicKey, vault: PublicKey, id: bigint, si
   programId: ROUTER,
   keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
   data: new W().u8(4).i128(size).done(),
+});
+/** Queues the close-out of `wallet`'s position on a close-only market (`payer` may be anyone). */
+export const requestClose = (payer: PublicKey, wallet: PublicKey, vault: PublicKey, id: bigint) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(SystemProgram.programId)],
+  data: new W().u8(8).done(),
 });
 /** Moves a vault's mark to a verified Pyth update (a PriceUpdateV2 account). */
 export const advanceMark = (v: Vault, pyth: PublicKey, market: Uint8Array) => {

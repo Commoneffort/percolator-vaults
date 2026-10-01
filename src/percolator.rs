@@ -136,11 +136,16 @@ pub const CONFIG_MIN_NONZERO_IM_REQ: usize = 22;
 pub const WRAPPER_TRADE_FEE_BASE_BPS: usize = HEADER_LEN + 128;
 pub const ASSET_EFFECTIVE_PRICE: usize = 25;
 pub const ASSET_SLOT_LAST: usize = 41;
+pub const ASSET_A_LONG: usize = 49;
+pub const ASSET_A_SHORT: usize = 65;
+/// Percolator's deleveraging coefficient of a side nothing has been force-reduced against.
+pub const ADL_ONE: u128 = 1_000_000_000_000_000;
 pub const PORTFOLIO_LEGS_OFF: usize = 356;
 pub const PORTFOLIO_LEG_LEN: usize = 152;
 pub const PORTFOLIO_LEG_COUNT: usize = 16;
 pub const LEG_ACTIVE: usize = 0;
 pub const LEG_ASSET_INDEX: usize = 1;
+pub const LEG_SIDE: usize = 13;
 pub const LEG_BASIS_POS_Q: usize = 14;
 
 /// Market-wide margin parameters: initial margin in bps, the minimum nonzero initial margin
@@ -159,8 +164,16 @@ pub fn asset_price(d: &[u8], asset_index: u16) -> Result<(u64, u64, u64), Progra
     Ok((rd_u64(d, e)?, rd_u64(d, e + ASSET_EFFECTIVE_PRICE)?, rd_u64(d, e + ASSET_SLOT_LAST)?))
 }
 
-/// A portfolio's capital, PnL and active legs as (asset, absolute position).
-pub fn portfolio_exposure(d: &[u8]) -> Result<(u128, i128, Vec<(u16, u128)>), ProgramError> {
+/// True while an asset is close-only: a position on it was reduced unilaterally (the vault's
+/// `Unwind`, a liquidation), which deleverages the other side, and Percolator then refuses every
+/// risk-increasing trade on the asset until all positions on it are closed and its sides reset.
+pub fn asset_close_only(d: &[u8], asset_index: u16) -> Result<bool, ProgramError> {
+    let e = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
+    Ok(rd_u128(d, e + ASSET_A_LONG)? != ADL_ONE || rd_u128(d, e + ASSET_A_SHORT)? != ADL_ONE)
+}
+
+/// A portfolio's capital, PnL and active legs as (asset, signed position: positive is long).
+pub fn portfolio_exposure(d: &[u8]) -> Result<(u128, i128, Vec<(u16, i128)>), ProgramError> {
     let mut legs = Vec::new();
     for i in 0..PORTFOLIO_LEG_COUNT {
         let l = PORTFOLIO_LEGS_OFF + i * PORTFOLIO_LEG_LEN;
@@ -170,7 +183,10 @@ pub fn portfolio_exposure(d: &[u8]) -> Result<(u128, i128, Vec<(u16, u128)>), Pr
         }
         let asset = u32::from_le_bytes(d[l + LEG_ASSET_INDEX..l + LEG_ASSET_INDEX + 4].try_into().unwrap());
         let q = rd_i128(d, l + LEG_BASIS_POS_Q)?;
-        legs.push((u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?, q.unsigned_abs()));
+        // The side is stored separately; the size's own sign is not relied on.
+        let abs = i128::try_from(q.unsigned_abs()).map_err(|_| VaultError::BadPercolatorAccount)?;
+        let signed = if d[l + LEG_SIDE] == 0 { abs } else { -abs };
+        legs.push((u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?, signed));
     }
     Ok((rd_u128(d, PORTFOLIO_CAPITAL_OFF)?, rd_i128(d, PORTFOLIO_PNL_OFF)?, legs))
 }

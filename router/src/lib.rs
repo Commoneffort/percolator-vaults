@@ -72,6 +72,7 @@ pub const TAG_REQUEST: u8 = 4;
 pub const TAG_ADVANCE: u8 = 5;
 pub const TAG_FILL: u8 = 6;
 pub const TAG_EXPIRE: u8 = 7;
+pub const TAG_REQUEST_CLOSE: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -99,6 +100,11 @@ pub enum RouterError {
     Overflow,
     NotActive,
     BadOracle,
+    /// The market is close-only (a position on it was force-reduced): positions on it can only be
+    /// closed, with `RequestClose`, until all are closed and it resets.
+    CloseOnly,
+    /// `RequestClose` on a market that is not close-only: use `Request`.
+    NotCloseOnly,
 }
 
 impl From<RouterError> for ProgramError {
@@ -124,6 +130,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_ADVANCE => advance(program_id, accounts, u64_at(0)?, u64_at(8)?),
         TAG_FILL => fill(program_id, accounts),
         TAG_EXPIRE => expire(program_id, accounts),
+        TAG_REQUEST_CLOSE => request_close(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }
@@ -387,9 +394,19 @@ fn margin_covers(market: &[u8], portfolio: &[u8], asset: u16, size: i128) -> Res
         let (_, price, _) = perc::asset_price(market, a)?;
         Ok(q.checked_mul(price as u128).ok_or(RouterError::Overflow)? / POS_SCALE)
     };
-    let mut total = notional(asset, size.unsigned_abs())?;
+    // The position on the traded asset after the fill. A trade that only shrinks it (without
+    // crossing zero) takes risk off and is never refused for margin: refusing it would stop a
+    // trader with thin margin from closing.
+    let held = legs.iter().find(|(a, _)| *a == asset).map_or(0, |(_, q)| *q);
+    let after = held.checked_add(size).ok_or(RouterError::Overflow)?;
+    if after == 0 || ((after > 0) == (held > 0) && held != 0 && after.unsigned_abs() < held.unsigned_abs()) {
+        return Ok(true);
+    }
+    let mut total = notional(asset, after.unsigned_abs())?;
     for (a, q) in legs {
-        total = total.checked_add(notional(a, q)?).ok_or(RouterError::Overflow)?;
+        if a != asset {
+            total = total.checked_add(notional(a, q.unsigned_abs())?).ok_or(RouterError::Overflow)?;
+        }
     }
     let stressed = total * (10_000 + STRESS_BPS) / 10_000;
     let need = stressed * im_bps as u128 / 10_000
@@ -438,19 +455,40 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
         return Err(RouterError::BookFull.into());
     }
     perc::expect_market(market)?;
+    if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
+        return Err(RouterError::CloseOnly.into());
+    }
     if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size)? {
         return Err(RouterError::InsufficientMargin.into());
     }
+    enqueue(program_id, wallet, wallet.key, trader_ai, &mut t, vault_ai, book_ai, &mut b, request_ai, system, size)
+}
 
+/// Stores a request for `owner`'s trading account (paid for by `payer`) and adds it to the book.
+/// `size` 0 marks a close-out (see `request_close`).
+#[allow(clippy::too_many_arguments)]
+fn enqueue<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    owner: &Pubkey,
+    trader_ai: &AccountInfo<'a>,
+    t: &mut TraderState,
+    vault_ai: &AccountInfo<'a>,
+    book_ai: &AccountInfo<'a>,
+    b: &mut Book,
+    request_ai: &AccountInfo<'a>,
+    system: &AccountInfo<'a>,
+    size: i128,
+) -> ProgramResult {
     let clock = Clock::get()?;
     let target = clock.unix_timestamp.max(b.mark_publish_time).checked_add(DELAY_SECS).ok_or(RouterError::Overflow)?;
     let id = b.next_id;
     let (rk, rbump) = request_address(program_id, vault_ai.key, id);
     key_is(request_ai, &rk)?;
-    create_pda(wallet, request_ai, system, program_id, REQUEST_LEN, BOND_LAMPORTS, &[SEED_REQUEST, vault_ai.key.as_ref(), &id.to_le_bytes(), &[rbump]])?;
+    create_pda(payer, request_ai, system, program_id, REQUEST_LEN, BOND_LAMPORTS, &[SEED_REQUEST, vault_ai.key.as_ref(), &id.to_le_bytes(), &[rbump]])?;
     store(
         request_ai,
-        &Request { magic: REQUEST_MAGIC, vault: *vault_ai.key, wallet: *wallet.key, id, size, target_time: target, created_slot: clock.slot, bump: rbump, _pad: [0; 7] },
+        &Request { magic: REQUEST_MAGIC, vault: *vault_ai.key, wallet: *owner, id, size, target_time: target, created_slot: clock.slot, bump: rbump, _pad: [0; 7] },
     )?;
     b.next_id = id.checked_add(1).ok_or(RouterError::Overflow)?;
     let (mut ids, mut targets) = (b.pending_id, b.pending_target);
@@ -459,11 +497,55 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
     b.pending_id = ids;
     b.pending_target = targets;
     b.len += 1;
-    store(book_ai, &b)?;
+    store(book_ai, &*b)?;
     t.has_pending = 1;
     t.pending_vault = *vault_ai.key;
     t.pending_id = id;
-    store(trader_ai, &t)
+    store(trader_ai, &*t)
+}
+
+/// Queues the close-out of a trader's position on a close-only market. Percolator refuses every
+/// risk-increasing trade on such a market, so the vault cannot take the other side of a close;
+/// the fill instead reduces the position unilaterally (Percolator's `RebalanceReduce`), at the
+/// same price as any request: the first Pyth price published at or after its target time. The
+/// market only reopens once every position on it is closed, so anyone may queue this for any
+/// trader (paying the bond and the request's rent, which goes to the trader when it closes).
+///
+/// Accounts: 0 payer [s, w], 1 trader [w], 2 trader wallet, 3 vault, 4 book [w], 5 request [w],
+/// 6 market, 7 system program.
+fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let payer = acc(accounts, 0)?;
+    let trader_ai = acc(accounts, 1)?;
+    let wallet = acc(accounts, 2)?;
+    let vault_ai = acc(accounts, 3)?;
+    let book_ai = acc(accounts, 4)?;
+    let request_ai = acc(accounts, 5)?;
+    let market = acc(accounts, 6)?;
+    let system = acc(accounts, 7)?;
+    signer(payer)?;
+    for w in [payer, trader_ai, book_ai, request_ai] {
+        writable(w)?;
+    }
+    key_is(system, &system_program::ID)?;
+    let mut t = load_trader(program_id, trader_ai, wallet.key)?;
+    let v = load_vault(vault_ai)?;
+    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    key_is(market, &v.market)?;
+    key_is(market, &t.market)?;
+    if b.vault != *vault_ai.key {
+        return Err(RouterError::BadAccount.into());
+    }
+    if t.has_pending != 0 {
+        return Err(RouterError::RequestPending.into());
+    }
+    if b.len as usize >= MAX_PENDING {
+        return Err(RouterError::BookFull.into());
+    }
+    perc::expect_market(market)?;
+    if !perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
+        return Err(RouterError::NotCloseOnly.into());
+    }
+    enqueue(program_id, payer, wallet.key, trader_ai, &mut t, vault_ai, book_ai, &mut b, request_ai, system, 0)
 }
 
 /// Moves the vault's mark to a verified Pyth price. The update must be newer than the current
@@ -580,6 +662,25 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(RouterError::NotConverged.into());
     }
     let (_, _, fee_bps) = perc::margin_params(&market.try_borrow_data()?)?;
+
+    if r.size == 0 {
+        // A close-out: reduce the whole position unilaterally at Percolator's price, which is the
+        // mark. Nothing to do if the position is already gone.
+        let held = perc::portfolio_exposure(&portfolio.try_borrow_data()?)?.2.iter().any(|(a, q)| *a == v.asset_index && *q != 0);
+        if held {
+            let view = perc::read_portfolio(portfolio, market.key, trader_ai.key)?;
+            invoke_signed(
+                &perc::rebalance_reduce(trader_ai.key, market.key, portfolio.key, view.portfolio_id, view.position_epoch, v.asset_index, u128::MAX >> 1),
+                &[trader_ai.clone(), market.clone(), portfolio.clone(), percolator.clone()],
+                &[trader_seeds!(t)],
+            )?;
+        }
+        b.remove(r.id)?;
+        store(book_ai, &b)?;
+        t.has_pending = 0;
+        store(trader_ai, &t)?;
+        return close(request_ai, BOND_LAMPORTS, executor, wallet);
+    }
 
     let mut arm = vec![TAG_ARM_FILL];
     arm.extend_from_slice(&r.size.to_le_bytes());

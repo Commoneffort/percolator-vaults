@@ -568,7 +568,10 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
             // trades that reduce its position, so a flat vault with requests is rolled on the first
             // pass after its epoch ends. A roll fails while the vault holds a position, and one
             // with no requests is not urgent: those are retried every 10th pass.
-            let urgent = (v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0) && v.inventory == 0;
+            // Once the epoch is overdue by a full epoch the vault may close its own position
+            // (Unwind), so that is urgent as well.
+            let overdue = now >= v.epoch_start_slot + 2 * v.epoch_len_slots;
+            let urgent = (v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0) && (v.inventory == 0 || overdue);
             let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots && (urgent || tick % 10 == 0);
             if tick % 15 != 0 && !epoch_over {
                 continue;
@@ -590,8 +593,11 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                     Ok(s) => println!("{} rolled epoch {} ({s})", k.vault, { v.epoch }),
                     Err(e) => {
                         eprintln!("{} roll: {}", k.vault, e.lines().next().unwrap_or(""));
-                        if now >= v.epoch_start_slot + 2 * v.epoch_len_slots {
-                            let _ = send(rpc, payer, vec![client::unwind(&k)], &[]);
+                        if overdue {
+                            match send(rpc, payer, vec![client::unwind(&k)], &[]) {
+                                Ok(s) => println!("{} closed its position so epoch {} can settle ({s})", k.vault, { v.epoch }),
+                                Err(e) => eprintln!("{} unwind: {}", k.vault, e.lines().next().unwrap_or("")),
+                            }
                         }
                     }
                 }
