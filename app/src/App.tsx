@@ -498,6 +498,9 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
   const pendingElsewhere = !!state.trader?.hasPending && !pendingHere;
   const locked = !!state.trader?.hasPending;
   const chainNow = Math.floor(Date.now() / 1000);
+  // Same rule as the vault's matcher: past the end of an epoch with deposits or withdrawals
+  // waiting, the vault only takes trades that shrink its own position, so it can settle them.
+  const reduceOnly = state.slot >= v.epochStart + v.epochLen && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
 
   const create = () => {
     if (!publicKey) return;
@@ -551,6 +554,12 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
           <button className="btn short" disabled={!state.trader || !state.book || locked || !!busy} onClick={() => trade(-1n)}>Short</button>
         </div>
         <button className="btn ghost wide" disabled={!p || p.position === 0n || locked || !!busy} onClick={close}>Close position</button>
+        {reduceOnly && (
+          <div className="note">
+            This vault is settling an epoch: until it rolls (usually under a minute) it only fills trades that reduce
+            its own position{v.inventory === 0n ? ", and it has none, so a trade queued now fills zero" : ` (it is ${v.inventory > 0n ? "long" : "short"}, so only ${v.inventory > 0n ? "longs" : "shorts"} fill)`}.
+          </div>
+        )}
         {pendingHere && <PendingTrade r={pendingHere} sym={sym} chainNow={chainNow} />}
         {pendingElsewhere && <p className="muted small">You have a trade queued on another market; it has to fill or expire first.</p>}
         <p className="muted small">

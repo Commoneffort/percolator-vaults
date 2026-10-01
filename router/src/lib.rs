@@ -57,7 +57,7 @@ solana_program::entrypoint!(process_instruction);
 /// real-world price move to reach a published Pyth price, plus any lag of the chain clock.
 pub const DELAY_SECS: i64 = 4;
 /// How long after its target a request can still be filled before anyone may expire it.
-pub const GRACE_SECS: i64 = 30;
+pub const GRACE_SECS: i64 = 90;
 /// Paid by the trader with each request: to the executor on a fill, forfeited on expiry.
 pub const BOND_LAMPORTS: u64 = 2_000_000;
 /// Extra price move (bps) the margin check at request time must survive, on every position.

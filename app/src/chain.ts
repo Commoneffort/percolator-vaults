@@ -373,90 +373,108 @@ export function depth(s: State): { long: bigint; short: bigint } {
   return { long: room(-1n), short: room(1n) };
 }
 
-// ---- Percolator (trader side) ----
-export async function catchUpCranks(conn: Connection, v: Vault | null, payer: PublicKey, knownVaults?: Vault[]): Promise<TransactionInstruction[]> {
-  const [m, slot, vaults, portfolios] = await Promise.all([
-    conn.getAccountInfo(MARKET, "confirmed"),
-    conn.getSlot("confirmed"),
-    knownVaults ?? listVaults(conn),
-    conn.getProgramAccounts(PERCOLATOR, {
-      commitment: "confirmed",
-      filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }],
-    }),
-  ]);
-  const market = new Uint8Array(m!.data);
-  const byAsset = new Map<number, Vault>();
-  // The traded asset is always brought current (that is also what moves Percolator's price to a
-  // new mark), and so is every other asset with open positions.
-  if (v) byAsset.set(v.assetIndex, v);
-  for (const x of vaults.filter(x => x.canonical && x.status === 1 && x.market.equals(MARKET))) {
-    if (byAsset.has(x.assetIndex)) continue;
-    const a = decodeAsset(market, x.assetIndex);
-    if (a.oiLong !== 0n || a.oiShort !== 0n) byAsset.set(x.assetIndex, x);
-  }
-  // Vault assets are in authority-mark mode: a crank reads no oracle account (the mark only moves
-  // through the router), it just accrues toward the mark and settles positions.
-  const crank = (x: Vault, portfolio: PublicKey) => new TransactionInstruction({
-    programId: PERCOLATOR,
-    keys: [rw(payer, true), rw(MARKET), rw(portfolio)],
-    data: new W().u8(5).u64(BigInt(slot)).u8(1).u16(x.assetIndex).u8(0).done(),
-  });
-  // Without a traded asset the flag only has to come down: catching up a nearly current asset
-  // with no positions (cheap cranks) recomputes it from that asset, which is never loss-stale.
-  if (!v) {
-    const idle = vaults.find(x => {
-      const a = decodeAsset(market, x.assetIndex);
-      const lag = BigInt(slot) - a.slotLast;
-      return x.canonical && x.status === 1 && a.oiLong === 0n && a.oiShort === 0n && lag > 0n && lag <= 100n;
-    });
-    if (idle) {
-      const lag = BigInt(slot) - decodeAsset(market, idle.assetIndex).slotLast;
-      return Array.from({ length: Number((lag + 9n) / 10n) }, () => crank(idle, idle.lpPortfolio));
-    }
-  }
-  const out: TransactionInstruction[] = [];
-  for (const x of byAsset.values()) {
-    const asset = L.market.slots + x.assetIndex * L.market.slot_len + L.market.engine;
-    const lag = BigInt(slot) - decodeAsset(market, x.assetIndex).slotLast;
-    const n = lag > 0n ? Number((lag + 9n) / 10n) : 0;
-    for (let i = 0; i < n; i++) out.push(crank(x, x.lpPortfolio));
-    for (const p of portfolios) {
-      const d = new Uint8Array(p.account.data);
-      for (let i = 0; i < 16; i++) {
-        const leg = L.portfolio.legs + i * L.portfolio.leg_len;
-        if (d[leg + L.leg.active] !== 1 || u32(d, leg + L.leg.asset_index) !== x.assetIndex) continue;
-        const epoch = d[leg + L.leg.side] === 0 ? L.market.kf_epoch_long : L.market.kf_epoch_short;
-        const stale = u64(d, leg + L.leg.kf_epoch_snap) < u64(market, asset + epoch);
-        if (n > 0 || stale) out.push(crank(x, p.pubkey));
+// ---- cranks ----
+
+/** A `fetch` for the public RPC, which rate-limits per address: requests go out one at a time, at
+ *  least `gapMs` apart, and a 429 is retried after a pause instead of failing the caller. */
+export function politeFetch(gapMs = 120, retries = 4): typeof fetch {
+  let queue: Promise<unknown> = Promise.resolve();
+  let last = 0;
+  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+  return (input, init) => {
+    const run = async () => {
+      for (let i = 0; ; i++) {
+        const wait = last + gapMs - Date.now();
+        if (wait > 0) await pause(wait);
+        last = Date.now();
+        const res = await fetch(input, init);
+        if (res.status !== 429 || i >= retries) return res;
+        await pause(700 * (i + 1));
       }
-    }
-  }
-  return out;
+    };
+    const p = queue.then(run, run);
+    queue = p.catch(() => undefined);
+    return p;
+  };
 }
 
-/** The trade (or any instruction gated on the market-wide loss-stale flag, such as a listing; pass
- *  `v = null` then) with the catch-up cranks it needs, found by simulating: a crank the engine rejects as
- *  having nothing to do (NonProgress, 0x16) is dropped and the rest simulated again. */
-export async function prepareTrade(conn: Connection, v: Vault | null, payer: PublicKey, trade: TransactionInstruction, knownVaults?: Vault[]): Promise<TransactionInstruction[]> {
-  // ~75k CU per crank on an asset with positions; keep room for the trade itself.
-  let cranks = (await catchUpCranks(conn, v, payer, knownVaults)).slice(0, 14);
-  for (let round = 0; round < 12; round++) {
-    const { blockhash } = await conn.getLatestBlockhash();
-    const msg = new TransactionMessage({
-      payerKey: payer,
-      recentBlockhash: blockhash,
-      instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...cranks, trade],
-    }).compileToV0Message();
-    const r = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
-    const err: any = r.value.err;
-    const failed = err?.InstructionError?.[0] - 1;
-    if (err && err.InstructionError?.[1]?.Custom === 22 && failed >= 0 && failed < cranks.length) {
-      cranks = cranks.filter((_, i) => i !== failed);
-      continue;
+/** What `crankPlan` reads: the market account, the slot it was read at, and every portfolio. */
+export type MarketSnapshot = { market: Uint8Array; slot: number; portfolios: { pubkey: PublicKey; data: Uint8Array }[] };
+
+export async function marketSnapshot(conn: Connection): Promise<MarketSnapshot> {
+  const [m, slot, accs] = await Promise.all([
+    conn.getAccountInfo(MARKET, "confirmed"),
+    conn.getSlot("confirmed"),
+    conn.getProgramAccounts(PERCOLATOR, { commitment: "confirmed", filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }] }),
+  ]);
+  return { market: new Uint8Array(m!.data), slot, portfolios: accs.map(a => ({ pubkey: a.pubkey, data: new Uint8Array(a.account.data) })) };
+}
+
+/** Percolator's permissionless crank on `portfolio`, naming the assets it may accrue (each by at
+ *  most 10 slots a call, up to the current slot). It fails (NonProgress) when it finds nothing to do. */
+export const crank = (payer: PublicKey, portfolio: PublicKey, assets: number[]) => {
+  const w = new W().u8(5).u64(0n).u8(assets.length);
+  for (const a of assets) w.u16(a).u8(0);
+  return new TransactionInstruction({ programId: PERCOLATOR, keys: [rw(payer, true), rw(MARKET), rw(portfolio)], data: w.done() });
+};
+
+/** The cranks Percolator needs before it accepts new risk on asset `focus`, as it works on chain:
+ *   - an asset with positions must be accrued to the current slot, and one crank accrues every
+ *     asset it names by at most 10 slots, so `ceil(lag / 10)` copies of `lagCrank` are needed,
+ *     counted at the slot the transaction lands in: one too few leaves an asset out of date
+ *     (the trade fails with LockActive), one too many has nothing to do (NonProgress);
+ *   - every price move marks all positions on the asset out of date, and a portfolio is settled
+ *     as a whole by one crank, which only works once every asset it holds is current. So the lag
+ *     cranks cover `focus` and every asset held by anyone with a position on it (and by the
+ *     trader), and `settle` has one crank for each of those portfolios that is, or is about to
+ *     be, out of date. They end on `focus`, whose state decides whether the trade is accepted.
+ *  With `focus` omitted the plan covers `assets` and every portfolio (routine upkeep). */
+export type CrankPlan = { lag: number; lagCrank: TransactionInstruction; settle: TransactionInstruction[]; resets: TransactionInstruction[] };
+
+export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKey, focus: number | undefined, trader?: PublicKey, assets: number[] = []): CrankPlan {
+  const at = (a: number) => L.market.slots + a * L.market.slot_len + L.market.engine;
+  const legs = (d: Uint8Array) => {
+    const out: { asset: number; stale: boolean }[] = [];
+    for (let i = 0; i < 16; i++) {
+      const leg = L.portfolio.legs + i * L.portfolio.leg_len;
+      if (d[leg + L.leg.active] !== 1) continue;
+      const asset = u32(d, leg + L.leg.asset_index);
+      const epoch = d[leg + L.leg.side] === 0 ? L.market.kf_epoch_long : L.market.kf_epoch_short;
+      out.push({ asset, stale: u64(d, leg + L.leg.kf_epoch_snap) < u64(s.market, at(asset) + epoch) });
     }
-    break;
-  }
-  return [...cranks, trade];
+    return out;
+  };
+  const mine = trader && routerPortfolio(trader);
+  const held = s.portfolios.map(p => ({ key: p.pubkey, legs: legs(p.data) })).filter(p => p.legs.length);
+  const holders = held.filter(p => focus === undefined || p.legs.some(l => l.asset === focus) || (mine && p.key.equals(mine)));
+  // The trader first, holders of `focus` last, so the last asset touched is `focus`.
+  holders.sort((x, y) => Number(mine ? y.key.equals(mine) : 0) - Number(mine ? x.key.equals(mine) : 0));
+  const set = new Set<number>([...assets, ...holders.flatMap(p => p.legs.map(l => l.asset))]);
+  if (focus !== undefined) { set.delete(focus); set.add(focus); }
+  const all = [...set];
+  const moving = (a: number) => u64(s.market, at(a) + L.market.effective_price) !== u64(s.market, at(a) + L.market.raw_oracle_target_price);
+  const oldest = all.reduce((m, a) => { const t = u64(s.market, at(a) + L.market.slot_last); return t < m ? t : m; }, BigInt(s.slot));
+  return {
+    lag: s.slot - Number(oldest),
+    lagCrank: crank(payer, vehicle, all),
+    settle: holders.filter(p => p.legs.some(l => l.stale || moving(l.asset))).map(p => crank(payer, p.key, [focus ?? p.legs[0].asset])),
+    resets: focus === undefined ? all.flatMap(a => finalizeResets(s.market, a)) : finalizeResets(s.market, focus),
+  };
+}
+
+/** When the last position on one side of an asset closes, Percolator parks that side ("reset
+ *  pending") and refuses new positions on the asset until anyone finalizes the reset. Returns
+ *  that instruction for each parked side that is ready (no stored or out-of-date positions). */
+export function finalizeResets(market: Uint8Array, assetIndex: number): TransactionInstruction[] {
+  const a = L.market.slots + assetIndex * L.market.slot_len + L.market.engine;
+  const sides = [
+    [L.market.mode_long, L.market.stored_pos_count_long, L.market.stale_account_count_long],
+    [L.market.mode_short, L.market.stored_pos_count_short, L.market.stale_account_count_short],
+  ];
+  return sides.flatMap(([mode, stored, stale], side) =>
+    market[a + mode] === 2 && u64(market, a + stored) === 0n && u64(market, a + stale) === 0n
+      ? [new TransactionInstruction({ programId: PERCOLATOR, keys: [rw(MARKET)], data: new W().u8(45).u16(assetIndex).u8(side).done() })]
+      : []);
 }
 
 /** The trader takes `sizeQ` (positive = long) against the vault through Percolator's TradeCpi. */

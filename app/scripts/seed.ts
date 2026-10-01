@@ -8,7 +8,7 @@ import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruct
 import * as fs from "fs";
 import * as C from "../src/chain";
 
-const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true });
+const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: C.politeFetch() });
 const KEYS = "../keys/seed";
 const deployer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(`${process.env.HOME}/.config/solana/percolator-test/deployer.json`, "utf8"))));
 const faucet = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("../keys/faucet.json", "utf8"))));

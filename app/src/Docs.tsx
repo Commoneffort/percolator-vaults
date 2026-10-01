@@ -184,6 +184,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Market authority.</b> On devnet, Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
           <li><b>Smart contracts.</b> Unaudited code. The program is upgradeable on devnet; a mainnet deployment must burn that authority.</li>
           <li><b>Keepers.</b> Everything is permissionless, but someone has to send the transactions. If nobody does, epochs don't roll and prices don't update.</li>
+          <li><b>Cost per position.</b> Each price move leaves every open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are. The executor does this in front of each fill, so keeping a market tradable costs more the more positions it has.</li>
           <li><b>Percolator fixes.</b> Devnet runs our Percolator integration branch, which includes fixes not yet merged upstream, among them the one that makes permissionless listing work while traders hold open positions (<a href="https://github.com/aeyakovenko/percolator-prog/pull/447" target="_blank" rel="noreferrer">percolator-prog #447</a>).</li>
         </ul>
 
@@ -271,6 +272,16 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           trade; between trades it keeps the mark on Pyth's free sponsored feed account. It also expires late requests. It needs
           a Pyth API key; the free plan covers every market listed here, and it makes only a few Hermes requests per trade.
           Anyone can run one; the program checks everything, and each fill pays its executor the request's bond.
+        </p>
+        <p>
+          A fill is more than one instruction. Percolator takes a new position on an asset only when that asset is accrued to
+          the current slot and every position on it is settled, and each price move leaves every position on the asset out of
+          date. So the executor puts the cranks that fix this in front of each fill: they bring every asset the traders involved
+          hold up to the current slot (which also walks Percolator's price to the mark), then settle each of those accounts.
+          The number of cranks depends on the slot the transaction lands in, and a crank with nothing to do fails, so two
+          versions are sent, one crank apart; only the matching one can succeed, and the request fills once. When the last
+          position on one side of a market closes, Percolator parks that side until anyone finalizes the reset; the executor
+          does that too.
         </p>
 
         <h2 id="integrate">Integrating</h2>

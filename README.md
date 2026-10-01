@@ -23,10 +23,10 @@ Before this change the vault filled every trade immediately at Percolator's mark
 2. **It fills at exactly one price:** the first Pyth price published at or after the target. Pyth's signed update carries its own publish time and the previous one, so the router accepts only the update with `previous publish time < target <= publish time`. Nobody chooses a price: whoever executes the fill, and whenever, the price is the same, and nobody could have known it when the request landed.
 3. **The vault's mark only moves through the router, and only forward.** The vault lists its market in Percolator's authority-mark mode with itself as the oracle authority, and it moves the mark only when the router asks, to a fully verified Pyth price that is newer than the current one. The router never moves it past a pending request's target before that request has filled or expired.
 4. **There is no other way to trade.** The vault's matcher refuses every fill the router did not arm for that exact slot and size, so a trader calling Percolator directly gets nothing.
-5. **No backing out.** A request cannot be cancelled. The trader's margin is locked from request to fill, and the request is only accepted with enough margin to survive a further 10% price move, so a trader cannot make the fill fail after seeing the price. A request nobody fills within 30 seconds of its target expires and its bond is forfeited; nothing is traded.
+5. **No backing out.** A request cannot be cancelled. The trader's margin is locked from request to fill, and the request is only accepted with enough margin to survive a further 10% price move, so a trader cannot make the fill fail after seeing the price. A request nobody fills within 90 seconds of its target expires and its bond is forfeited; nothing is traded.
 6. **Nobody can censor it.** Filling is permissionless: any wallet, the trader included, can execute any request once the mark is at its price, and earns the request's bond for doing so. Each trader's Percolator account is owned by a program address derived from their wallet; only the router can trade it, and withdrawals can only go back to that wallet.
 
-What is left: the design assumes the chain clock does not run more than a few seconds behind real time (the 4-second delay is the margin), and a request that cannot fill (for example after a price move larger than the 10% margin buffer) holds the mark at most 30 seconds before it expires, at the cost of its bond.
+What is left: the design assumes the chain clock does not run more than a few seconds behind real time (the 4-second delay is the margin), and a request that cannot fill (for example after a price move larger than the 10% margin buffer) holds the mark at most 90 seconds before it expires, at the cost of its bond.
 
 ## Why this exists
 
@@ -82,7 +82,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 4 | `Request` | trader | Queues a trade; sets its target time; checks margin with a 10% stress buffer; takes a bond |
 | 5 | `Advance` | anyone | Moves a vault's mark to a newer verified Pyth price, never past a pending target |
 | 6 | `Fill` | anyone | Fills a request at the mark once the mark is its target price; pays the executor the bond |
-| 7 | `Expire` | anyone | Removes a request unfilled 30 s after its target; the bond is forfeited |
+| 7 | `Expire` | anyone | Removes a request unfilled 90 s after its target; the bond is forfeited |
 
 ## Share pricing
 
@@ -125,7 +125,8 @@ The executor (`app/scripts/executor.ts`) moves marks and fills requests. It need
 
 - **Feeds.** The free plan serves SOL, BTC, ETH, PYTH, DOGE, HYPE, XAU and EUR, so those are the markets the app offers (JUP, WIF, RAY, JTO, BONK and TRUMP are refused on the free plan).
 - **Usage.** Keeping marks fresh costs nothing: the executor uses Pyth's own sponsored on-chain feed accounts (updated at least every minute, or on a 0.5% move). Hermes is called only when a trade needs its exact target price: one request per target time, shared by every trade queued for it, plus one batched request every few minutes to refresh the feed accounts of markets not opened yet. That is a few Hermes requests per trade, far below the documented limit of 30 requests per 10 seconds. Pyth does not publish a monthly quota for the free plan; the executor backs off for a minute whenever Hermes answers 429.
-- **RPC.** It fits within the public devnet RPC's limits: one batched account read every 3 seconds, and confirmations by polling rather than websockets.
+- **RPC.** It fits within the public devnet RPC's limits: one batched account read every 3 seconds (every second while a trade is queued), requests sent one at a time with a pause on HTTP 429, and confirmations by polling rather than websockets.
+- **Cranks.** Percolator takes new risk on an asset only when that asset is accrued to the current slot and every position on it is settled, and it settles a trader's positions only once every asset that trader holds is current. The executor puts exactly those cranks in front of each fill (`crankPlan` in `app/src/chain.ts`). How many are needed depends on the slot the transaction lands in, and a crank with nothing to do fails, so it sends two versions of the fill one crank apart: only the one that matches can succeed, and the request fills once. It also finalizes Percolator's side reset when the last position on one side of a market closes, without which that market would refuse new positions. Between trades it keeps every market within about 50 slots of the chain and settles out-of-date positions.
 
 `RPC=https://api.devnet.solana.com npx tsx scripts/executor.ts` (from `app/`).
 

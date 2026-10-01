@@ -8,7 +8,7 @@ import { PhantomWalletAdapter, SolflareWalletAdapter } from "@solana/wallet-adap
 import "@solana/wallet-adapter-react-ui/styles.css";
 import "./styles.css";
 import App from "./App";
-import { RPC_URL } from "./chain";
+import { RPC_URL, politeFetch } from "./chain";
 import { DevnetBurnerAdapter } from "./burner";
 
 function Root() {
@@ -16,7 +16,7 @@ function Root() {
   // The public devnet RPC rate-limits hard; retrying every 429 multiplies the load, so the pages
   // keep their last data and try again on their next refresh instead.
   return (
-    <ConnectionProvider endpoint={RPC_URL} config={{ commitment: "confirmed", disableRetryOnRateLimit: true }}>
+    <ConnectionProvider endpoint={RPC_URL} config={{ commitment: "confirmed", disableRetryOnRateLimit: true, fetch: politeFetch() }}>
       <WalletProvider wallets={wallets} autoConnect>
         <WalletModalProvider>
           <App />

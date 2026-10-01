@@ -437,6 +437,23 @@ fn maybe_retire(rpc: &RpcClient, payer: &Keypair, k: &VaultKeys, v: &VaultState,
     send(rpc, payer, vec![client::retire_market(k, asset_epoch, market_epoch)], &[])
 }
 
+/// Renews Percolator's time-limited approval of the vault as its portfolio's matcher. A roll renews
+/// it too, but a vault holding a position cannot roll, and without the approval no trade fills.
+fn refresh_matcher(rpc: &RpcClient, payer: &Keypair, k: &VaultKeys) -> Result<String, String> {
+    let (_, g, _) = market_state(rpc, &k.market);
+    send(rpc, payer, vec![client::refresh_matcher(k, g.next_market_id)], &[])
+}
+
+/// Renews every vault's matcher approval now.
+fn refresh_matchers(rpc: &RpcClient, payer: &Keypair) {
+    for (k, v) in all_vaults(rpc) {
+        match refresh_matcher(rpc, payer, &k) {
+            Ok(s) => println!("{} asset {}: matcher approval renewed ({s})", k.vault, { v.asset_index }),
+            Err(e) => println!("{} asset {}: {}", k.vault, { v.asset_index }, e.lines().next().unwrap_or("")),
+        }
+    }
+}
+
 /// Retires every idle market now, printing why the others stay.
 fn retire_idle(rpc: &RpcClient, payer: &Keypair) {
     let now = rpc.get_slot().unwrap();
@@ -498,6 +515,12 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
             vaults = all_vaults(rpc);
             println!("servicing {} vault(s)", vaults.len());
         }
+        // While any trade is queued, cranking is the executor's: it puts the exact cranks a fill
+        // needs in the fill's own transaction, and a crank landing in between makes one of those
+        // a no-op, which fails the whole fill.
+        let books: Vec<Pubkey> = vaults.iter().map(|(k, _)| percolator_vault::router_book(&k.vault)).collect();
+        let queued = rpc.get_multiple_accounts(&books).map(|accs| accs.iter().flatten()
+            .any(|a| a.data.get(percolator_vault::ROUTER_BOOK_LEN_OFF).is_some_and(|n| *n != 0))).unwrap_or(false);
         for (k, _) in vaults.clone() {
             let d = match rpc.get_account_data(&k.vault) { Ok(d) => d, Err(_) => continue };
             let v: VaultState = bytemuck::pod_read_unaligned(&d[state::VAULT_STATE_OFF..]);
@@ -513,7 +536,7 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                 .map(|a| if a.oi_eff_long_q != 0 || a.oi_eff_short_q != 0 { u64::MAX }
                     else if v.vault_kind == state::KIND_CANONICAL { now.saturating_sub(a.slot_last) } else { 0 })
                 .unwrap_or(0);
-            if lag > 40 {
+            if lag > 40 && !queued {
                 if let Err(e) = crank_vault(rpc, payer, &k.market, &v) {
                     eprintln!("{} crank: {}", k.vault, e.lines().next().unwrap_or(""));
                 } else if lag == u64::MAX && tick % 5 == 0 {
@@ -522,6 +545,13 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
                         Ok(n) => println!("{} settled {n} stale position(s)", k.vault),
                         Err(e) => eprintln!("{} settle: {}", k.vault, e.lines().next().unwrap_or("")),
                     }
+                }
+            }
+            // The approval lasts matcher_ttl_slots (about 14 hours on devnet); renew it every
+            // 30 minutes so a vault that cannot roll (it holds a position) keeps trading.
+            if tick % 120 == 2 {
+                if let Err(e) = refresh_matcher(rpc, payer, &k) {
+                    eprintln!("{} refresh matcher: {}", k.vault, e.lines().next().unwrap_or(""));
                 }
             }
             if tick % 15 == 0 {
@@ -686,8 +716,9 @@ fn main() {
         }
         Some("keeper") => keeper(&rpc, &admin),
         Some("retire-idle") => retire_idle(&rpc, &admin),
+        Some("refresh-matchers") => refresh_matchers(&rpc, &admin),
         Some("accept-governance") => accept_governance(&rpc, &admin, &key(&load(), "market")),
         Some("status") => status(&rpc),
-        _ => eprintln!("usage: devnet setup-market | create-vault | faucet <pubkey> <usdc> | keeper | accept-governance | status"),
+        _ => eprintln!("usage: devnet setup-market | create-vault | faucet <pubkey> <usdc> | keeper | accept-governance | retire-idle | refresh-matchers | status"),
     }
 }

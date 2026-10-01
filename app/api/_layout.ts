@@ -32,12 +32,19 @@ export default {
     "kf_epoch_short": 153,
     "lifecycle": 16,
     "market_id": 0,
+    "mode_long": 513,
+    "mode_short": 514,
     "oi_long": 289,
     "oi_short": 305,
     "oracle_observation": 0,
+    "raw_oracle_target_price": 17,
     "slot_last": 41,
     "slot_len": 1813,
-    "slots": 1190
+    "slots": 1190,
+    "stale_account_count_long": 337,
+    "stale_account_count_short": 345,
+    "stored_pos_count_long": 321,
+    "stored_pos_count_short": 329
   },
   "market_header": {
     "max_market_slots": 498,
@@ -72,7 +79,7 @@ export default {
     },
     "book_len": 632,
     "delay_secs": 4,
-    "grace_secs": 30,
+    "grace_secs": 90,
     "max_pending": 32,
     "program": "DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3",
     "request": {

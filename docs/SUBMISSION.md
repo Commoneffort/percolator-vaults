@@ -50,8 +50,8 @@ A Solana program that turns "operate a Percolator market" into a pooled, permiss
   - a leaderboard computed from chain data;
   - detailed docs;
   - a devnet burner wallet so anyone can try it without installing a wallet.
-- **Keeper** that discovers every vault and keeps it running: price accrual, settling out-of-date positions, rolls, harvests, retiring idle markets.
-- **Executor** that anyone can run on Pyth's free plan: fetches each trade's target-time Pyth update from Hermes (a few requests per trade), posts it, fills the trade at it, keeps marks fresh between trades from Pyth's free sponsored feed accounts, and expires late requests.
+- **Keeper** that discovers every vault and keeps it running: rolls, harvests, matcher renewal, retiring idle markets.
+- **Executor** that anyone can run on Pyth's free plan: fetches each trade's target-time Pyth update from Hermes (a few requests per trade), posts it, fills the trade at it with the cranks Percolator needs first (accruing every asset involved and settling out-of-date positions), keeps marks and accrual fresh between trades from Pyth's free sponsored feed accounts, and expires late requests. It runs on the public devnet RPC.
 - **Percolator fixes found while building it:** a Percolator bug blocked permissionless listing whenever any trader held open PnL; fixed on our integration branch, deployed on devnet, and submitted upstream (percolator-prog #447).
 
 ## Why it matters
@@ -63,7 +63,8 @@ Percolator gives Solana an engine for permissionless perps. This gives it a work
 - Unaudited, and devnet only today.
 - The vault is the counterparty to all traders: depositors win if traders lose and pay if traders win. Fees are their compensation.
 - Trades take a few seconds: that delay is what makes the fill price one nobody could know in advance. Its protection assumes the chain clock is not more than a few seconds behind real time.
-- A request that cannot fill (for example after a price move larger than its 10% margin buffer) holds the market's mark at its price for at most 30 seconds before it expires, at the cost of its bond.
+- A request that cannot fill (for example after a price move larger than its 10% margin buffer) holds the market's mark at its price for at most 90 seconds before it expires, at the cost of its bond.
+- Every price move leaves each open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are; the executor does this in front of each fill, so a fill costs more the more positions a market has.
 - Executors need a Pyth API key (the free plan covers the markets offered) to fetch each trade's target-time update; anyone can run one, and if nobody does, requests expire and nothing trades.
 - Demo activity on devnet is seeded by four wallets we control, and the site labels them "seed".
 
