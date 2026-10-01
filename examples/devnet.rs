@@ -571,8 +571,12 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
             // Once the epoch is overdue by a full epoch the vault may close its own position
             // (Unwind), so that is urgent as well.
             let overdue = now >= v.epoch_start_slot + 2 * v.epoch_len_slots;
-            let urgent = (v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0) && (v.inventory == 0 || overdue);
-            let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots && (urgent || tick % 10 == 0);
+            // With a position open the epoch is settled through the router (the executor queues
+            // it); the keeper only rolls flat vaults, and unwinds one that has to get flat.
+            let has_requests = v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0;
+            let settled_by_router = v.inventory != 0 && v.needs_flat == 0;
+            let urgent = has_requests && (v.inventory == 0 || overdue);
+            let epoch_over = now >= v.epoch_start_slot + v.epoch_len_slots && !settled_by_router && (urgent || tick % 10 == 0);
             if tick % 15 != 0 && !epoch_over {
                 continue;
             }

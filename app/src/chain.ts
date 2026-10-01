@@ -95,6 +95,8 @@ export type Vault = {
   fillNavBps: number;
   openerFeesOwed: bigint;
   openerFeesTotal: bigint;
+  /** The epoch is overdue and its withdrawals exceed the vault's cash: closing-only until flat. */
+  needsFlat: boolean;
 };
 
 export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
@@ -134,6 +136,7 @@ export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
     fillNavBps: u16(d, v.fill_nav_bps),
     openerFeesOwed: u64(d, v.opener_fees_owed),
     openerFeesTotal: u64(d, v.opener_fees_total),
+    needsFlat: d[v.needs_flat] === 1,
   };
 }
 
@@ -382,7 +385,7 @@ export function depth(s: State): { long: bigint; short: bigint } {
     const open = reducing ? maxInv : maxInv > abs ? maxInv - abs : 0n;
     return (reducing ? abs : 0n) + (open < maxFill ? open : maxFill);
   };
-  const epochOver = s.slot >= v.epochStart + v.epochLen && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
+  const epochOver = s.slot >= v.epochStart + v.epochLen && v.needsFlat;
   if (epochOver) {
     // Reduce-only: a taker long is only filled if the vault is long (and vice versa).
     return { long: inv > 0n ? abs : 0n, short: inv < 0n ? abs : 0n };
@@ -651,9 +654,11 @@ export function decodeBook(d: Uint8Array): Book {
   const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, b.pending_target + 8 * i)) }));
   return { vault: key(d, b.vault), len, markPublish: Number(i64(d, b.mark_publish_time)), markPrev: Number(i64(d, b.mark_prev_publish_time)), markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending };
 }
-export type RouterRequest = { key: PublicKey; vault: PublicKey; wallet: PublicKey; id: bigint; size: bigint; target: number };
+/** `settle`: an epoch settlement of the vault (then `wallet` is whoever queued it), not a trade. */
+export type RouterRequest = { key: PublicKey; vault: PublicKey; wallet: PublicKey; id: bigint; size: bigint; target: number; settle: boolean };
 export const decodeRequest = (k: PublicKey, d: Uint8Array): RouterRequest => ({
   key: k, vault: key(d, R.request.vault), wallet: key(d, R.request.wallet), id: u64(d, R.request.id), size: i128(d, R.request.size), target: Number(i64(d, R.request.target_time)),
+  settle: d[R.request.kind] === 1,
 });
 export type Trader = { wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; pendingVault: PublicKey; pendingId: bigint };
 export const decodeTrader = (d: Uint8Array): Trader => ({
@@ -693,6 +698,38 @@ export const requestTrade = (wallet: PublicKey, vault: PublicKey, id: bigint, si
   keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
   data: new W().u8(4).i128(size).done(),
 });
+/** Queues the settlement of a vault's epoch at the first Pyth price after its target time. */
+export const requestSettle = (payer: PublicKey, vault: PublicKey, id: bigint) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, id)), ro(SystemProgram.programId)],
+  data: new W().u8(9).done(),
+});
+/** Executes a queued settlement: rolls the vault's epoch through the router at the mark. */
+export const settleEpoch = (executor: PublicKey, v: Vault, r: RouterRequest, frontier: bigint) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [
+    rw(executor, true), rw(r.key), rw(r.wallet), rw(bookAddress(v.key)), ro(routerAuthority()),
+    rw(v.key), rw(MARKET), rw(v.lpPortfolio), rw(v.buffer), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), rw(v.shareMint), rw(v.escrow),
+    rw(epochAddress(v.key, v.epoch)), ro(v.delegate), ro(PERCOLATOR), ro(VAULT_PROGRAM), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
+  ],
+  data: new W().u8(10).u64(frontier).done(),
+});
+/** Switches a vault to closing-only when its overdue epoch's withdrawals exceed its cash. */
+export const requireFlat = (v: Vault) => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [rw(v.key), ro(MARKET), ro(v.lpPortfolio), ro(v.buffer), ro(v.shareMint)],
+  data: new W().u8(35).done(),
+});
+/** Whether an epoch's withdrawals fit in the vault's cash, so it can settle with the vault's
+ *  position open (the vault program's own test in `RequireFlat` and `RollEpoch`). */
+export function canSettleOpen(s: State): boolean {
+  const v = s.vault;
+  const cash = s.buffer - v.reserved - v.pendingDeposit;
+  const navLow = cash + s.lp.capital - (s.lp.pnl < 0n ? -s.lp.pnl : 0n);
+  // assets_for_shares with the program's virtual offsets rounds down; this is within an atom.
+  const owed = s.shareSupply > 0n ? v.pendingWithdraw * navLow / s.shareSupply : 0n;
+  return owed <= cash + v.pendingDeposit;
+}
 /** Sets a vault's tracked position to what its portfolio holds (after Percolator changed it
  *  outside a fill: a liquidation or a close-out on the other side). Anyone can send it. */
 export const syncInventory = (v: Vault) => new TransactionInstruction({

@@ -47,6 +47,7 @@ const ERRORS: Record<string, string> = {
   "0x5707": "this market's queue is full: try again in a minute",
   "0x570f": "this market is close-only until its remaining positions are closed",
   "0x5710": "this market is open: close with a normal trade",
+  "0x561b": "this epoch can settle without closing the vault's position",
 };
 
 function useSend(onDone: () => void): [Send, string | undefined, Toast | undefined, () => void] {
@@ -449,7 +450,7 @@ function Activity({ vault, tick }: { vault: C.Vault; tick: number }) {
 
 const VAULT_TAGS: Record<number, string> = {
   16: "Vault created", 17: "Deposit requested", 18: "Withdrawal requested", 19: "Epoch settled", 20: "Claimed",
-  21: "Matcher renewed", 22: "Profit converted", 23: "Market settled", 24: "Redeemed", 25: "Swept", 26: "Market listed", 27: "Fees harvested", 28: "Position unwound",
+  34: "Vault position re-read", 35: "Vault closing-only until flat", 21: "Matcher renewed", 22: "Profit converted", 23: "Market settled", 24: "Redeemed", 25: "Swept", 26: "Market listed", 27: "Fees harvested", 28: "Position unwound",
 };
 
 function describe(tx: any, v: C.Vault): string {
@@ -479,7 +480,9 @@ function describe(tx: any, v: C.Vault): string {
       if (data[0] === 5) return ""; // mark moved to a new Pyth price: not shown
       if (data[0] === 6) return "Queued trade filled at its target price";
       if (data[0] === 7) return "Queued trade expired unfilled";
-      if (data[0] === 8) return "Close-out queued";
+      if (data[0] === 8) return "Forced close queued (liquidation or close-out)";
+      if (data[0] === 9) return "Epoch settlement queued";
+      if (data[0] === 10) return "Epoch settled at the Pyth price";
     }
     if (program.equals(C.PERCOLATOR) && data[0] === 5) crank = true; // a fill carries cranks in front: keep looking
   }
@@ -568,9 +571,9 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
   const pendingElsewhere = !!state.trader?.hasPending && !pendingHere;
   const locked = !!state.trader?.hasPending;
   const chainNow = Math.floor(Date.now() / 1000);
-  // Same rule as the vault's matcher: past the end of an epoch with deposits or withdrawals
-  // waiting, the vault only takes trades that shrink its own position, so it can settle them.
-  const reduceOnly = state.slot >= v.epochStart + v.epochLen && (v.pendingDeposit > 0n || v.pendingWithdraw > 0n);
+  // Same rule as the vault's matcher: an overdue epoch whose withdrawals exceed the vault's cash
+  // can only settle with the vault flat, so until then it only takes trades that shrink its position.
+  const reduceOnly = state.slot >= v.epochStart + v.epochLen && v.needsFlat;
   const room = C.depth(state);
   // The largest order each way that the router's margin check accepts. Shrinking a position is
   // always accepted; past zero, the new position has to fit the margin.
@@ -719,8 +722,8 @@ function TradePanel({ state, send, busy }: { state: C.State; send: Send; busy?: 
           </div>
         ) : reduceOnly ? (
           <div className="note">
-            This vault is settling an epoch: until it rolls (usually under a minute) it only fills trades that reduce
-            its own position{v.inventory === 0n ? ", and it has none, so nothing can be opened right now" : ` (it is ${v.inventory > 0n ? "long" : "short"}, so only ${v.inventory > 0n ? "longs" : "shorts"} fill)`}.
+            This epoch's withdrawals are larger than the vault's cash reserve, so they can only be paid once the vault's
+            position is closed. Until then it only fills trades that reduce its position{v.inventory === 0n ? ", and it has none, so nothing can be opened right now" : ` (it is ${v.inventory > 0n ? "long" : "short"}, so only ${v.inventory > 0n ? "longs" : "shorts"} fill)`}.
           </div>
         ) : (room.long === 0n || room.short === 0n) && (
           <div className="note">The vault is at its position limit, so it cannot take more {room.long === 0n ? "longs" : "shorts"} right now.</div>
@@ -766,7 +769,7 @@ function LiquidityPanel({ state, send, busy }: { state: C.State; send: Send; bus
             <div className="row"><span>Value</span><b>${fmt(num(state.userShares, 10 ** C.SHARE_DECIMALS) * price)}</b></div>
             <div className="row"><span>Share price</span><b>${fmt(price, 4)}</b></div>
             <div className="row"><span>Wallet test USDC</span><b>{usd(state.userCollateral)}</b></div>
-            {pending && <div className="note">Queued for epoch {String(t!.epoch)}: {t!.deposit > 0n && `${usd(t!.deposit)} deposit`} {t!.withdraw > 0n && `${shares(t!.withdraw)} shares out`}. It settles at one price when the epoch ends{state.slot < v.epochStart + v.epochLen ? ` (about ${Math.max(1, Math.ceil(Number(v.epochStart + v.epochLen - state.slot) * C.slotSeconds() / 60))} min from now)` : v.inventory === 0n ? " (being settled now, usually under a minute)" : " (the vault has to be flat first: it now only takes trades that close its position)"}; then come back here to claim your shares.</div>}
+            {pending && <div className="note">Queued for epoch {String(t!.epoch)}: {t!.deposit > 0n && `${usd(t!.deposit)} deposit`} {t!.withdraw > 0n && `${shares(t!.withdraw)} shares out`}. It settles at one price when the epoch ends{state.slot < v.epochStart + v.epochLen ? ` (about ${Math.max(1, Math.ceil(Number(v.epochStart + v.epochLen - state.slot) * C.slotSeconds() / 60))} min from now)` : v.needsFlat ? " (this epoch's withdrawals exceed the vault's cash reserve, so the vault has to close its position first: it now only takes trades that reduce it)" : " (being settled now, usually within half a minute)"}; then come back here to claim.</div>}
             {claimable && <button className="btn primary wide" disabled={!!busy} onClick={() => send("Claim", claimIxs(publicKey))}>Claim epoch {String(t!.epoch)} result</button>}
             <Faucet />
           </>
@@ -896,6 +899,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <h3>The rules every market gets</h3>
         <div className="row"><span>Vault position limit</span><b>3× its NAV</b></div>
         <div className="row"><span>Most new exposure per order</span><b>0.75× its NAV (closing is not limited)</b></div>
+        <div className="row"><span>Cash kept for withdrawals</span><b>10% of its NAV</b></div>
         <div className="row"><span>Epoch</span><b>about {Math.round(C.CANON_EPOCH_LEN_SLOTS * C.slotSeconds() / 60)} minutes</b></div>
         <div className="row"><span>Insurance kept for traders</span><b>$100</b></div>
         <div className="row"><span>Price</span><b>Pyth, ≤ 5 min old</b></div>

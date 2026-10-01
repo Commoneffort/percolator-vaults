@@ -94,12 +94,14 @@
     "request": {
       "created_slot": 104,
       "id": 72,
+      "kind": 113,
       "size": 80,
       "target_time": 96,
       "vault": 8,
       "wallet": 40
     },
     "request_len": 120,
+    "reserve_bps": 1000,
     "stress_bps": 1000,
     "trader": {
       "collateral": 104,
@@ -145,6 +147,7 @@
     "max_fill_abs": 368,
     "max_inventory_abs": 384,
     "mode": 416,
+    "needs_flat": 427,
     "opener_fees_owed": 672,
     "opener_fees_total": 680,
     "oracle_feeds": 464,

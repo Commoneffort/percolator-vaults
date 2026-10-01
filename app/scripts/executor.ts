@@ -211,12 +211,27 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
     const tracked = C.decodeVault(v.key, new Uint8Array(fresh[i]!.data)).inventory;
     if (held !== tracked) await send(`sync ${v.feed?.symbol} vault position ${Number(tracked) / 1e6} -> ${Number(held) / 1e6}`, [C.syncInventory(v)]);
   }
+  // An epoch that is over with deposits or withdrawals waiting, while the vault holds a position
+  // (a flat vault is rolled directly by the keeper): settle it at a committed price if its
+  // withdrawals fit in the vault's cash, otherwise it has to get flat first.
+  let sent = false;
+  for (const [i, v] of vaults.entries()) {
+    const lp = snap.portfolios.find(p => p.pubkey.equals(v.lpPortfolio));
+    if (!lp || !fresh[i]) continue;
+    const cur = C.decodeVault(v.key, new Uint8Array(fresh[i]!.data));
+    const over = BigInt(snap.slot) >= cur.epochStart + cur.epochLen;
+    if (!over || cur.needsFlat || (cur.pendingDeposit === 0n && cur.pendingWithdraw === 0n)) continue;
+    if (C.decodePortfolio(lp.data, v.assetIndex, snap.market).position === 0n || C.closeOnly(snap.market, v.assetIndex)) continue;
+    const s = await C.fetchVault(conn, v.key);
+    if (!s.book) continue;
+    if (C.canSettleOpen(s)) sent = (await send(`queue settlement of ${v.feed?.symbol} epoch ${cur.epoch}`, [C.requestSettle(payer.publicKey, v.key, s.book.nextId)], true)) || sent;
+    else await send(`require flat ${v.feed?.symbol} (withdrawals exceed the vault's cash)`, [C.requireFlat(v)]);
+  }
   const queue = async (v: C.Vault, wallet: PublicKey, why: string) => {
     const book = await conn.getAccountInfo(C.bookAddress(v.key));
     if (!book) return false;
     return send(`queue ${why} ${v.feed?.symbol} for ${wallet.toBase58().slice(0, 6)}`, [C.requestClose(payer.publicKey, wallet, v.key, C.decodeBook(new Uint8Array(book.data)).nextId)], true);
   };
-  let sent = false;
   const busy = new Set<string>();
   for (const v of closing) {
     const holder = snap.portfolios.find(p => { const o = owners.get(p.pubkey.toBase58()); return o && !o.hasPending && C.decodePortfolio(p.data, v.assetIndex, snap.market).position !== 0n; });
@@ -260,6 +275,31 @@ async function upkeep(vaults: C.Vault[], market: Uint8Array, slot: bigint, pass:
   if (lag > 50) await send(`crank ${assets.length} asset(s) (${lag} slots behind)`, Array(Math.min(10, Math.ceil(lag / 10))).fill(C.crank(payer.publicKey, vehicle, assets)));
 }
 
+/** Executes a queued epoch settlement: the vault's own position has to be settled at the mark
+ *  (one crank on its portfolio once its asset is current), then the router rolls the epoch. */
+async function settleEpoch(v: C.Vault, r: C.RouterRequest, what: string) {
+  const [snap, va] = await Promise.all([C.marketSnapshot(conn), conn.getAccountInfo(v.key)]);
+  if (!va) return;
+  const cur = C.decodeVault(v.key, new Uint8Array(va.data));
+  const own = { ...snap, portfolios: snap.portfolios.filter(p => p.pubkey.equals(v.lpPortfolio)) };
+  const plan = C.crankPlan(own, payer.publicKey, v.lpPortfolio, v.assetIndex);
+  const k = Math.max(1, Math.ceil((plan.lag + LAND_SLOTS) / 10));
+  if (k > 8) {
+    await send(`catch up for settlement ${what} (${plan.lag} slots behind)`, Array(Math.min(k, 12)).fill(plan.lagCrank), true);
+    return;
+  }
+  const tail = [C.settleEpoch(payer.publicKey, cur, r, C.marketHeader(snap.market).nextMarketId)];
+  const t = await tune(plan.lagCrank, k, plan.settle, tail);
+  if (typeof t === "string") {
+    log("fail", `settle epoch ${cur.epoch} of ${what}`, t);
+    // 0x560e: the withdrawals do not fit in the vault's cash after all. It has to get flat.
+    if (t.includes('"Custom":22030') && !cur.needsFlat) await send(`require flat ${v.feed?.symbol}`, [C.requireFlat(v)]);
+    return;
+  }
+  const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...t.settle, ...tail];
+  await race(`settle epoch ${cur.epoch} of ${what} at ${Number(C.decodeAsset(snap.market, v.assetIndex).price) / 1e6} with the vault's position open`, [version(t.k), version(t.k + 1)]);
+}
+
 async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boolean): Promise<boolean> {
   if (!snap.book) {
     await send(`open book ${v.feed?.symbol}`, [C.openBook(payer.publicKey, v.key)]);
@@ -273,7 +313,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   //    the chain (once per request), so the fill itself has only a few seconds to catch up.
   for (const r of live.filter(r => r.target > b.markPublish && now < r.target && !prepared.has(`${v.key}:${r.id}`))) {
     prepared.add(`${v.key}:${r.id}`);
-    const plan = C.crankPlan(await C.marketSnapshot(conn), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet);
+    const plan = C.crankPlan(await C.marketSnapshot(conn), payer.publicKey, v.lpPortfolio, v.assetIndex, r.settle ? undefined : r.wallet);
     if (plan.lag <= 15) continue;
     const t = await tune(plan.lagCrank, Math.min(10, Math.ceil(plan.lag / 10)), [], []);
     if (typeof t !== "string" && t.k > 0) await send(`get ready for ${v.feed?.symbol} #${r.id} (${plan.lag} slots behind)`, Array(t.k).fill(plan.lagCrank));
@@ -298,6 +338,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   //    that leaves out of date; a miss is retried next pass.
   for (const r of live.filter(r => b.markPrev < r.target && r.target <= b.markPublish)) {
     const what = `${v.feed?.symbol} #${r.id}`;
+    if (r.settle) { await settleEpoch(v, r, what); continue; }
     const plan = C.crankPlan(await C.marketSnapshot(conn), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet);
     const k = Math.max(1, Math.ceil((plan.lag + LAND_SLOTS) / 10));
     if (k > 6) {
